@@ -99,6 +99,7 @@
    #:screen-app-cursor-keys
    #:screen-app-keypad
    #:screen-vt52-mode
+   #:screen-vt52-graphics
    #:screen-title
    #:screen-title-stack
    #:screen-cwd

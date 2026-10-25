@@ -18,7 +18,7 @@
   backend backend-state name title configuration font framebuffer damage
   (columns 80) (rows 24) (width 0) (height 0) (open-p nil)
   (cleanup-pending-p nil)
-  owner grid cursor-row cursor-col cursor-visible)
+  owner grid cursor-row cursor-col cursor-visible (reverse-screen nil) (blink-phase t))
 
 (defgeneric backend-open (backend display))
 (defgeneric backend-close (backend display))

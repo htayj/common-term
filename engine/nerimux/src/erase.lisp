@@ -6,10 +6,21 @@
   (loop for y from y0 to y1
         do (%clear-line-wrapped screen y)   ; erased content no longer wraps (capture -J)
            (let ((bx (if (= y y0) x0 0))
-                 (ex (if (= y y1) x1 (1- (screen-width screen)))))
+                 (ex (min (1- (row-columns screen y))
+                          (if (= y y1) x1 (1- (screen-width screen))))))
              (loop for x from bx to ex
                    do (setf (screen-cell screen x y) (%erase-cell screen)))))
   (setf (screen-dirty-p screen) t))
+
+(defun erase-display-region (screen x0 y0 x1 y1)
+  "ED restores single width on every completely erased line (VT100 UG ED)."
+  (loop for row from y0 to y1
+        for first = (if (= row y0) x0 0)
+        for last = (if (= row y1) x1 (1- (screen-width screen)))
+        do (when (and (zerop first) (>= last (1- (row-columns screen row))))
+             (remhash row (screen-line-sizes screen))
+             (setf last (1- (screen-width screen))))
+           (erase-region screen first row last row)))
 
 (defmacro define-erase-display-rules (&rest specs)
   "Build ERASE-DISPLAY from a Prolog-like mode rule table.
@@ -32,22 +43,22 @@
   (0
    (let ((cx (screen-cursor-x screen)) (cy (screen-cursor-y screen))
          (w  (screen-width    screen)) (h  (screen-height   screen)))
-     (erase-region screen cx cy (1- w) cy)
+     (erase-display-region screen cx cy (1- w) cy)
      (when (< (1+ cy) h)
-       (erase-region screen 0 (1+ cy) (1- w) (1- h)))))
+       (erase-display-region screen 0 (1+ cy) (1- w) (1- h)))))
   (1
    (let ((cx (screen-cursor-x screen)) (cy (screen-cursor-y screen))
          (w  (screen-width    screen)))
      (when (> cy 0)
-       (erase-region screen 0 0 (1- w) (1- cy)))
-     (erase-region screen 0 cy cx cy)))
+       (erase-display-region screen 0 0 (1- w) (1- cy)))
+     (erase-display-region screen 0 cy cx cy)))
   (2
    (let ((w (screen-width screen)) (h (screen-height screen)))
      (scroll-screen-to-history screen)
-     (erase-region screen 0 0 (1- w) (1- h))))
+     (erase-display-region screen 0 0 (1- w) (1- h))))
   (3
    (let ((w (screen-width screen)) (h (screen-height screen)))
-     (erase-region screen 0 0 (1- w) (1- h))
+     (erase-display-region screen 0 0 (1- w) (1- h))
      (setf (screen-scrollback screen) nil))))
 
 (defmacro define-erase-line-rules (&rest specs)
@@ -59,7 +70,7 @@
       Mode 0: cursor to end.  Mode 1: start to cursor.  Mode 2: entire line."
      (let ((cx (screen-cursor-x screen))
            (cy (screen-cursor-y screen))
-           (w (screen-width screen)))
+           (w (row-columns screen)))
        (case mode
          ,@(mapcar
             (lambda (s)

@@ -3,7 +3,7 @@
 
 (defun screen-grid (screen)
   (let ((grid (make-array (list (lispterm.engine:rows screen)
-                                (lispterm.engine:columns screen)))))
+                               (lispterm.engine:columns screen)))))
     (dotimes (row (array-dimension grid 0))
       (dotimes (column (array-dimension grid 1))
         (let ((cell (lispterm.engine:cell-at screen row column)))
@@ -14,11 +14,24 @@
                   :bg (lispterm.engine:cell-background cell)
                   :bold (lispterm.engine:cell-bold-p cell)
                   :inverse (lispterm.engine:cell-inverse-p cell)
-                  :underline (lispterm.engine:cell-underline-p cell))))))
+                  :underline (lispterm.engine:cell-underline-p cell)
+                  :blink (lispterm.engine:cell-blink-p cell)
+                  :line-size (lispterm.engine:line-size screen row))))))
     grid))
 
-(defun render-session (session display)
-  "Coalesce damage into at most one frame per scheduler tick. Never clear on failure."
+(defun screen-visible-blink-p (screen)
+  "Only addressable glyphs or underlines require a blink timer."
+  (loop for row below (lispterm.engine:rows screen)
+        thereis (loop for col below (lispterm.engine:logical-columns screen row)
+                      for cell = (lispterm.engine:cell-at screen row col)
+                      thereis (and (lispterm.engine:cell-blink-p cell)
+                                   (plusp (lispterm.engine:cell-width cell))
+                                   (or (lispterm.engine:cell-underline-p cell)
+                                       (not (eql #\Space (lispterm.engine:cell-character cell))))))))
+
+(defun render-session (session display &key
+                       (now (/ (get-internal-real-time) internal-time-units-per-second)))
+  "Coalesce damage into one frame per scheduler tick; NOW permits deterministic replay."
   (sb-thread:with-mutex ((session-lock session))
     (let* ((screen (session-screen session))
            (cursor (list (lispterm.engine:cursor-row screen)
@@ -26,7 +39,16 @@
                          (nerimux/terminal:screen-cursor-visible screen)))
            (dirty (or (session-force-frame session) (lispterm.engine:dirty-p screen)))
            (cursor-changed (not (equal cursor (session-last-cursor session))))
-           (title (nerimux/terminal:screen-title screen)))
+           (title (nerimux/terminal:screen-title screen))
+           (phase (session-blink-phase session))
+           (visible (session-blink-visible session))
+           (next-blink (session-next-blink session)))
+      (when dirty
+        (setf visible (screen-visible-blink-p screen))
+        (unless (eql visible (session-blink-visible session))
+          (setf phase t next-blink (and visible (+ now 1/2)))))
+      (when (and visible next-blink (>= now next-blink))
+        (setf phase (not phase) next-blink (+ now 1/2) dirty t))
       (when (and title (not (equal title (session-last-title session))))
         (ltd:set-title display (subseq title 0 (min 1024 (length title))))
         (setf (session-last-title session) (copy-seq title)))
@@ -34,9 +56,14 @@
         (if dirty
             (ltd:draw-frame display (screen-grid screen)
               :cursor-row (first cursor) :cursor-col (second cursor)
-              :cursor-visible (third cursor))
+              :cursor-visible (third cursor)
+              :reverse-screen (lispterm.engine:reverse-screen-p screen)
+              :blink-phase phase)
             (ltd:set-cursor display (first cursor) (second cursor) :visible (third cursor)))
         (ltd:present display)
         (incf (session-frames session))
-        (setf (session-last-cursor session) cursor (session-force-frame session) nil)
+        ;; Publish the phase with its completed frame, never ahead of a failed draw.
+        (setf (session-last-cursor session) cursor (session-force-frame session) nil
+              (session-blink-phase session) phase (session-blink-visible session) visible
+              (session-next-blink session) next-blink)
         (lispterm.engine:clear-damage screen)))))

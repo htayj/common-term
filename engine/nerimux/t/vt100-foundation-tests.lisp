@@ -307,8 +307,9 @@
       (expect (not (nerimux/terminal/types:screen-app-keypad s)))
       (dolist (reset (list (esc "c") (csi "!" #\p)))
         (feed s (esc "="))
-        ;; The VT52 parser is a later owner; set its contract flag directly.
+        ;; Return to ANSI before its RIS/DECSTR commands; neither is VT52.
         (setf (nerimux/terminal/types:screen-vt52-mode s) t)
+        (feed s (esc "<"))
         (feed s reset)
         (expect (not (nerimux/terminal/types:screen-app-keypad s)))
         (expect (not (nerimux/terminal/types:screen-vt52-mode s)))))))

@@ -1,9 +1,31 @@
 (in-package #:nerimux/terminal/actions)
 
+(defun row-columns (screen &optional (row (screen-cursor-y screen)))
+  "Number of addressable character positions in ROW, independent of pixel size."
+  (if (gethash row (screen-line-sizes screen))
+      (max 1 (floor (screen-width screen) 2))
+      (screen-width screen)))
+
+(defun clamp-row-cursor (screen)
+  (setf (screen-cursor-x screen)
+        (min (screen-cursor-x screen) (1- (row-columns screen)))))
+
+(defun designate-line-size (screen size)
+  "Designate the current row; discard the right half on single-to-double changes."
+  (let* ((row (screen-cursor-y screen)) (sizes (screen-line-sizes screen))
+         (previous (gethash row sizes)))
+    (if size (setf (gethash row sizes) size) (remhash row sizes))
+    (when (and size (null previous))
+      (loop for col from (row-columns screen row) below (screen-width screen)
+            do (setf (screen-cell screen col row) (blank-cell))))
+    (clamp-row-cursor screen)
+    (setf (screen-pending-wrap screen) nil (screen-dirty-p screen) t)))
 (defun %copy-row (screen dst-row src-row)
   "Copy all cells from SRC-ROW to DST-ROW within SCREEN."
   (dotimes (col (screen-width screen))
-    (setf (screen-cell screen col dst-row) (screen-cell screen col src-row))))
+    (setf (screen-cell screen col dst-row) (screen-cell screen col src-row)))
+  (let* ((sizes (screen-line-sizes screen)) (size (gethash src-row sizes)))
+    (if size (setf (gethash dst-row sizes) size) (remhash dst-row sizes))))
 
 (defun %erase-cell (screen)
   "A blank cell carrying the current background colour (BCE, background colour
@@ -16,7 +38,8 @@
 (defun %clear-row (screen row)
   "Fill every cell in ROW with a background-colour-erase blank (BCE)."
   (dotimes (col (screen-width screen))
-    (setf (screen-cell screen col row) (%erase-cell screen))))
+    (setf (screen-cell screen col row) (%erase-cell screen)))
+  (remhash row (screen-line-sizes screen)))
 
 (defconstant +max-scrollback-lines+
   10000
@@ -75,14 +98,7 @@
           do (%copy-row screen row (1+ row)))
     (%clear-row screen bottom)
     (%shift-line-wrapped-up screen top bottom)
-    (let ((sizes (screen-line-sizes screen)))
-      (when (plusp (hash-table-count sizes))
-        (loop for row from top below bottom
-              do (let ((below (gethash (1+ row) sizes)))
-                   (if below
-                       (setf (gethash row sizes) below)
-                       (remhash row sizes))))
-        (remhash bottom sizes)))
+    (clamp-row-cursor screen)
     (setf (screen-dirty-p screen) t)))
 
 (defun clear-scrollback (screen)
@@ -134,6 +150,7 @@
           do (%copy-row screen row (1- row)))
     (%clear-row screen top)
     (%clear-all-line-wrapped screen)
+    (clamp-row-cursor screen)
     (setf (screen-dirty-p screen) t)))
 
 (defun decstbm (screen top bottom)

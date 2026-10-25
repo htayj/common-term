@@ -35,3 +35,16 @@
 (defun cell-underline-p (cell) (logtest nerimux/terminal/types:+attr-underline+ (nerimux/terminal:cell-attrs cell)))
 (defun dirty-p (screen) (nerimux/terminal/types:screen-dirty-p screen))
 (defun clear-damage (screen) (nerimux/terminal:screen-clear-dirty screen))
+
+(defun line-size (screen row)
+  "Return ROW's native rendition keyword; physical screen dimensions do not change."
+  (case (gethash row (nerimux/terminal:screen-line-sizes screen))
+    (#\3 :double-height-top) (#\4 :double-height-bottom)
+    (#\6 :double-width) (otherwise :single)))
+(defun logical-columns (screen row)
+  "Addressable character positions in ROW, half the physical columns when doubled."
+  (if (eq (line-size screen row) :single) (columns screen)
+      (max 1 (floor (columns screen) 2))))
+(defun reverse-screen-p (screen) (nerimux/terminal:screen-reverse-screen screen))
+(defun cell-blink-p (cell)
+  (logtest nerimux/terminal/types:+attr-blink+ (nerimux/terminal:cell-attrs cell)))

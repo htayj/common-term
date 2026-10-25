@@ -1,6 +1,12 @@
 (in-package #:nerimux/terminal/parser)
 
-(define-state ground-state (screen byte)
+(defun ground-state (screen byte)
+  "Dispatch new sequences according to DECANM, including after CSI mode changes."
+  (if (screen-vt52-mode screen)
+      (vt52-ground-state screen byte)
+      (ansi-ground-state screen byte)))
+
+(define-state ansi-ground-state (screen byte)
   (#x1B  #'escape-state)
   (#x0D  (cursor-cr screen) #'ground-state)
   (#x0A  (cursor-nl screen) #'ground-state)
@@ -26,7 +32,13 @@
    #'ground-state)
   (t #'ground-state))
 
-(define-state escape-state (screen byte)
+(defun escape-state (screen byte)
+  "Dispatch the byte after ESC to the current ANSI or VT52 command table."
+  (if (screen-vt52-mode screen)
+      (vt52-escape-state screen byte)
+      (ansi-escape-state screen byte)))
+
+(define-state ansi-escape-state (screen byte)
   (#x5B  (make-csi-k '() nil nil))
   (#x5D  #'osc-state)
   (#x50  (make-dcs-k))

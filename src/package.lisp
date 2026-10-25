@@ -17,4 +17,5 @@
   (:export #:make-screen #:feed #:resize #:rows #:columns #:cursor-row
            #:cursor-column #:cell-at #:cell-character #:cell-width
            #:cell-foreground #:cell-background #:cell-bold-p #:cell-inverse-p
-           #:cell-underline-p #:dirty-p #:clear-damage #:palette-color))
+           #:cell-underline-p #:cell-blink-p #:line-size #:logical-columns #:reverse-screen-p
+           #:dirty-p #:clear-damage #:palette-color))

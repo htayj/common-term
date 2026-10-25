@@ -9,13 +9,13 @@
   "Advance by COUNT columns, preserving VT100 deferred-wrap semantics."
   (let ((next-x (+ (screen-cursor-x screen) count)))
     (cond
-      ((< next-x (screen-width screen))
+      ((< next-x (row-columns screen))
        (setf (screen-cursor-x screen) next-x))
       ((screen-autowrap screen)
-       (setf (screen-cursor-x screen) (1- (screen-width screen))
+       (setf (screen-cursor-x screen) (1- (row-columns screen))
              (screen-pending-wrap screen) t))
       (t
-       (setf (screen-cursor-x screen) (1- (screen-width screen)))))))
+       (setf (screen-cursor-x screen) (1- (row-columns screen)))))))
 
 (defun %place-wide-char (screen x y char fg bg attrs attrs2 ul-color hyperlink)
   "Place CHAR at X,Y and create its zero-width continuation cell when possible."
@@ -35,7 +35,7 @@
                                             hyperlink
                                             :width
                                             2))
-  (when (< (1+ x) (screen-width screen))
+  (when (< (1+ x) (row-columns screen y))
     (setf (screen-cell screen (1+ x) y) (make-cell :char
                                                    #\Space
                                                    :fg
@@ -99,7 +99,7 @@
         (attrs (screen-cur-attrs screen))
         (attrs2 (screen-cur-attrs2 screen))
         (ul-color (screen-cur-ul-color screen)))
-    (when (>= (1+ (screen-cursor-x screen)) (screen-width screen))
+    (when (>= (1+ (screen-cursor-x screen)) (row-columns screen))
       (setf (screen-cell screen
                          (screen-cursor-x screen)
                          (screen-cursor-y screen)) (blank-cell)

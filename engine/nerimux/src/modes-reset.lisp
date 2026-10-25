@@ -22,6 +22,7 @@
         (screen-app-cursor-keys screen) nil
         (screen-app-keypad screen) nil
         (screen-vt52-mode screen) nil
+        (screen-vt52-graphics screen) nil
         (screen-pending-wrap screen) nil)
   (clrhash (screen-line-sizes screen)))
 
@@ -54,6 +55,7 @@
   "DECALN, ESC # 8: fill the entire screen with 'E' (the VT100 screen-alignment
    test pattern, used by vttest and terminal conformance suites), then home the
    cursor.  Each cell becomes a default-attribute 'E'."
+  (clrhash (screen-line-sizes screen))
   (dotimes (y (screen-height screen))
     (dotimes (x (screen-width screen))
       (setf (screen-cell screen x y) (make-cell :char #\E))))

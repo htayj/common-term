@@ -235,17 +235,13 @@
      '3'/'4'  → DECDHL (double-height line top/bottom): recorded per row.
      '5'      → DECSWL (single-width line): clears the row's size flag.
      '6'      → DECDWL (double-width line): recorded per row.
-   The renderer re-emits ESC # <char> for flagged rows so the outer terminal
-   draws double-size lines.  Returns to ground."
+   Transitions use the shared logical-width action, including cursor clamping
+   and discarding the inaccessible right half. Returns to ground."
   (lambda (screen byte)
     (declare (type screen screen) (type (unsigned-byte 8) byte))
     (case byte
       (#x38 (decaln-action screen))
       ((#x33 #x34 #x36)
-       (setf (gethash (screen-cursor-y screen) (screen-line-sizes screen))
-             (code-char byte))
-       (setf (screen-dirty-p screen) t))
-      (#x35
-       (remhash (screen-cursor-y screen) (screen-line-sizes screen))
-       (setf (screen-dirty-p screen) t)))
+       (nerimux/terminal/actions::designate-line-size screen (code-char byte)))
+      (#x35 (nerimux/terminal/actions::designate-line-size screen nil)))
     #'ground-state))

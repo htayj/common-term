@@ -13,7 +13,7 @@
                (declare (ignorable n))
                (let ((cx (screen-cursor-x screen))
                      (cy (screen-cursor-y screen))
-                     (w (screen-width screen)))
+                     (w (row-columns screen)))
                  (declare (ignorable cx cy w))
                  ,shift-loop
                  ,blank-loop
@@ -52,6 +52,7 @@
                    (let ((count (min n (- bottom top -1))))
                      ,shift-loop
                      ,blank-loop
+                     (clamp-row-cursor screen)
                      (setf (screen-dirty-p screen) t)))))))
         specs)))
 

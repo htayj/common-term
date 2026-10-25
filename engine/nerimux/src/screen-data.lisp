@@ -42,8 +42,9 @@
   (bracketed-paste nil :type boolean)
   (app-cursor-keys nil :type boolean)
   (app-keypad nil :type boolean)
-  ;; Input contract for the later VT52 parser; no ?2 transition is implemented here.
+  ;; VT52 uses its own graphics selection, independent of ANSI G0..G3.
   (vt52-mode nil :type boolean)
+  (vt52-graphics nil :type boolean)
   (title "" :type string)
   (title-stack nil :type list)
   (cwd "" :type string)

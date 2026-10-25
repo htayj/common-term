@@ -25,6 +25,13 @@
               specs))))))
 
 (define-dec-pm-rules
+  (2
+   ((values)) ; DECANM can only be set with ESC < while in VT52 mode.
+   ((setf (screen-vt52-mode screen) t
+          (screen-vt52-graphics screen) nil
+          (screen-pending-wrap screen) nil)
+    (return-from dec-pm-reset nil))) ; Following ANSI parameters do not cross modes.
+
   (25
    ((setf (screen-cursor-visible screen) t))
    ((setf (screen-cursor-visible screen) nil)))

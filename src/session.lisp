@@ -18,6 +18,7 @@
   (lock (sb-thread:make-mutex :name "lispterm screen"))
   (transport-state :open) process-state
   (bytes-received 0) (frames 0) (force-frame t) last-cursor last-title
+  (blink-phase t) (blink-visible nil) next-blink
   ;; The window owner alone enqueues/drains. Observers use INPUT-LOCK.
   (input-lock (sb-thread:make-mutex :name "lispterm input"))
   input-head input-tail (input-offset 0) (input-pending 0))

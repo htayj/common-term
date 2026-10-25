@@ -2,7 +2,8 @@
 
 (in-package #:lispterm.display)
 
-(defstruct cell (char #\ ) (width 1) fg bg bold inverse underline)
+(defstruct cell (char #\ ) (width 1) fg bg bold inverse underline blink
+  (line-size :single))
 
 (defstruct key-event key text modifiers)
 

@@ -1,19 +1,30 @@
 (in-package #:nerimux/terminal/actions)
 
+;; xterm charsets.h map_DEC_Spec_Graphic_VT52, DEC STD 070 VT52 repertoire.
+;; The odd fraction numerators 3/, 5/, 7/ have no Unicode characters; use
+;; the same blank fallback as xterm. This is deliberately not DEC special 0.
+(defun %vt52-graphics-char (ch)
+  (let ((code (char-code ch)))
+    (if (<= #x5f code #x7e)
+        (char "   ▮⅟   °±→…÷↓⎺⎺⎻⎻⎼⎼⎽⎽₀₁₂₃₄₅₆₇₈₉" (- code #x5f))
+        ch)))
+
 (defun %remap-charset-char (screen ch)
-  "Map CH through the invoked charset, consuming any pending single shift."
-  (let* ((shift (screen-single-shift screen))
-         (charset (if shift (screen-invoked-charset screen shift)
-                      (screen-charset screen))))
-    (when shift (setf (screen-single-shift screen) nil))
-    (case charset
-      (:dec-graphics (%dec-graphics-char ch))
-      (:british (if (char= ch #\#) #\£ ch))
-      (t ch))))
+  "Map CH through VT52 graphics or the ANSI invoked charset/single shift."
+  (if (screen-vt52-mode screen)
+      (if (screen-vt52-graphics screen) (%vt52-graphics-char ch) ch)
+      (let* ((shift (screen-single-shift screen))
+             (charset (if shift (screen-invoked-charset screen shift)
+                          (screen-charset screen))))
+        (when shift (setf (screen-single-shift screen) nil))
+        (case charset
+          (:dec-graphics (%dec-graphics-char ch))
+          (:british (if (char= ch #\#) #\£ ch))
+          (t ch)))))
 
 (defun %consume-pending-wrap (screen)
   "Perform the deferred VT100 wrap before the next printable character."
-  (when (screen-pending-wrap screen)
+  (when (and (screen-pending-wrap screen) (not (screen-vt52-mode screen)))
     (%mark-line-wrapped screen (screen-cursor-y screen))
     (setf (screen-pending-wrap screen) nil
           (screen-cursor-x screen) 0)

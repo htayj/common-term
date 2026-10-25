@@ -22,15 +22,16 @@
             `(defun ,name (screen n)
                ,docstring
                (%cancel-wrap screen)
-               (setf (,accessor screen) ,limit-expr))))
+               (setf (,accessor screen) ,limit-expr)
+               (clamp-row-cursor screen))))
         specs)))
 
 (defun set-cursor (screen x y)
   "Move the cursor to (X, Y), clamping both coordinates into bounds.
    Cancels a pending wrap (explicit positioning discards the last-column flag)."
   (%cancel-wrap screen)
-  (setf (screen-cursor-x screen) (clamp x 0 (1- (screen-width  screen)))
-        (screen-cursor-y screen) (clamp y 0 (1- (screen-height screen))))
+  (setf (screen-cursor-y screen) (clamp y 0 (1- (screen-height screen)))
+        (screen-cursor-x screen) (clamp x 0 (1- (row-columns screen))))
   (%clear-line-wrapped screen (screen-cursor-y screen)))
 
 (define-cursor-movements
@@ -47,7 +48,7 @@
        (+ (screen-cursor-y screen) n)))
  (cursor-right "Move the cursor right N columns, clamping to width-1."
                screen-cursor-x
-               (min (1- (screen-width screen)) (+ (screen-cursor-x screen) n)))
+               (min (1- (row-columns screen)) (+ (screen-cursor-x screen) n)))
  (cursor-left "Move the cursor left N columns, clamping to column 0."
               screen-cursor-x
               (max 0 (- (screen-cursor-x screen) n))))
@@ -58,7 +59,8 @@
   (cond ((= (screen-cursor-y screen) (screen-scroll-bottom screen))
          (scroll-up-one screen))
         ((< (screen-cursor-y screen) (1- (screen-height screen)))
-         (incf (screen-cursor-y screen)))))
+         (incf (screen-cursor-y screen))))
+  (clamp-row-cursor screen))
 
 (defun cursor-lf (screen)
   "Line feed: move cursor down, scrolling the scroll region if at the bottom."
@@ -128,7 +130,8 @@
   (%cancel-wrap screen)
   (setf (screen-cursor-x screen) (%next-tab-stop (screen-tab-stops screen)
                                                  (screen-cursor-x screen)
-                                                 (1- (screen-width screen)))))
+                                                 (1- (row-columns screen))))
+  (clamp-row-cursor screen))
 
 (defun cursor-cht (screen n)
   "CHT, cursor forward N tab stops (CSI N I).
@@ -156,7 +159,8 @@
   (cond ((= (screen-cursor-y screen) (screen-scroll-top screen))
          (scroll-down-one screen))
         ((plusp (screen-cursor-y screen))
-         (decf (screen-cursor-y screen)))))
+         (decf (screen-cursor-y screen))))
+  (clamp-row-cursor screen))
 
 (defun cursor-cr (screen)
   "Carriage return: move the cursor to column 0."

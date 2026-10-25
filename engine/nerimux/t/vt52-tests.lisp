@@ -1,0 +1,308 @@
+(in-package #:nerimux/test/terminal)
+
+;; VT100 UG 3.3.5; DEC STD 070 behavior as implemented by xterm charproc.c
+;; and charsets.h map_DEC_Spec_Graphic_VT52. Fixtures require no .build data.
+(defun vt52-feed (screen bytes)
+  (map nil (lambda (byte)
+             (screen-process-bytes screen
+                                   (make-array 1 :element-type '(unsigned-byte 8)
+                                                 :initial-element byte)))
+       bytes)
+  screen)
+
+(defun vt52-enter (screen)
+  (feed screen (csi "?2" #\l)))
+
+(defun vt52-position (screen x y)
+  (vt52-feed screen (vector 27 89 (+ 32 y) (+ 32 x))))
+
+(defun vt52-bounds-p (screen)
+  (and (<= 0 (screen-cursor-x screen) (1- (screen-width screen)))
+       (<= 0 (screen-cursor-y screen) (1- (screen-height screen)))))
+
+(describe "terminal-suite/vt52"
+  (it "enters from CSI and dispatches VT52 commands immediately after the final byte"
+    (with-screen (s 10 5)
+      (feed s (csi "3;4" #\H))
+      (vt52-enter s)
+      (expect (eq t (nerimux/terminal:screen-vt52-mode s)))
+      (feed s (esc "D"))
+      (check-cursor s 2 2)
+      (feed s (esc "H"))
+      (check-cursor s 0 0)
+      (feed s (esc "<"))
+      (expect (null (nerimux/terminal:screen-vt52-mode s)))
+      (feed s (csi "4;5" #\H))
+      (check-cursor s 4 3)))
+
+  (it "does not interpret VT52 ESC [ as ANSI CSI or ESC c as RIS"
+    (with-screen (s 12 4)
+      (feed s "keep")
+      (vt52-enter s)
+      (feed s (esc "[2J"))
+      (expect (string= "keep2J" (row-string s 0 :end 6)))
+      (feed s (esc "c"))
+      (expect (string= "keep2J" (row-string s 0 :end 6)))
+      (expect (nerimux/terminal:screen-vt52-mode s))))
+
+  (it "moves one cell without scrolling at the edges"
+    (with-screen (s 4 3)
+      (vt52-enter s)
+      (feed s (esc "A")) (feed s (esc "D"))
+      (check-cursor s 0 0)
+      (dotimes (i 7) (feed s (esc "B")) (feed s (esc "C")))
+      (check-cursor s 3 2)
+      (feed s (esc "A")) (feed s (esc "D"))
+      (check-cursor s 2 1)))
+
+  (it "collects partial direct addresses and retains each out-of-range axis"
+    (with-screen (s 8 5)
+      (vt52-enter s)
+      (vt52-feed s #(27 89 35))
+      (check-cursor s 0 0)
+      (vt52-feed s #(38))
+      (check-cursor s 6 3)
+      (vt52-position s 94 2)
+      (check-cursor s 6 2)
+      (vt52-position s 1 94)
+      (check-cursor s 1 2)
+      (vt52-position s 94 94)
+      (check-cursor s 1 2)
+      (vt52-position s 0 0)
+      (check-cursor s 0 0)))
+
+  (it "addresses physically even when ANSI origin mode is set"
+    (with-screen (s 8 7)
+      (feed s (csi "3;5" #\r))
+      (feed s (csi "?6" #\h))
+      (vt52-enter s)
+      (vt52-position s 1 0)
+      (check-cursor s 1 0)))
+
+  (it "erases from the active cell inclusively without moving the cursor"
+    (with-screen (s 5 3)
+      (vt52-enter s)
+      (dotimes (y 3)
+        (vt52-position s 0 y)
+        (feed s "abcde"))
+      (vt52-position s 2 1)
+      (feed s (esc "K"))
+      (expect (string= "ab   " (row-string s 1)))
+      (expect (string= "abcde" (row-string s 2)))
+      (check-cursor s 2 1)
+      (feed s (esc "J"))
+      (expect (string= "abcde" (row-string s 0)))
+      (expect (row-blank-p s 2))
+      (check-cursor s 2 1)))
+
+  (it "reverse line feeds at the top and moves elsewhere"
+    (with-screen (s 5 3)
+      (vt52-enter s)
+      (feed s "abc")
+      (feed s (esc "H"))
+      (feed s (esc "I"))
+      (expect (row-blank-p s 0))
+      (expect (string= "abc" (row-string s 1 :end 3)))
+      (check-cursor s 0 0)
+      (vt52-position s 3 2)
+      (feed s (esc "I"))
+      (check-cursor s 3 1)))
+
+  (it "uses the separate full VT52 graphics repertoire and ASCII ESC G"
+    (with-screen (s 40 3)
+      (vt52-enter s)
+      (feed s (esc "F"))
+      (feed s "_`abcdefghijklmnopqrstuvwxyz{|}~")
+      (expect (string= "   ▮⅟   °±→…÷↓⎺⎺⎻⎻⎼⎼⎽⎽₀₁₂₃₄₅₆₇₈₉"
+                       (row-string s 0 :end 32)))
+      (feed s (esc "G"))
+      (feed s "q#")
+      (expect (char= #\q (char-at s 32 0)))
+      (expect (char= #\# (char-at s 33 0)))))
+
+  (it "preserves ANSI British and DEC G0/G1 and a pending single shift"
+    (with-screen (s 30 4)
+      (feed s (esc "(A"))
+      (feed s (esc ")0"))
+      (feed s (esc "*A"))
+      (feed s (esc "N"))
+      (vt52-enter s)
+      (feed s (esc "G"))
+      (feed s "#") ; VT52 ASCII, independent of the saved ANSI British charset.
+      (feed s (esc "F"))
+      (feed s "b")
+      (feed s (esc "<"))
+      (feed s "#") ; saved SS2 => British
+      (feed s "#") ; G0 British
+      (vt52-feed s #(14))
+      (feed s "q") ; G1 DEC
+      (expect (string= "#▮££─" (row-string s 0 :end 5)))))
+
+  (it "overwrites the last column without wrapping in VT52 then restores ANSI wrap"
+    (with-screen (s 4 3)
+      (vt52-enter s)
+      (feed s "abcdef")
+      (expect (string= "abcf" (row-string s 0)))
+      (expect (row-blank-p s 1))
+      (check-cursor s 3 0)
+      (feed s (esc "<"))
+      (feed s "GH")
+      (expect (char= #\G (char-at s 3 0)))
+      (expect (char= #\H (char-at s 0 1)))))
+
+  (it "replies exactly once per identify and keeps keypad flags Boolean"
+    (with-screen (s 8 3)
+      (vt52-enter s)
+      (feed s (esc "Z")) (feed s (esc "Z"))
+      (expect (equal (list (esc "/Z") (esc "/Z"))
+                     (nerimux/terminal/types:screen-response-queue s)))
+      (feed s (esc "="))
+      (expect (eq t (nerimux/terminal:screen-app-keypad s)))
+      (feed s (esc ">"))
+      (expect (null (nerimux/terminal:screen-app-keypad s)))))
+
+  (it "executes controls but ignores shifts and high-bit parity in VT52"
+    (with-screen (s 16 5)
+      (vt52-enter s)
+      (vt52-feed s #(193 9 194 13 10 195 8 196 14 15 0 127 7))
+      (expect (char= #\A (char-at s 0 0)))
+      (expect (char= #\B (char-at s 8 0)))
+      (expect (char= #\D (char-at s 0 1)))
+      (check-cursor s 1 1)
+      (expect (nerimux/terminal/types:screen-bell-pending s))))
+
+  (it "recovers from CAN SUB ESC and nonprintables in both address phases"
+    (dolist (prefix '(#(27 89) #(27 89 34)))
+      (dolist (cancel '(24 26))
+        (with-screen (s 12 5)
+          (vt52-enter s)
+          (vt52-feed s prefix)
+          (vt52-feed s (vector cancel 88))
+          (expect (char= #\X (char-at s 0 0)))
+          (check-cursor s 1 0)))
+      (with-screen (s 12 5)
+        (vt52-enter s)
+        (vt52-feed s prefix)
+        (vt52-feed s #(27 72 88))
+        (expect (char= #\X (char-at s 0 0)))))
+    (with-screen (s 12 5)
+      (vt52-enter s)
+      (vt52-feed s #(27 0 127 89 0 7 34 0 127 35 88))
+      (expect (char= #\X (char-at s 3 2)))
+      (check-cursor s 4 2)))
+
+  (it "returns to ANSI and resets VT52 graphics keypad and cursor-input modes"
+    (with-screen (s 12 5)
+      (feed s (csi "?1" #\h))
+      (vt52-enter s)
+      (feed s (esc "=")) (feed s (esc "F"))
+      (feed s (esc "c")) ; RIS has no meaning in the VT52 command table.
+      (expect (nerimux/terminal:screen-vt52-mode s))
+      (expect (nerimux/terminal/types:screen-vt52-graphics s))
+      (expect (nerimux/terminal:screen-app-keypad s))
+      (expect (nerimux/terminal:screen-app-cursor-keys s))
+      (feed s (esc "<")) (feed s (esc "c"))
+      (expect (null (nerimux/terminal:screen-vt52-mode s)))
+      (expect (null (nerimux/terminal/types:screen-vt52-graphics s)))
+      (expect (null (nerimux/terminal:screen-app-keypad s)))
+      (expect (null (nerimux/terminal:screen-app-cursor-keys s)))
+      (check-cursor s 0 0)
+      (vt52-enter s) (feed s (esc "=")) (feed s (esc "F"))
+      (nerimux/terminal/actions:ris-action s)
+      (expect (null (nerimux/terminal:screen-vt52-mode s)))
+      (expect (null (nerimux/terminal/types:screen-vt52-graphics s)))
+      (expect (null (nerimux/terminal:screen-app-keypad s)))))
+
+  (it "draws an independently specified rectangular fixture"
+    (with-screen (s 10 5)
+      (vt52-enter s)
+      (vt52-position s 1 1) (feed s "+------+")
+      (vt52-position s 1 2) (feed s "|      |")
+      (vt52-position s 1 3) (feed s "+------+")
+      (expect (string= " +------+ " (row-string s 1)))
+      (expect (string= " |      | " (row-string s 2)))
+      (expect (string= " +------+ " (row-string s 3)))))
+
+  (it "discards unsupported ESC intermediates and recovers on cancel or ESC"
+    (with-screen (s 20 3)
+      (vt52-enter s)
+      (vt52-feed s #(27 40 48 65 27 35 0 7 56 66))
+      (expect (string= "AB" (row-string s 0 :end 2)))
+      (vt52-feed s #(27 40 24 67 27 40 26 68))
+      (expect (string= "ABCD" (row-string s 0 :end 4)))
+      (vt52-feed s #(27 40 27 72 69))
+      (expect (char= #\E (char-at s 0 0)))))
+
+  (it "stops processing ANSI parameters after switching to VT52"
+    (with-screen (s 20 3)
+      (feed s (csi "?2;25" #\l))
+      (expect (nerimux/terminal:screen-vt52-mode s))
+      (expect (nerimux/terminal/types:screen-cursor-visible s))))
+
+  (it "returns to ANSI from every partial VT52 state without stranding the parser"
+    (dolist (prefix '(#(27) #(27 89) #(27 89 34) #(27 40)))
+      (with-screen (s 8 4)
+        (vt52-enter s)
+        (vt52-feed s prefix)
+        (feed s (esc "<"))
+        (feed s (csi "2;2" #\H))
+        (feed s "X")
+        (expect (not (nerimux/terminal:screen-vt52-mode s)))
+        (expect (char= #\X (char-at s 1 1)))
+        (check-cursor s 2 1))))
+
+  (it "routes line-size designations through logical-width transitions and DECRC"
+    (with-screen (s 12 4)
+      (feed s "abcdefghijkl")
+      (feed s (csi "1;11" #\H))
+      (feed s (esc "(A"))
+      (feed s (esc "7"))
+      (feed s (esc "#6"))
+      (check-cursor s 5 0)
+      (expect (char= #\6 (gethash 0 (nerimux/terminal/types:screen-line-sizes s))))
+      (expect (string= "abcdef      " (row-string s 0)))
+      (feed s (csi "3;1" #\H))
+      (feed s (esc "8"))
+      (check-cursor s 5 0)
+      (expect (not (nerimux/terminal/types:screen-pending-wrap s)))
+      (feed s "#")
+      (expect (char= #\£ (char-at s 5 0)))
+      (feed s (esc "#5"))
+      (expect (null (gethash 0 (nerimux/terminal/types:screen-line-sizes s))))
+      (expect (string= "      " (row-string s 0 :start 6)))))
+
+  (it "clamps DECRC to resized destination rows and retains the saved charset"
+    (with-screen (s 12 4)
+      (feed s (csi "4;11" #\H))
+      (feed s (esc "(A")) (feed s (esc "7"))
+      (screen-resize s 6 2)
+      (feed s (esc "(B"))
+      (feed s (esc "8"))
+      (check-cursor s 5 1)
+      (feed s "#")
+      (expect (char= #\£ (char-at s 5 1)))))
+
+  (it "clears line-size metadata before DECALN fills the entire physical grid"
+    (with-screen (s 12 4)
+      (loop for code in '("#3" "#4" "#6") for row from 1 do
+        (feed s (csi (format nil "~D;1" row) #\H))
+        (feed s (esc code)))
+      (feed s (esc "#8"))
+      (expect (zerop (hash-table-count (nerimux/terminal/types:screen-line-sizes s))))
+      (dotimes (y 4)
+        (expect (string= "EEEEEEEEEEEE" (row-string s y))))
+      (check-cursor s 0 0)))
+
+  (it "keeps physical coordinates bounded across small geometries and arbitrary octets"
+    (dolist (width '(1 2 7))
+      (dolist (height '(1 2 5))
+        (with-screen (s width height)
+          (vt52-enter s)
+          (dotimes (byte 256)
+            (loop for octet across (vector 27 89 byte (- 255 byte)) do
+              (vt52-feed s (vector octet))
+              (expect (vt52-bounds-p s))))
+          (dotimes (pass 4)
+            (dotimes (byte 256)
+              (vt52-feed s (vector byte))
+              (expect (vt52-bounds-p s)))))))))

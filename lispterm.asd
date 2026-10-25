@@ -48,6 +48,7 @@
                (:file "parser-csi")
                (:file "parser-utf8")
                (:file "parser")
+               (:file "parser-vt52")
                (:file "parser-osc-clipboard")
                (:file "parser-osc-uri")
                (:file "parser-osc-color")
@@ -138,6 +139,7 @@
 (:file "emulator-tests")
 (:file "parser-fuzz-tests")
 (:file "vt100-foundation-tests")
+(:file "vt52-tests")
 )) (:file "tests/engine-tests")))
 
 (defmethod perform ((operation test-op) (system (eql (find-system "lispterm/tests"))))

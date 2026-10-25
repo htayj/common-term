@@ -199,8 +199,8 @@
       (lispterm.pty:close-pty pty))))
 (defun terminal-key-modes ()
   "Exercise parser keypad/reset state and the session's three-flag snapshot."
-  ;; VT52 parser selection is a separate batch. Set its agreed boolean directly
-  ;; here to test input wiring, while feeding real ESC=/ESC>/RIS commands.
+  ;; Force the Boolean to isolate input wiring. ANSI RIS requires ESC < first
+  ;; when starting in VT52 mode; ESC c itself is not a VT52 command.
   (dolist (case '((nil nil "" :kp1 (49))
                   (nil nil "=" :kp1 (27 79 113))
                   (nil nil "=>" :kp1 (49))
@@ -210,7 +210,7 @@
                   (nil t "" :up (27 79 65))
                   (t t "" :up (27 65))
                   (nil nil "=c" :kp1 (49))
-                  (t nil "=c" :up (27 91 65))))
+                  (t nil "=<c" :up (27 91 65))))
     (destructuring-bind (vt52 app-cursor commands key expected) case
       (let* ((session (lispterm::make-session nil 24 80))
              (screen (lispterm::session-screen session)))
