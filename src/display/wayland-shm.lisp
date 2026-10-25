@@ -4,13 +4,18 @@
 (cffi:defcfun ("mmap" %mmap) :pointer (address :pointer) (length :unsigned-long)
   (protection :int) (flags :int) (fd :int) (offset :long))
 (cffi:defcfun ("munmap" %munmap) :int (address :pointer) (length :unsigned-long))
-(defstruct shm-buffer id pointer size width height generation (busy-p nil))
+(defstruct shm-buffer id pointer size width height generation (busy-p nil) (destroyed-p nil))
 (defun destroy-shm-buffer (state buffer &optional disconnected)
-  (unless disconnected (wire-send (wayland-state-wire state) (shm-buffer-id buffer) 0))
-  (remhash (shm-buffer-id buffer) (wire-handlers (wayland-state-wire state)))
-  (when (shm-buffer-pointer buffer)
-    (%munmap (shm-buffer-pointer buffer) (shm-buffer-size buffer))
-    (setf (shm-buffer-pointer buffer) nil)))
+  (let ((wire (wayland-state-wire state)))
+    (unless (shm-buffer-destroyed-p buffer)
+      (unless disconnected (wire-send wire (shm-buffer-id buffer) 0))
+      (setf (shm-buffer-destroyed-p buffer) t))
+    ;; Queued releases remain legal until the ordered display.delete_id.
+    ;; After disconnect there can be no more events to drain.
+    (when disconnected (remhash (shm-buffer-id buffer) (wire-handlers wire)))
+    (when (shm-buffer-pointer buffer)
+      (%munmap (shm-buffer-pointer buffer) (shm-buffer-size buffer))
+      (setf (shm-buffer-pointer buffer) nil))))
 (defun make-protocol-buffer (state width height)
   ;; Bound hostile compositor configure sizes before multiplication/allocation.
   (unless (and (<= 1 width 16384) (<= 1 height 16384) (<= (* width height) 67108864))
@@ -27,8 +32,10 @@
           (let ((pool (wire-id wire :shm-pool (constantly nil)))
                 (id (wire-id wire :buffer
                       (lambda (id opcode payload)
-                        (declare (ignore id payload))
-                        (when (= opcode 0) (setf (shm-buffer-busy-p buffer) nil))))))
+                        (declare (ignore id))
+                        (unless (and (= opcode 0) (zerop (length payload)))
+                          (wire-error "invalid wl_buffer.release event" nil))
+                        (setf (shm-buffer-busy-p buffer) nil)))))
             (setf buffer (make-shm-buffer :id id :pointer pointer :size size
                                          :width width :height height
                                          :generation (wayland-state-generation state)))

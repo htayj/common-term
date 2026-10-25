@@ -1,5 +1,7 @@
 (load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
 (asdf:load-system "babel")
+(asdf:load-system "lispterm/display-wayland")
 (dolist (n '("package" "cells" "font-otb" "font" "keys" "protocol" "framebuffer"))
  (load (merge-pathnames (format nil "../src/display/~a.lisp" n) *load-truename*)))
 (load (merge-pathnames "display-tests.lisp" *load-truename*))
+(load (merge-pathnames "wayland-buffer-lifecycle-tests.lisp" *load-truename*))
