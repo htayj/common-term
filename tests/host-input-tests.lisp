@@ -197,11 +197,66 @@
       (setf (symbol-function 'lispterm.pty::%poll) poller
             (symbol-function 'lispterm.pty::%write) writer)
       (lispterm.pty:close-pty pty))))
+(defun terminal-key-modes ()
+  "Exercise parser keypad/reset state and the session's three-flag snapshot."
+  ;; VT52 parser selection is a separate batch. Set its agreed boolean directly
+  ;; here to test input wiring, while feeding real ESC=/ESC>/RIS commands.
+  (dolist (case '((nil nil "" :kp1 (49))
+                  (nil nil "=" :kp1 (27 79 113))
+                  (nil nil "=>" :kp1 (49))
+                  (t nil "" :up (27 65))
+                  (t nil "=" :kp-enter (27 63 77))
+                  (t nil "=>" :kp-period (46))
+                  (nil t "" :up (27 79 65))
+                  (t t "" :up (27 65))
+                  (nil nil "=c" :kp1 (49))
+                  (t nil "=c" :up (27 91 65))))
+    (destructuring-bind (vt52 app-cursor commands key expected) case
+      (let* ((session (lispterm::make-session nil 24 80))
+             (screen (lispterm::session-screen session)))
+        (setf (nerimux/terminal:screen-vt52-mode screen) vt52
+              (nerimux/terminal:screen-app-cursor-keys screen) app-cursor)
+        (loop for command across commands
+              do (lispterm.engine:feed screen (octets (format nil "~c~c" #\Esc command))))
+        (lispterm::session-event session (ltd:make-key-event :key key))
+        (check (list :session-key-mode vt52 app-cursor commands key)
+               (equalp (coerce expected '(vector (unsigned-byte 8)))
+                       (car (lispterm::session-input-head session)))))))
+  (terminal-key-reset))
+
+(defun terminal-key-reset ()
+  "Enable actual application modes, then require RIS to restore numeric input."
+  (let* ((session (lispterm::make-session nil 24 80))
+         (screen (lispterm::session-screen session)))
+    (flet ((feed (suffix) (lispterm.engine:feed screen (octets (format nil "~c~a" #\Esc suffix))))
+           (queued () (apply #'concatenate '(vector (unsigned-byte 8))
+                             (lispterm::session-input-head session))))
+      (feed "[?1h") (feed "=")
+      (check :parser-application-flags
+             (and (nerimux/terminal:screen-app-cursor-keys screen)
+                  (nerimux/terminal:screen-app-keypad screen)))
+      (lispterm::session-event session (ltd:make-key-event :key :up))
+      (lispterm::session-event session (ltd:make-key-event :key :kp1))
+      (check :session-application-input (equalp #(27 79 65 27 79 113) (queued)))
+      (feed ">")
+      (check :parser-numeric-keypad (not (nerimux/terminal:screen-app-keypad screen)))
+      (feed "=") (feed "c")
+      ;; Compare newly appended bytes after the first two input events.
+      (lispterm::session-event session (ltd:make-key-event :key :up))
+      (lispterm::session-event session (ltd:make-key-event :key :kp1))
+      (let ((after (subseq (queued) 6)))
+        (format t "~&(:ris-input :expected #(27 91 65 49) :actual ~S)~%" after)
+        (check :session-ris-restores-normal-input (equalp #(27 91 65 49) after)))
+      (check :parser-ris-input-flags
+             (and (not (nerimux/terminal:screen-app-cursor-keys screen))
+                  (not (nerimux/terminal:screen-app-keypad screen))
+                  (not (nerimux/terminal:screen-vt52-mode screen)))))))
 (defun run-tests ()
   (setf *checks* 0)
   (let ((directory (merge-pathnames (format nil ".build/evidence/input54-~D-~D/" (get-universal-time) (sb-posix:getpid))
                                    (uiop:getcwd))))
     (ensure-directories-exist directory)
+    (terminal-key-modes)
     (mock-partials)
     (zero-timeout)
     (zero-timeout-syscalls)

@@ -90,7 +90,7 @@
                                    (#xff56 . :next) (#xff57 . :end)
                                    (#xff63 . :insert) (#xffff . :delete)))))
          (unicode (%xkb-sym-utf32 sym))
-         (key (or special
+         (key (or (lispterm.display::keysym-keypad-key sym) special
                   (when (<= #xffbe sym #xffc9)
                     (intern (format nil "F~D" (1+ (- sym #xffbe))) :keyword))
                   (and (plusp unicode) (code-char unicode))))
@@ -101,7 +101,8 @@
                  (let ((n (%xkb-key-utf8 state code buffer 128)))
                    (when (and (> n 0) (< n 128))
                      (cffi:foreign-string-to-lisp buffer :count n :encoding :utf-8))))))
-    (when key (list :key key :text text :modifiers mods))))
+    (when key (list :key key :text (or (lispterm.display::keypad-text key) text)
+                    :modifiers mods))))
 (defun emit-key (state keycode)
   (when (wayland-state-xkb state)
     (let ((key (xkb-normalized-key (wayland-state-xkb state) keycode)))

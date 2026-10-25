@@ -24,10 +24,9 @@
          (reply (xclhb:intern-atom-sync c 0 (length bytes) bytes)))
     (xclhb:intern-atom-reply-atom reply)))
 
-(defun translate-key (client keycode modifiers)
-  "Translate core keymaps, including Caps Lock and Unicode keysyms."
-  (let* ((symbols (cdr (assoc keycode (xclhb:client-keycode-keysym-table client))))
-         (base (first symbols))
+(defun translate-keysyms (symbols modifiers)
+  "Translate a core mapping while retaining keypad identity in either level."
+  (let* ((base (first symbols))
          (shift (logbitp 0 modifiers)))
     (when base
       (when (and (logbitp 1 modifiers) (< base 256) (alpha-char-p (code-char base)))
@@ -35,9 +34,14 @@
       (let ((keysym
              (or (and shift (second symbols) (not (zerop (second symbols))) (second symbols))
                  base)))
-        (cond ((< keysym 256) (code-char keysym))
-              ((<= 16777472 keysym 17891327) (code-char (- keysym 16777216)))
-              (t (cdr (assoc keysym xclhb::+keycode-keysym-table-non-character+))))))))
+        (or (lispterm.display::keysym-keypad-key keysym)
+            (cond ((< keysym 256) (code-char keysym))
+                  ((<= 16777472 keysym 17891327) (code-char (- keysym 16777216)))
+                  (t (cdr (assoc keysym xclhb::+keycode-keysym-table-non-character+)))))))))
+
+(defun translate-key (client keycode modifiers)
+  (translate-keysyms (cdr (assoc keycode (xclhb:client-keycode-keysym-table client)))
+                    modifiers))
 
 (defun dispatch-key (display event)
   (let* ((state (display-backend-state display)) (client (x-state-client state)))
@@ -47,7 +51,9 @@
                (key (translate-key client (xclhb:key-press-event-detail event) modifiers)))
           (when key
             (queue-event display
-             (make-key-event :key key :text (when (characterp key) (string key)) :modifiers
+             (make-key-event :key key
+              :text (or (lispterm.display::keypad-text key) (when (characterp key) (string key)))
+              :modifiers
               (loop for (bit name) in '((0 :shift) (2 :control) (3 :alt) (6 :super))
                     when (logbitp bit modifiers)
                     collect name))))))))

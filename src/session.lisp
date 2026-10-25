@@ -120,9 +120,12 @@
      (session-resize session (ltd:resize-event-rows event) (ltd:resize-event-columns event)))
     (ltd:key-event
      (sb-thread:with-mutex ((session-lock session))
-       (session-write session
-         (ltd:key-event-bytes event :application-cursor
-           (nerimux/terminal:screen-app-cursor-keys (session-screen session))))))
+       (let ((screen (session-screen session)))
+         (session-write session
+           (ltd:key-event-bytes event
+             :application-cursor (nerimux/terminal:screen-app-cursor-keys screen)
+             :application-keypad (nerimux/terminal:screen-app-keypad screen)
+             :vt52 (nerimux/terminal:screen-vt52-mode screen))))))
     (ltd:text-event (session-write session (utf8 (ltd:text-event-text event))))
     (ltd:paste-event
      (let ((text (ltd:paste-event-text event)))
