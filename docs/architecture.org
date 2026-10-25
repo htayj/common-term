@@ -1,0 +1,42 @@
+#+title: Architecture
+
+* Layers
+- =lispterm/engine=: vendored Nerimux VT parser, Unicode grid and compatibility
+  layer. Upstream terminal assertions run through real cl-weave.
+- =lispterm/pty=: Linux x86-64 glibc PTY operations, posix_spawn shell launch,
+  bounded nonblocking I/O, resize, status and reaping. Transport-only saver
+  detach is distinct from process-owner close.
+- =lispterm/display=: CPU ARGB32 cell renderer, damage tracking, Terminus OTB
+  parser and normalized terminal keyboard input.
+- =lispterm/display-x11=: native xclhb socket protocol, TrueColor transfer and
+  X11 keyboard/window events.
+- =lispterm/display-wayland=: native Lisp/CFFI Unix transport and fd passing,
+  xdg-shell, SHM buffers, scale handling and xkbcommon keyboard state.
+- =lispterm=: sessions, rendering projection, owner-thread window loop and
+  public host API. The session owns its PTY and grid independently of a view.
+- =lispterm/launcher=: shell executable and same-heap Autolith main entry.
+- =lispterm/autolith=: extension-owned registered TOOL runtime and application
+  command; stock Autolith telemetry and application methods are not replaced.
+
+* Ownership and recovery
+One window-owner thread serializes backend access, framebuffer presentation,
+input and resize. Public requests cross that boundary through host operations.
+A view can be closed and reopened while retaining the session. Quiescence
+joins the owner before a saver fork. Parent resume reconstructs ephemeral
+window state; saver detach closes inherited transports without signaling or
+waiting for a process owned by the parent.
+
+For live renderer changes, redefine Lisp functions in the running image and
+request a redraw/reopen through the host API. Source files are the persistence
+boundary. The recovery gate exercises native input, detached-session I/O,
+view recreation and quiesce/resume on both backends.
+
+* Autolith entry paths
+The standalone executable establishes its own session and controlling PTY,
+rebuilds UTF-8 fd streams, then calls Autolith main synchronously on the
+original Lisp thread. Renderer work occurs on a separate thread in that heap.
+The in-image =/graphical-shell= command starts only a fresh shell subprocess
+and graphical host; it does not replace the active application's streams.
+
+See [[file:interfaces.org][layer interfaces]], [[file:display-api.org][display API]], [[file:pty-api.org][PTY API]],
+[[file:wayland.org][Wayland internals]] and [[file:autolith-contract.org][Autolith lifecycle and replay contract]].

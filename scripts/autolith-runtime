@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Installed Autolith 0.67.0 dependency closure, never an inherited Quicklisp tree.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+al=/nix/store/ycpg6dripw0zi0gvkkiw2484raad0q7m-sbcl-autolith-0.67.0
+runtime=/nix/store/m4594yh4fzx4lhfw0qfmgq7hzsmm8iaq-sbcl-with-packages/bin/sbcl
+[[ -x $runtime && -f $al/autolith.asd ]] || {
+ echo 'Installed pinned Autolith 0.67.0 runtime is unavailable.' >&2; exit 1;
+}
+display_runtime=${LISPTERM_RUNTIME:-$root/.build/deps}
+if [[ -d $display_runtime ]]; then
+ export LISPTERM_FONT=${LISPTERM_FONT:-$display_runtime/share/fonts/terminus/ter-u16n.otb}
+ export LISPTERM_XKBCOMMON_LIBRARY=${LISPTERM_XKBCOMMON_LIBRARY:-$display_runtime/lib/libxkbcommon.so.0}
+fi
+# The packaged wrapper supplies its own registry and precompiled Nix mappings.
+unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
+export AUTOLITH_SOURCE_ROOT=$al
+export AUTOLITH_NIX_SOURCE_ROOT=$al
+export AUTOLITH_ASDF_CACHE=${AUTOLITH_ASDF_CACHE:-$root/.build/autolith/asdf}
+mkdir -p "$AUTOLITH_ASDF_CACHE"
+# Installed source provenance is read-only. These options affect only this process.
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=$al
+export GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1=$al/.git
+exec "$runtime" --no-userinit --no-sysinit "$@"

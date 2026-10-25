@@ -1,0 +1,111 @@
+#+title: Native Wayland backend
+
+* Architecture
+The =lispterm/display-wayland= ASDF system implements the backend contract in
+=display-api.org=. The terminal engine and CPU framebuffer are independent of
+Wayland. The backend owns its AF_UNIX connection, protocol object table, shared
+memory buffers and keyboard state on the display's caller thread.
+
+The transport is Common Lisp with CFFI bindings to Linux libc. It does not use
+libwayland callbacks, a foreign event-loop thread, Xlib, Xwayland, or =DISPLAY=.
+The Linux x86-64 =msghdr=, =iovec= and =cmsghdr= layouts are explicit in
+=wayland-wire.lisp=. Other architectures require a transport ABI port.
+
+The implemented protocol subset is =wl_display=, =wl_registry=,
+=wl_compositor= version 4, =wl_surface= version 4, =wl_shm= version 1,
+=wl_shm_pool=, =wl_buffer=, =wl_callback=, =wl_seat= up to version 5,
+=wl_keyboard= up to version 5, =wl_output= up to version 2 and =xdg_wm_base= /
+=xdg_surface= / =xdg_toplevel= version 1. Opcode layouts follow the core Wayland
+XML and wayland-protocols stable xdg-shell XML. Object IDs increase monotonically
+and are not reused during a connection.
+
+* Handshake and rendering
+1. Connect to the supplied socket name or =WAYLAND_DISPLAY= under
+   =XDG_RUNTIME_DIR=. An absolute socket name is also accepted.
+2. Enumerate globals, bind the required compositor, SHM and xdg-shell globals,
+   and bind optional outputs and the first seat.
+3. Create the surface, xdg surface and toplevel; commit without a buffer.
+4. Wait for =xdg_surface.configure= and acknowledge its serial before attaching
+   the first buffer. Answer =xdg_wm_base.ping= with =pong=.
+5. Allocate anonymous =memfd_create(MFD_CLOEXEC)= storage, size it, map it, and
+   pass its descriptor with =sendmsg(SCM_RIGHTS)=. Close the local descriptor
+   after creating the server's SHM pool and buffer. Destroy the pool immediately;
+   the buffer keeps the server-side reference.
+6. Copy the latest CPU ARGB32 image to an idle buffer and submit it with a frame
+   callback. Maintain at most two buffers for the current size generation.
+   Never overwrite a buffer before =wl_buffer.release=.
+7. Retain busy previous-generation buffers across resize until release, then
+   destroy the protocol object and unmap its storage. Keep at most eight buffers
+   and 256 MiB of SHM storage across all generations. Throttle submissions with
+   frame callbacks; coalesce unsent damage to the latest framebuffer.
+
+Dimensions are logical pixels. For each entered output, use its announced
+integer scale; use the maximum scale when spanning outputs. Scale the SHM image
+by integer nearest-neighbour replication and send =wl_surface.set_buffer_scale=.
+The CPU glyph rasterizer continues to use logical pixels.
+
+* Keyboard
+Read ancillary descriptors with =recvmsg(MSG_CMSG_CLOEXEC)=. Each
+=wl_keyboard.keymap= descriptor is closed after consumption, or closed directly
+for an unsupported format. Validate the event payload before taking descriptor
+ownership. Accept 2 through 16,777,216 advertised bytes, copy exactly that many
+with =pread= into owned memory, and reject short reads, invalid UTF-8, embedded
+NULs or a missing final NUL before parsing. No compositor-owned keymap storage
+is mapped; concurrent file truncation cannot fault a mapped page. Retry EINTR
+and partial reads. Free the temporary copy after constructing xkbcommon objects.
+Process compositor modifier masks and emit the shared key/focus event structures.
+Use evdev keycode + 8 for xkbcommon. Emit text, normalized special keys and
+=:shift=, =:control=, =:alt=, =:super= modifiers. Honour compositor repeat rate and
+delay on the caller's polling loop; emit at most one repeat per poll. Stop repeat
+on release or keyboard focus loss.
+
+Load =libxkbcommon.so.0= through the platform loader, or set
+=LISPTERM_XKBCOMMON_LIBRARY= to its absolute path. The transport itself needs only
+libc, CFFI and Babel.
+
+* Lifecycle and limits
+Connecting is nonblocking. Opening has a five-second bounded roundtrip/configure handshake. Polling honours
+the requested timeout. Sending is nonblocking with =MSG_NOSIGNAL=; a failed or
+partial request invalidates the connection rather than retrying ancillary rights
+ambiguously. Connection errors become =display-connection-lost= in the shared
+backend API. The session owner can close and reopen the display.
+
+Close disconnects the socket first, closes queued ancillary descriptors, unmaps
+all SHM storage and unreferences all xkbcommon objects. It is idempotent. No
+terminal process, Lisp image or other display connection is terminated.
+
+The current backend does not implement clipboard/data-device transfer, pointer
+selection, IME/text-input protocols, fractional scaling, client decorations or
+Wayland protocol extensions beyond the subset above. Font shaping belongs to the
+shared display layer. This transport currently targets Linux x86-64.
+
+* Isolated compositor harness
+Run =tests/wayland-gate.sh= for the real native compositor gate. The harness uses
+Sway 1.12 / wlroots 0.20 headless with the Pixman renderer, =wtype= 0.4 for a
+native virtual keyboard, and =grim= 1.5 for a compositor screenshot. Install these
+programs or set =LISPTERM_SWAY=, =LISPTERM_SWAYMSG=, =LISPTERM_WTYPE= and
+=LISPTERM_GRIM= to their executable paths. The Nix test environment also discovers
+store paths. Set =LISPTERM_XKBCOMMON_LIBRARY= if needed.
+
+The gate unsets =DISPLAY=, creates a private mode-0700 runtime directory, disables
+Xwayland and hardware input backends, and uses only its own compositor IPC socket.
+It exercises registry/configure/first frame, actual compositor-routed keyboard
+input, compositor-requested resize, integer scale 2, compositor screenshot,
+connection loss, reopen against a restarted compositor and file-descriptor cleanup.
+The screenshot and machine-readable evidence are under
+=.git/autolith-tests/wayland/= by default.
+
+For later terminal/Fastfetch captures:
+
+#+begin_src sh
+tests/wayland-gate.sh start "$PWD/.git/my-wayland-capture"
+. .git/my-wayland-capture/env.sh
+# DISPLAY is unset; run the native Wayland frontend here.
+"$LISPTERM_GRIM" .git/my-wayland-capture/screenshot.png
+tests/wayland-gate.sh stop "$PWD/.git/my-wayland-capture"
+#+end_src
+
+The harness never injects input into the user's compositor. The =start= command
+leaves its private compositor running until =stop=. Stop validates the recorded
+process's configuration path before terminating it. Remove the private runtime
+directory recorded in =runtime-path= after stopping if it is no longer needed.

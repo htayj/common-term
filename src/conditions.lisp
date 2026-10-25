@@ -1,0 +1,7 @@
+(in-package #:lispterm)
+(define-condition lispterm-error (error)
+  ((operation :initarg :operation :initform nil :reader error-operation)
+   (detail :initarg :detail :initform nil :reader error-detail))
+  (:report (lambda (condition stream)
+             (format stream "lispterm ~A: ~A" (error-operation condition)
+                     (error-detail condition)))))

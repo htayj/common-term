@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # Create the GitHub Release and upload assets.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Release metadata and provenance must agree before public assets are made.
+      - name: Verify release provenance and version
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PACKAGE: cl-weave
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag $GITHUB_REF_NAME must use stable SemVer vX.Y.Z" >&2
+            exit 1
+          fi
+          asd_version="$(perl -ne 'if (/^[[:space:]]*:version "([^"]+)"/) { print $1; exit }' "$PACKAGE.asd")"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "asd=$asd_version tag=$tag_version"
+          if [[ -z "$asd_version" ]]; then
+            echo "::error::$PACKAGE.asd does not contain a :version form" >&2
+            exit 1
+          fi
+          if [[ "$asd_version" != "$tag_version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match $PACKAGE.asd version $asd_version" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Tag $GITHUB_REF_NAME must point to a commit reachable from $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+
+      - name: Set up Nix
+        uses: ./.github/actions/nix-setup
+        with:
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # Never publish a release that does not pass its own test suite.
+      - name: Verify the tagged tree
+        run: nix flake check --print-build-logs --max-jobs 2
+
+      - name: Build and bundle test report artifacts
+        run: |
+          set -euo pipefail
+          outputs="$(timeout 600s nix build --no-link --print-out-paths \
+            ".#checks.x86_64-linux.json-results-artifact" \
+            ".#checks.x86_64-linux.jsonl-events-artifact" \
+            ".#checks.x86_64-linux.cli-json-results" \
+            ".#checks.x86_64-linux.plan-artifact" \
+            ".#checks.x86_64-linux.watch-once-artifact" \
+            ".#checks.x86_64-linux.tap-artifact" \
+            ".#checks.x86_64-linux.junit-artifact" \
+            ".#checks.x86_64-linux.coverage-artifact")"
+          mkdir -p release-artifacts
+          while IFS= read -r output; do
+            test -d "$output"
+            cp -R "$output"/. release-artifacts/
+          done <<< "$outputs"
+          tar -czf "cl-weave-test-reports-${GITHUB_REF_NAME}.tar.gz" -C release-artifacts .
+
+      # Keep the release in draft status until its notes are written.
+      - name: Create draft release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: cl-weave-test-reports-${{ github.ref_name }}.tar.gz

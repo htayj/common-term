@@ -1,0 +1,75 @@
+#+title: Independent adoption lifecycle follow-up
+#+date: 2026-10-25
+
+* Verdict and scope
+RESOLVED: review52 MEDIUM, new shell escaping runtime checkpoint ownership.
+No remaining concrete finding in this bounded recheck. TASK route, no subagents.
+Reviewed =src/autolith-adapter.lisp=, both runtime-adoption test files and the
+relevant finding in =evidence/review-integration.org=. Existing host lifecycle
+code was consulted only to interpret retained-handle cleanup and resume.
+No production/test edits, staging, commits, live-image operations or auth access.
+The only deliverable is this report; disposable test artifacts are ignored.
+The separate input backpressure finding is outside this verdict.
+
+* Mechanism inspection
+=open-owned-host= checks RUNNING and increments OPENINGS under the runtime mutex
+before invoking the host factory. Factory invocation is outside that mutex.
+The original reentrant gap can therefore call runtime-status and TOOL close
+without recursively acquiring an already held runtime mutex. TOOL close checks
+OPENINGS before changing hosts, state, or rollback tokens and signals the typed
+runtime-opening condition. Publication and reservation decrement execute together
+under the runtime mutex in unwind-protect. A subsequent close cannot observe a
+released reservation without the returned host already being registered.
+
+Interrupts are disabled around reservation/publication, locally permitted during
+the factory. The publication region contains no external callback or subsequent
+state-check failure. A host-error handler captures the partial-open recovery
+handle before unwinding; the original condition is not replaced. Ordinary factory
+failure and nonlocal exit release the reservation. Existing close/resume callbacks
+still use their existing lifecycle locking; the new factory path introduces no
+callback-under-runtime-lock dependency.
+
+* Independent execution
+All commands exited 0 in disposable packaged Autolith processes:
+- =scripts/autolith-runtime --script tests/run-runtime-adoption-tests.lisp=:
+  40 checks. Exact original same-thread close between real OPEN and publication;
+  semaphore-ordered real concurrent close; installed checkpoint backend validation
+  during that gap; later close/resume includes the published host; failed-open plus
+  failed-cleanup preserves the identical condition and registered recovery handle;
+  ordinary failure releases reservation; final FD/thread baselines match exactly,
+  children reaped, host/runtime registries and tokens empty.
+  Execution =d50e2149-153f-40b4-9c4c-dbdd6fb4cd19=.
+- =tests/checkpoint-gate.sh=: actual installed checkpoint lifecycle, 20 checks,
+  isolated gate-owned HOME/XDG and native Wayland compositor. Validation joins,
+  later-tool rollback, partial-close rollback, retained-token retry, hosted-main
+  pre-fork refusal, actual saver fork detach/prune and usable parent shell passed.
+  Execution =f5dff31b-5e83-4723-893c-7245ca220fc1=.
+- Additional stdin-only disposable script, no test-source edits: reran the 40
+  checks, then 12 additional assertions. A nonlocal THROW from the factory releases
+  its reservation. A real failed-open/failed-cleanup recovery handle remains
+  runtime-owned through an actual TOOL close failure; runtime state rolls back to
+  RUNNING. After clearing cleanup failure, TOOL close quiesces that retained host,
+  TOOL resume restores its worker, final close succeeds, and exact FD/thread
+  baselines plus empty runtime/token registries hold.
+  Execution =62937c91-91b2-408c-8cdb-89edb8d48478=.
+
+Logs and hash manifests: =.build/evidence/adoption-followup57/=
+=adoption.log=, =checkpoint.log=, =extra.log=,
+=source-before.sha256=, =source-after.sha256=, =originals-before.sha256=.
+The extra probe's complete input is retained with the shell execution record.
+
+* Source and original-evidence stability
+Before/after manifests are byte-identical; SHA256 verification passed:
+- adapter: ca483055d14ec6689319e56a28fb4ada28627c24263b762ab89a5089bd8e49f9
+- runtime-adoption-tests: 8b253dc1f6c502d089337f81170a0d0c2305272bcbcee8ad58946938e2bbfecb
+- run-runtime-adoption-tests: 6592718c263a48d45db68574fd554dc1a20656faa2dc323398635ba9ac614482
+
+Both original Fastfetch PNGs, fastfetch.org, all three original Autolith PNGs
+and autolith.org passed before/after SHA256 checks. No screenshot gates ran.
+No original captures/provenance or protected compositors were edited.
+
+* Limits
+This is a targeted adoption recheck, not another broad integration/native audit.
+No graphical saved-core restoration is claimed. Catastrophic allocation failure
+inside the short ownership-list publication region was not fault-injected;
+there is no ordinary host callback or lifecycle rejection in that region.

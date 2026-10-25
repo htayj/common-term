@@ -1,0 +1,36 @@
+(in-package #:lispterm.engine.compat)
+(deftype lock () 'sb-thread:mutex)
+(defun make-lock (&key name) (sb-thread:make-mutex :name name))
+(defmacro with-lock-held ((lock) &body body)
+  `(sb-thread:with-mutex (,lock) ,@body))
+(define-condition decode-error (error)
+  ((cause :initarg :cause :reader decode-error-cause)))
+(defun string-to-octets (string &key (encoding :utf-8))
+  (babel:string-to-octets string :encoding encoding))
+(defun parse-integer-or-nil (string &key (radix 10) junk-allowed)
+  (handler-case (parse-integer string :radix radix :junk-allowed junk-allowed)
+    (parse-error () nil)))
+(defun split-string (string &key (separator #\Space))
+  "Split on one character, retaining empty fields including trailing fields."
+  (loop for start = 0 then (1+ end)
+        for end = (position separator string :start start)
+        collect (subseq string start end)
+        while end))
+(defun version-string () "lispterm/nerimux-0.4.0")
+(defun char-width (character)
+  "Terminal width using the pinned SBCL Unicode database, ambiguous narrow."
+  (let ((category (sb-unicode:general-category character)) (code (char-code character)))
+    (cond ((= code #xad) 1)
+          ((<= #x1160 code #x11ff) 0)
+          ((member category '(:mn :me :cf :cc :cs)) 0)
+          ((member (sb-unicode:east-asian-width character) '(:w :f)) 2)
+          (t 1))))
+(defun octets-to-string (octets &key (encoding :utf-8) (start 0) end
+                                    (errorp t) (replacement #\REPLACEMENT_CHARACTER))
+  (handler-case
+      (sb-ext:octets-to-string
+       (coerce octets '(simple-array (unsigned-byte 8) (*)))
+       :start start :end end
+       :external-format (if errorp encoding (list encoding :replacement replacement)))
+    (sb-int:character-decoding-error (condition)
+      (error 'decode-error :cause condition))))

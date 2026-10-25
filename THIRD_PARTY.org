@@ -1,0 +1,67 @@
+#+title: Third-party source provenance
+
+* Nerimux terminal engine
+Source: git@github.com:nerima-lisp/nerimux.git
+Commit: fd19d6abc48296c7faae4b1a150a96c20033a330
+Vendored terminal src/ and t/ from packages/terminal/ under engine/nerimux/.
+MIT notice: engine/nerimux/LICENSE. Original ASDF component order retained in
+engine/nerimux/UPSTREAM-nerimux-terminal.asd.txt.
+
+Local integration replaces imports/references to cl-host-kit, cl-codec-kit,
+cl-concurrent-kit, cl-tty-kit, nerimux text/version packages, and the one
+cl-regex-kit split operation with lispterm.engine.compat. The terminal engine
+and its upstream assertions otherwise retain their upstream behavior.
+Compatibility implementation is in src/engine/compat.lisp. Character width
+uses SBCL's Unicode category/East Asian Width database, with standard terminal
+exceptions for Hangul Jamo U+1160..U+11FF (zero width) and soft hyphen (one).
+The former copied cl-tty-kit width table and implementation are not compiled
+or shipped; its MIT notice is retained as engine/nerimux/LICENSE.cl-tty-kit.
+
+* cl-weave test framework
+Source: git@github.com:takeokunn/cl-weave.git (upstream now nerima-lisp/cl-weave)
+Commit: c530c56c1df948e2665009f6acad26c2c8f66dbb
+Vendored as regular files under vendor/cl-weave/; MIT, vendor/cl-weave/LICENSE.
+No semantic test shim. Version 1.5.0. Local changes remove redundant EOF blank lines.
+
+* X11 client dependencies
+- xclhb: git@github.com:yoshida2koji/xclhb.git, upstream source
+  88f4785005b8d578851f0113fa42f50ec4203d44; vendored under vendor/xclhb/.
+  Includes the prior tested multi-digit DISPLAY socket-path repair, recorded
+  upstream-research local commit d191e09a61abbc13bd264d28b3d8cdc0264672cf.
+  Local connection.lisp also accepts an explicit display name through
+  x-connect/make-x-stream/socket-path without mutating process DISPLAY.
+  MIT notice: vendor/xclhb/LICENSE.
+- struct-plus: git@github.com:yoshida2koji/struct-plus.git,
+  79a79a5ab0b6e71358b0e01adfbee97b93263f06; vendor/struct-plus/;
+  MIT notice vendor/struct-plus/LICENSE. ASDF system name is struct+.
+
+Delivery hygiene removes trailing spaces from selected Nerimux source/test lines,
+xclhb connection.lisp and the struct-plus README code example. It also removes
+redundant EOF blank lines from the retained cl-tty-kit notice and selected
+cl-weave and xclhb files, preserving one terminal newline. These whitespace-only
+edits are additional to the integration adaptations documented above.
+
+* Pinned runtime dependencies
+scripts/deps.nix pins nixpkgs d482ef84049d9b7276b83a06e4e4d76983830097
+(the installed Autolith 0.67.0 package's pin) and selects SBCL, Alexandria,
+Babel, Bordeaux Threads, CFFI, FiveAM, ZPNG, Terminus fonts and libxkbcommon.
+Nix retains source hashes and package license metadata for the closure.
+No application runtime dependency uses research files under .git/autolith-builds
+and no user Quicklisp initialization is needed.
+
+- Terminus font 4.49.1: separately packaged, not copied into this repository.
+  Upstream: https://terminus-font.sourceforge.net/ . Font license: SIL Open
+  Font License 1.1 (OFL-1.1), as declared by the pinned nixpkgs terminus_font
+  derivation. The runtime resolves share/fonts/terminus/ter-u16n.otb through
+  the pinned closure; distributors copying font data must preserve its notices.
+- libxkbcommon 1.13.2: separately packaged native keyboard dependency, MIT.
+  Upstream: https://xkbcommon.org/ . Lispterm uses its keyboard API through
+  CFFI; Wayland transport and protocol dispatch are local Lisp implementations.
+- The optional verification closure adds Xvfb, xdotool, ImageMagick, Sway,
+  wtype, grim, Fastfetch and standard shell/process tools. They are separate
+  Nix packages, not vendored project code. Their respective package licenses
+  apply when redistributing the closure.
+
+Project code is licensed under the top-level MIT LICENSE. Installed Autolith
+is an external package with its own license and provenance; the runtime adapter
+requires the documented installed 0.67.0 closure.

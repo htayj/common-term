@@ -1,0 +1,79 @@
+#+title: Independent PTY close follow-up
+#+date: 2026-10-25
+
+* Finding assessment
+The MEDIUM close-starvation finding in [[file:review-input-followup.org][input follow-up]] is resolved
+by fix59. No remaining concrete PTY close finding was identified in this review.
+This reviewer read the production cancellation, read/write, process close/reap,
+and saver-detach paths and the deterministic, stress and disposable-fork tests.
+Production and test implementations were read-only.
+
+* Cancellation and lock ordering
+CLOSE-PTY publishes its cancellation request under a separate short-held mutex
+before waiting for the transport mutex. Publication releases the cancellation
+mutex before transport acquisition. I/O may acquire cancellation while holding
+transport; no production path holds cancellation while waiting for transport.
+Process polling/signalling uses the process mutex after transport release.
+Concurrent closers invalidate and close the master exactly once under transport
+ownership; process wait/kill operations serialize their individual state access.
+
+Active and queued readers/writers check cancellation before another poll slice.
+The master descriptor is protected through poll and read/write, preventing close
+and descriptor reuse during the native call. Active reads return EOF; active
+writes return their accepted prefix. Calls entering after publication signal the
+typed closed condition. Polling slices are at most 50ms; writer deadlines retain
+the default two-second bound and timeout zero makes a nonwaiting attempt.
+
+Saver DETACH-PTY invalidates copied ownership and replaces transport, process and
+cancellation mutexes without acquiring inherited mutexes. The disposable fork
+regression deliberately holds all three mutexes across fork; child detach and
+continued parent usability pass in the actual PTY suite.
+
+* Independent execution
+Exact standalone command:
+#+begin_src sh
+scripts/sbcl --script tests/run-pty-close-tests.lisp
+#+end_src
+Exit0, 503 checks. Both read-holder and write-holder barriers were inspected and
+executed: seven I/O callers pass the real initial open check, one holds the real
+transport mutex inside readiness, and cancellation publication completes before
+that mutex is released. The FD is still live before release. Active/queued I/O
+then returns EOF/zero; there is exactly one readiness invocation and one native
+descriptor close. Three concurrent closers finish normally.
+
+The 120-iteration stress uses 60 raw no-child and 60 real HUP-ignoring-child
+PTYs, each with four readers, two writers and three closers. Independent run:
+max0.068s, p95 0.067999s, zero close+all-join measurements >=1s. Every child is
+SIGKILLed and reaped (ECHILD checked); FD and thread counts return exactly to
+baseline. No output is printed within measured regions. The same503 checks
+passed again through the final dispatcher PTY gate with identical maxima.
+
+An additional independent original-shape reproduction opened12 raw no-child
+PTYs, started a 30-second read, slept0.1s, then measured CLOSE-PTY plus reader
+join. All readers returned EOF; max0.001s, all12 below1s. The former independent
+12-run probe had max10.740839s with seven measurements over1s.
+
+* Dispatcher and evidence
+Only =tests/verify.sh= was edited outside these reports: the PTY branch runs
+PTY66 plus disposable fork10 followed by the new503-check close suite. Unit
+retains the ordinary PTY suite, avoiding duplicate503 execution within unit.
+The real PTY dispatcher finished in14s, within its120s gate budget.
+
+Logs and before/after manifests:
+=.build/evidence/final-acceptance60/{close-independent.log,original-repro12.log,pty.log,pty-before.sha256,pty-after-check.log,source-before.sha256,source-after-check.log}=.
+All reviewed source/test hashes match before and after acceptance:
+#+begin_example
+8b5d725b7ec6452e9f1cd454bdaee6bdde33a67979df172c66d20b2271250b47  src/pty/package.lisp
+45c346f05dac8f6ebde94618d5a87d5570569ec5d6ca73cbd9e46b51c4675a61  src/pty/posix.lisp
+f47dc232e982250e80d18d19826b46cb6cab22eafdaa06e576b2a87e341f81a6  src/pty/process.lisp
+6d103de4d975d296bb9f89e2a7a88827729f89b9d306c64b02a33194d1dd065d  tests/pty-tests.lisp
+a11fbc70743dab84046ca4fd0d5315b761de45b6e0123972f2772aab0b3a0b22  tests/pty-close-concurrency-tests.lisp
+b8e948ba64d1c459885492ec69d5cc43fcc959866d5997f5bac9cac85b19bfa1  tests/run-pty-close-tests.lisp
+#+end_example
+
+* Limits
+This is bounded concurrency testing and source review, not a scheduler fairness
+or arbitrary native failure proof. Cancellation removes reliance on transport
+mutex handoff fairness for the reproduced polling starvation. Catastrophic
+allocation failure and arbitrary operating-system suspension were not injected.
+Final delivery checks and signing status are recorded in [[file:acceptance.org][acceptance]].

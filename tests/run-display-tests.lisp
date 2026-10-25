@@ -1,0 +1,5 @@
+(load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
+(asdf:load-system "babel")
+(dolist (n '("package" "cells" "font-otb" "font" "keys" "protocol" "framebuffer"))
+ (load (merge-pathnames (format nil "../src/display/~a.lisp" n) *load-truename*)))
+(load (merge-pathnames "display-tests.lisp" *load-truename*))

@@ -1,0 +1,110 @@
+#+TITLE: Display choice
+
+* Decision
+
+Use a package-owned display layer with native Wayland and X11 backends.
+Keep terminal/session state independent of windows. Own event dispatch,
+coalesced damage rendering, font/input protocols and restartable lifecycle.
+Both backends present the shared CPU framebuffer and normalized keyboard
+protocol. McCLIM is excluded by the user's requirement.
+
+Native Wayland uses local Unix transport and fd passing, xdg-shell, SHM
+buffers and libxkbcommon. Its acceptance gate runs under headless Sway with
+DISPLAY unset. X11 uses the low-level xclhb protocol bindings and is verified
+at 16-bit and 24-bit depth. Xwayland is optional when running the X11 backend,
+not a requirement of the native Wayland backend.
+
+Automatic selection prefers Wayland when WAYLAND_DISPLAY is set, otherwise
+X11. Explicit backend failure is reported without silently switching protocols.
+Backend selection does not enter the VT emulator or Autolith lifecycle owner.
+Sophisticated shaping and broader platform support are future work.
+
+* CLOG investigation: retrieved primary sources
+
+Retrieved on 2026-10-25 through direct HTTPS page/source requests, not web
+search or Git transport. These are moving upstream main-branch references:
+
+- [[https://raw.githubusercontent.com/rabbibotton/clog/main/README.md][Upstream README]]:
+  BSD-3-Clause; browser or embedded browser control for rendering;
+  WebSocket communications; application logic/events can run in a local Lisp
+  server. SBCL is listed among development implementations.
+- [[https://raw.githubusercontent.com/rabbibotton/clog/main/source/clog-system.lisp][clog-system.lisp]]:
+  =initialize= accepts host, port, server, static-root, boot settings and SSL
+  settings. Observed defaults are host =0.0.0.0=, port 8080 and server
+  =:hunchentoot=. Port NIL/0 selects an available random port.
+  =open-browser= invokes =xdg-open= on Linux.
+- [[https://raw.githubusercontent.com/rabbibotton/clog/main/clog.asd][clog.asd]]:
+  dependencies include Clack, websocket-driver, Hunchentoot,
+  Bordeaux Threads, SQLite and cl-dbi. Components include canvas/WebGL,
+  DOM/form controls, authentication and presentation facilities.
+- [[https://raw.githubusercontent.com/rabbibotton/clog/main/static-files/boot.html][boot.html]]:
+  uses local =/js/jquery.min.js= and =/js/boot.js= paths.
+- [[https://rabbibotton.github.io/clog/clog-manual.html][Reference manual]] is linked by
+  the README, but was not retrieved in this research.
+
+The README calls the release 2.3 while the retrieved ASDF definition says
+2.2. Do not infer a pinned package version from those moving pages. Pin and
+verify a source revision before a CLOG implementation.
+
+* Comparison for this host
+
+| Concern | Package-owned native Wayland/X11 | CLOG/browser |
+|---------+----------------------------------+--------------|
+| Same Lisp heap | Display/session/Autolith share image | Lisp server/session/Autolith may share image; browser is external |
+| Start without terminal | Executable opens native window | Executable starts Lisp server and opens browser |
+| Presentation ownership | Direct grid renderer, explicit scheduling | DOM/canvas/WebGL renderer and browser scheduling |
+| Input | Translate native keyboard events to terminal bytes | Translate browser events to terminal bytes |
+| Recovery | Recreate display/window, retain session | Reconnect or recreate browser view, retain server-side session |
+| Dependencies | Wayland compositor or X server, bindings, fonts | HTTP/WebSocket stack, local assets, browser or embedded webview |
+| Added local attack surface | Existing compositor/X server connection | Local listening socket plus browser origins and sessions |
+
+CLOG is compatible with the same-image requirement. A browser UI does not
+force Autolith into a separate Lisp heap. It is a credible later backend,
+especially for remote UI or richer controls. It does not provide our terminal
+engine, PTY lifecycle, checkpoint quiescence, or safe source replay by itself.
+Its presentation facilities also do not imply McCLIM compatibility.
+
+Choose native Wayland and X11 because the first requirement is a local terminal
+window and an explicit, inspectable render/recovery loop. There is no measured
+CLOG latency or rendering failure behind this choice. Browser-terminal speed,
+IME behavior and reconnection were not benchmarked; no CLOG prototype was run.
+
+* Requirements for either backend
+
+- Keep each session independently addressable. Bind input/render subscriptions
+  to a view rather than make the view own the PTY.
+- Serialize resize, grid snapshots and input mode changes. Coalesce damage
+  with a bounded frame rate, wake promptly for input, redraw fully on expose.
+- Preserve Unicode decoding across byte chunks, cursor state, colors and
+  alternate-screen state through display loss.
+- Keep frontend queues and detached-session history bounded. Avoid synchronous
+  per-cell transport to an external browser; batch rows/damage if using CLOG.
+- Catch recoverable errors inside supervised threads. Validate native display
+  disconnect behavior before relying on Lisp conditions for recovery.
+- Quiesce and join threads before checkpoint fork, detach inherited handles
+  only in the saver, and reinitialize ephemeral display state on resume.
+  See [[file:autolith-contract.org][Autolith contract]].
+
+* CLOG-specific gates before selecting that backend
+
+These are requirements/proposals, not verified upstream features:
+
+1. Bind explicitly to 127.0.0.1 rather than the observed all-interface default.
+   Require unguessable per-launch session authorization, validate WebSocket
+   origins, and reject unauthenticated attachment/input. Do not assume a
+   random port or loopback address provides authorization.
+2. Serve pinned local JS/fonts/assets and prove offline launch. The observed
+   boot page references local assets; this does not establish that every
+   optional widget avoids CDN/network dependencies.
+3. Test keydown/text/IME composition separately, modifier keys, paste,
+   bracketed paste, browser shortcut conflicts, focus, resize and clipboard
+   permission behavior. API/component presence is not terminal conformance.
+4. Test tab close/reload, WebSocket loss and browser relaunch without closing
+   the PTY. Authenticate reattachment and redraw the full screen.
+5. Make HTTP/WebSocket/browser-facing worker threads participate in pre-fork
+   quiescence. No inherited listener, connection or browser object may be
+   treated as live state after checkpoint restoration.
+6. Verify installed browser discovery when launched from a desktop environment;
+   =xdg-open= is a launch mechanism, not proof that a browser is installed.
+
+These costs justify deferring CLOG, not rejecting its architecture.

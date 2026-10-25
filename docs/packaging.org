@@ -1,0 +1,57 @@
+#+title: Packaging
+
+* Reproducible dependency closure
+Run =scripts/bootstrap-deps= from the source checkout. Nix evaluates
+=scripts/deps.nix= at nixpkgs revision
+=d482ef84049d9b7276b83a06e4e4d76983830097= and links the resulting closure at
+=.build/deps=. The closure includes SBCL with Alexandria, Babel, Bordeaux
+Threads, CFFI, FiveAM and ZPNG, Terminus OTB fonts and libxkbcommon.
+Vendored cl-weave, xclhb and struct+ are registered by =scripts/bootstrap.lisp=.
+Builds and caches are local to ignored directories; loading ASDF opens no UI.
+
+=scripts/sbcl= bypasses system/user init and clears inherited ASDF registry
+variables before invoking the packaged wrapper. Its defaults are:
+
+| Variable | Default |
+|----------+---------|
+| LISPTERM_RUNTIME | checkout/.build/deps |
+| LISPTERM_SBCL | runtime/bin/sbcl |
+| LISPTERM_FONT | runtime/share/fonts/terminus/ter-u16n.otb |
+| LISPTERM_XKBCOMMON_LIBRARY | runtime/lib/libxkbcommon.so.0 |
+
+Use these variables for an equivalent externally provisioned runtime. The OTB
+parser reads bitmap Terminus OpenType files directly; it is not a general
+outline font renderer. Wayland's CFFI loader opens the explicit xkbcommon
+library path when supplied, otherwise the platform soname. The launcher
+requires Bash and =setsid= from util-linux for its disposable Autolith entry.
+The PTY and Wayland native ABI targets Linux x86-64 glibc and SBCL.
+
+* Autolith dependency closure
+=scripts/autolith-runtime= selects the installed Autolith 0.67.0 package and
+its packaged SBCL dependency environment. This is a separate, explicitly
+checked installed-package requirement, not a Quicklisp download or a file
+under =.git=. Its exact installed paths are recorded in that script and the
+integration contract. A different installation needs a reviewed runtime
+adapter with matching Autolith lifecycle interfaces. Repository-only shell
+mode uses the independently built closure above.
+
+* Verification tools
+Run =scripts/bootstrap-deps --tests= to additionally build =.build/test-tools=
+from the same pin. It includes Xvfb, xdotool, ImageMagick, Sway, wtype, grim,
+Fastfetch, Bash, coreutils, Git, util-linux and procps. =tests/verify.sh=
+prepends this directory to PATH and supplies the pinned Fastfetch executable.
+The graphical harnesses create private X servers or headless Sway compositors;
+Wayland acceptance runs with DISPLAY unset. These tools are verification
+requirements, not dependencies of the Lisp renderer.
+
+Run =tests/verify.sh packaging= for a fresh HOME/XDG/cache runtime load from
+an isolated copy of the deliverable sources, without =.git= or =.build=.
+The gate parses the actual font, loads xkbcommon, verifies inert ASDF loading
+and checks Bash syntax in the delivered scripts. Run =tests/verify.sh git= only after the final local signed
+commit. It requires a clean tree, a valid signature by the requested agent
+fingerprint and SSH GitHub remotes. It does not alter Git configuration.
+
+Distribute the source tree, its vendor notices and a built or reproducibly
+recreated runtime closure together. Preserve licenses for any copied closure
+components. Font data is not vendored in this source checkout; its separately
+packaged provenance and license are in [[file:../THIRD_PARTY.org][THIRD_PARTY.org]].

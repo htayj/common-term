@@ -1,0 +1,119 @@
+#+title: Running Autolith inside lispterm
+
+* Startup
+
+Run =bin/lispterm= for a fresh shell. Select =--backend wayland= for native
+Wayland, =--backend x11= for X11, or =--backend auto= to select from the session
+environment. Pass =--display NAME=, =--title TEXT=, =--rows N=, and =--columns N=
+to configure the window. Pass a program and arguments after =--=.
+
+Run =bin/lispterm --autolith --backend wayland= to start Autolith in the same
+SBCL image. Pass Autolith arguments after =--=. The standalone executable starts
+a fresh POSIX session, attaches a PTY slave to descriptors 0/1/2, rebuilds SBCL's
+standard and terminal streams, and sets =TERM=xterm-256color= and
+=AUTOLITH_SESSION_STYLE=direct=. It then opens the window over the master and
+calls the actual =autolith::main= synchronously on SBCL's original main thread.
+Autolith is not spawned as a subprocess. A separate diagnostic descriptor
+retains bootstrap/runtime evidence when the PTY becomes standard output.
+
+=scripts/autolith-runtime= selects the installed Autolith 0.67.0 Nix dependency
+closure and checks its pinned paths. It supplies process-local source provenance
+and Git safe-directory settings. No global Git settings or primary terminal
+state are changed. The extension runtime produced by =scripts/bootstrap-deps=
+is sufficient for shell mode; the installed Autolith closure is required for
+=--autolith=. Revise this adapter explicitly when upgrading Autolith.
+
+* Entry from a running Autolith
+
+Load =lispterm/autolith= through ASDF, then invoke =/graphical-shell=. This
+registered application command opens a new shell using the current heap without
+redirecting the primary application's stdio or starting a second Autolith main.
+Its metadata permits execution during a turn and declares shared primary
+terminal ownership. Inspect the host through =lispterm:status=.
+
+For explicit control, call =lispterm:open=, =lispterm:send-input=,
+=lispterm:status=, =lispterm:reopen=, and =lispterm:close=. To add a manually opened
+host to an application's shutdown/checkpoint ownership, first call
+=lispterm.autolith:register-runtime= with that application's actual tool registry,
+then =lispterm.autolith:adopt-host=. Call =forget-host= when closing it permanently.
+The graphical-shell command performs registration automatically.
+
+* Runtime ownership
+
+The extension-owned =runtime-tool= specializes Autolith's TOOL runtime identity,
+close, resume, detach, and checkpoint-prune protocol. The real registry deduplicates
+owners by their shared runtime identity. A scoped registry initialization hook
+registers the owner during standalone main, only on its original thread and only
+under the launcher's dynamic binding. Loading ASDF alone opens no windows and
+does not register owners in unrelated application registries. There is no
+replacement APPLICATION checkpoint method or Autolith function definition.
+
+=/graphical-shell= reserves runtime ownership before opening its host. If checkpoint
+validation overlaps that opening, validation refuses before quiescing any host;
+retry after the opening completes. The factory runs outside the runtime mutex.
+Publication and release of the reservation are atomic, including a partial-open
+recovery host returned through =host-error-host= when native cleanup fails. That
+host retains runtime ownership for cleanup retry. Opening while the runtime is
+quiesced or awaiting rollback is refused before allocating a host. For a manually
+opened host, the caller owns cleanup until =adopt-host= succeeds.
+
+For shell-only runtimes, close quiesces and joins the owned windows while retaining
+PTYs and emulator state. Successful quiesces produce exact parent-only rollback
+tokens. If a later host fails, the adapter resumes its previously stopped hosts
+before signaling; the failing host must restore its own partial work. Resume
+consumes successful tokens so a partial resume can be retried. In the saver child,
+detach releases inherited handles without waiting on or signaling the parent's
+shells, and prune removes the transient owner binding from the saved registry.
+
+* Checkpoint capability
+
+Graphical Autolith exact-heap checkpoint restoration is unavailable. Stock
+Autolith 0.67.0 restores through =checkpoint-resume-main= rather than this graphical
+entry point. Restoring its primary streams after dropping their PTY/window
+handles would be unsafe. The registered hosted-main owner therefore signals
+=checkpoint-unavailable= from the actual pre-fork TOOL validation path, before
+quiescing the primary terminal. Source-backed startup is the supported path.
+Ordinary launcher exit uses outer host/PTY cleanup even though registry close
+refuses hosted-main checkpoint preparation.
+
+The shell-only TOOL lifecycle is independently testable, including an actual fork
+and saver-child detach followed by usable parent shell input. These checks do
+not establish saved-core graphical restoration. Manually invoking internal
+checkpoint functions without the actual application's registered tool registry
+bypasses the ownership contract.
+
+* Source tracking
+
+The default extension mode is source-backed. Edit/reload the repository to retain
+changes. Loading =lispterm= and redefining its functions in the shared heap does
+not create Autolith private mutation journal entries.
+
+Launcher preloading alone does not make private =self.commit= persistence safe.
+Autolith's clean replay probe starts a pinned stock active core/executable and
+bypasses this launcher; private replay also precedes user init. A journal mode
+requires extension preloading across startup, selected active core, clean probe,
+and recovery/checkpoint entry, followed by a successful clean-process probe and
+subsequent boot. This integration does not advertise that capability.
+
+* Reproducible isolated verification
+
+Run =tests/autolith-gate.sh wayland= and =tests/autolith-gate.sh x11=. Each gate
+uses a new display/compositor and a dedicated HOME/config/data/state/cache tree
+under =.build/autolith/=. The standalone process starts with stdin =/dev/null=.
+The probe enters real Lisp through the hosted terminal, records PID/main-thread,
+isatty/direct-style/TERM evidence inside the actual runtime, invokes the registered
+active-image command handler with a fresh PTY while checking descriptor and stream
+object identity, and redefines the live cell renderer through the real Lisp prompt.
+It reopens the window over the same session/PTY, resizes through the compositor,
+captures the native window with the modified renderer, then enters =/quit=.
+No input is sent to the user's session.
+
+Run =tests/checkpoint-gate.sh= for actual installed backend validation callbacks,
+close/resume, failed-validation recovery, partial-close rollback, hosted-main
+refusal, real forked saver detach/prune, and usable parent shell input afterward.
+Logs and structured runtime evidence are retained under =.build/autolith/=.
+
+Run =scripts/autolith-runtime --script tests/run-runtime-adoption-tests.lisp= in a
+disposable process for deterministic and concurrent opening/checkpoint interleavings,
+partial-open cleanup retry ownership, and final PTY/process/worker/FD/registry checks.
+Screenshots are written under =evidence/=.

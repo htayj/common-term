@@ -1,0 +1,76 @@
+#+title: Display interface, frozen Batch A
+
+* Ownership
+Package LISPTERM.DISPLAY (nickname LTD). Backends LISPTERM.DISPLAY.X11 and
+LISPTERM.DISPLAY.WAYLAND. Caller-thread-only operations. No terminal engine types.
+The shared core owns a CPU ARGB32 framebuffer, damage tracking, glyph cache and
+box drawing. Backends own transport, window handles and input translation.
+
+* Public operations
+- open-display &key backend display-name title columns rows font-path font-size
+  returns a display. :auto selects native Wayland when available, otherwise X11.
+- close-display display is idempotent; display-open-p display returns a boolean.
+- reopen-display display returns a new display with the saved configuration.
+- poll-events display &key timeout returns a list of events (timeout seconds).
+- draw-cells display row column cells; draw-frame display grid &key cursor-row
+  cursor-col cursor-visible. Grid is a rank-two array indexed [row,column].
+- set-cursor display row column &key visible; present display submits damage.
+- set-title display title; display-metrics display returns a plist including
+  :columns :rows :width :height :cell-width :cell-height :backend.
+
+* Cell and event values
+make-cell &key char width fg bg bold inverse underline. Width is 2 on a wide
+leading cell, 0 on its continuation, otherwise 1. Colours are NIL (default) or
+24-bit RGB integers. palette-color index returns RGB; char-cell-width character.
+key-event has key (character or :up/:down/:left/:right/:f1..:f12), text, modifiers
+(list of :shift :control :alt :super). text-event has text; resize-event has
+columns rows width height; close-event; focus-event has focused-p; paste-event
+has text. key-event-bytes event &key application-cursor returns UTF-8 octets.
+
+* Backend protocol
+backend-open backend display; backend-close backend display;
+backend-poll backend display timeout; backend-blit backend display framebuffer
+rectangles; backend-set-title backend display title; backend-metrics backend
+display. Backend names are keywords :x11 and :wayland. Implementors may store
+backend state on the shared display, but must keep rendering engine-independent.
+Rectangles use (x y width height) pixel coordinates. Framebuffer entries are
+32-bit #xAARRGGBB words in a row-major one-dimensional array.
+
+* Conditions and recovery
+display-error, display-open-failed, display-connection-lost. Connection failure
+must unwind to the owning session, not terminate the Lisp runtime. No hidden
+backend fallback when a backend was explicitly selected. Reopen creates fresh
+transport handles. Closing and polling must be bounded and testable.
+
+* Backend implementation internals
+All frontend operations use the calling thread; store and use each display on
+its creator thread. The frontend makes no hidden UI threads. The frontend sets
+=display-open-p= after =backend-open= returns. Backend open failures call
+=backend-close= on partial state before signaling =display-open-failed=.
+Backend close implementations must tolerate missing or partial state.
+
+Exported mutable accessors are =display-backend-state=, =display-width=,
+=display-height=, =display-columns=, =display-rows=, =display-font=,
+=display-framebuffer= and =display-damage=. Read configuration with
+=display-name=, =display-title=, =display-backend= and =display-configuration=.
+Each backend stores its own state structure in =display-backend-state=.
+Call =(resize-display display pixel-width pixel-height)= after native configure;
+it allocates the framebuffer and cell cache, marks full damage and returns a
+=resize-event= to include in the backend event list. The session must redraw
+its grid after a resize. Preserve no references to the old framebuffer.
+
+Use =font-width= and =font-height= for cell metrics. The shared renderer reads
+real OpenType bitmap glyphs from Terminus EBLC/EBDT tables and caches masks.
+Pass =:font-path= or set =LISPTERM_FONT= to a Terminus OTB file. The Nix default
+searches the installed Terminus font at the requested pixel size. Box drawing
+uses the font's actual Unicode glyphs. Glyph shaping is outside this interface.
+
+Damage is a list of =(x y width height)= rectangles. The backend may coalesce
+rectangles into larger updates. X11 currently coalesces into full-width strips,
+serializes the negotiated native pixel format and byte order, and bounds each
+PutImage by the server's maximum request length. It uses neither SHM nor a
+foreign event loop. Native input arrives as normalized event structures.
+
+Event predicates and accessors follow DEFSTRUCT conventions; constructors take
+keyword slot arguments. X11 =backend-metrics= also reports =:window-id=,
+=:depth= and =:bits-per-pixel=. Use the native window ID for external diagnostics.

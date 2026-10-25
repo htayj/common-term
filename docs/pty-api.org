@@ -1,0 +1,55 @@
+#+title: PTY interface, frozen Batch A
+
+Package LISPTERM.PTY. Linux SBCL; dependencies SB-POSIX and CFFI where needed.
+
+- open-pty &key (rows 24) (columns 80) returns a PTY.
+- pty-master-fd, pty-slave-name, pty-process, pty-open-p are accessors.
+- pty-read pty &key timeout returns octets, NIL on timeout, :eof on EOF/EIO.
+  timeout is seconds. An invocation begun after close cancellation is published
+  signals pty-closed-error. An active read returns :eof when it observes
+  cancellation; an in-flight read may still return its accepted data.
+- pty-write pty octets &key (timeout 2) returns the accepted prefix length.
+  Timeout is a real number from 0 through 3600 seconds. With zero timeout,
+  attempt one readiness poll/write without waiting for capacity; an interrupted
+  poll/write or full kernel buffer can return zero. A short write returns its
+  exact accepted count. Retain and retry the unaccepted suffix in order. A
+  positive timeout retries EINTR/EAGAIN within the deadline. Concurrent close
+  cancels an active write and returns its exact accepted prefix, possibly zero;
+  a write begun after cancellation signals pty-closed-error. IO failures signal
+  pty-io-error.
+- pty-resize pty rows columns; pty-window-size pty returns rows, columns.
+- pty-foreground-process-group pty returns a process group identifier.
+- spawn-on-pty pty argv &key environment directory returns process.
+  argv includes executable as its first element. Use posix_spawnp + setsid;
+  child opens the slave path and acquires its controlling terminal. The parent
+  must not fork Lisp threads into child execution or alter its own stdio.
+- process-pid, process-status, process-exit-code; process-poll process;
+  process-wait process &key timeout; process-signal process signal.
+- close-pty pty &key (terminate t) (timeout 1) is idempotent, including concurrent
+  callers. Cancellation is published before waiting for transport ownership.
+  Active and queued readers/writers stop before another readiness poll; each
+  active poll waits at most 50 ms. The master is closed only after the active
+  syscall releases ownership, excluding descriptor reuse during IO. Transport
+  cancellation does not depend on mutex fairness or the read/write deadline.
+  This bounds transport polling delay, not OS thread scheduling or child reap.
+  With terminate, send SIGHUP, wait up to timeout seconds, then SIGKILL and wait
+  up to another two seconds to reap; failure to reap signals pty-io-error.
+  With terminate NIL, close still polls the owned child; the caller must reap
+  a child that is still running. This operation requires parent process ownership.
+- detach-pty pty returns T: close only the inherited master in a saver child,
+  without signals, process polling, or waitpid. It is idempotent. Before fork,
+  quiesce every reader, writer, resizer, spawner, closer, and process operation;
+  only the saver child may access its copied PTY during detach. No inherited
+  mutex is acquired. Copied locks are replaced, pty-process becomes NIL, and
+  aliased copied process objects become :detached with PID/exit-code NIL.
+  The parent's descriptor, process status, and ownership are unchanged. Polling
+  a detached process returns :detached; signaling it is a no-op. Reopen fresh
+  PTYs after restoring the image. Do not use detach to abandon owned children.
+- attach-slave-to-stdio pty &key fds controlling-terminal disposable refuses
+  unless :disposable T. Only the standalone disposable launch process uses it.
+  Defaults fds '(0 1 2), controlling-terminal T. Never call in active primary UI.
+- with-pty (variable &rest open-options) body closes with unwind-protect.
+
+Conditions: pty-error, pty-open-error, pty-io-error, pty-spawn-error,
+pty-closed-error, stdio-rebind-refused. Useful retry/continue restarts may be
+provided at operation boundaries; errors must retain operation/errno context.

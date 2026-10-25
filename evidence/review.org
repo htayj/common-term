@@ -1,0 +1,93 @@
+#+title: Independent review synthesis
+#+date: 2026-10-25
+
+* Current verdict
+All six reproduced runtime findings now have independently verified repairs.
+The final PTY close-starvation recheck passes503 checks and an additional12-run
+original-shape probe. All non-Git mission command gates pass. Authorized
+trailing-space and redundant-EOF reconciliation plus post-cleanup checks pass;
+see [[file:acceptance.org][final precommit acceptance]] for exact locations and commands.
+The intended423-file staged index passes the whitespace check and is ready to sign.
+
+* Independent review chain
+- [[file:review-native.org][Initial native review]]: HIGH unsafe mmap keymap backing, MEDIUM malformed
+  keymap ancillary-FD ownership leak, MEDIUM X11 close failure falsely reported
+  as successful cleanup. Also independently reran earlier ECHILD saver-detach
+  and closed-stdio CLOEXEC repairs with PTY66 plus fork-detach10 checks.
+- [[file:review-native-followup.org][Native follow-up]]: all three native findings resolved. Independently executed
+  shared cleanup/timeout/partial-open checks, XKB54, X11-close39, additional FD
+  ownership/EIO probes, native Wayland and X11 depths16/24; fresh renders viewed
+  by that reviewer. Native source hashes below match those reviewed repairs.
+- [[file:review-integration.org][Initial integration review]]: HIGH silent loss of PTY partial-write suffixes,
+  MEDIUM shell-open/runtime-adoption gap. Both were reproduced with real PTYs;
+  the adoption reproduction used actual installed checkpoint callbacks.
+- [[file:review-adoption-followup.org][Adoption follow-up]]: adoption race resolved. Reservation precedes factory,
+  factory runs outside runtime mutex, publication/release atomic, close refuses
+  before disruption. Independent adoption40, actual checkpoint20 and12 extra
+  nonlocal-exit/failed-cleanup/retry checks pass.
+- [[file:review-input-followup.org][Input follow-up]]: silent truncation resolved by bounded owner FIFO preserving
+  exact accepted-prefix suffixes and response order. Independent input52 plus14
+  supplemental concurrency/public-API/exact-cancellation checks pass. Actual
+  64KiB nonreader release yields byte-exact payload/paste/replies/TAIL. New
+  transport-close starvation was independently reproduced in that snapshot.
+- [[file:review-pty-close-followup.org][PTY close follow-up]]: starvation resolved. Independent read/write barriers,
+  120 mixed real-child/no-child concurrency iterations and503 checks pass,
+  close+all-join max0.068s and zero >=1s. Additional original30s read/close probe
+  passes12 runs with max0.001s. No remaining concrete runtime finding identified.
+
+The above reports are immutable review snapshots; this synthesis records their
+combined present verdict rather than changing their original findings.
+
+* Acceptance wiring checked
+=tests/verify.sh unit= includes engine950, PTY66 plus disposable fork10, shared
+display, host66 and input52. The =pty= branch additionally executes the503-check
+close concurrency suite; the unit branch avoids duplicating that stress suite.
+=display= includes shared display, XKB54 and X11-close39. =integration= includes
+actual-runtime adoption40 then actual checkpoint TOOL20. Approved input conditions
+and readers are exported.
+
+Final actual sequential dispatcher runs all exit0: =deps unit pty-spike pty
+display x11 wayland same-heap active-image recovery integration fastfetch-x11
+fastfetch-wayland packaging=. An additional explicit =same-heap x11= run passes.
+Unknown gate exits2. Real X11 depths16/24 and native Wayland DISPLAY-unset
+checks pass, as do actual Autolith startup, same-image active shell, lifecycle
+rollback/recovery and live renderer redefinition on both native backends.
+Packaging uses env-i and a fresh source-only checkout/cache. Exact elapsed times,
+test counts, backend PIDs, fresh visual inspections and limits are in
+[[file:acceptance.org][final precommit acceptance]]. Logs: =.build/evidence/final-acceptance60/=.
+
+Authorized delivery reconciliation removes the identified trailing spaces from
+eight files and excess EOF blank lines from26 engine/vendor targets. Per-file
+snapshots and =diff -w --ignore-blank-lines= confirm whitespace-only source
+changes, preserving one terminal newline. All417 text files and all shell
+entrypoints pass whitespace/syntax audits. Actual post-cleanup unit and
+source-only packaging gates pass; the preceding trailing-space cleanup also
+passed PTY and display gates. Original PNG/provenance hashes match. The staged
+423-file index passes =git diff --cached --check=; signing can proceed.
+
+* Reviewed production identities
+#+begin_example
+546fb3b4423952d7305853af0e8d67b1277925d997fcb4e787303166747798ee  src/display/xkb.lisp
+26a10eef0861f778e9eec6c77ce00d6de0388e408be7596aa859577feb552a11  src/display/x11.lisp
+ca483055d14ec6689319e56a28fb4ada28627c24263b762ab89a5089bd8e49f9  src/autolith-adapter.lisp
+1dc10d0f3bd31a1ed6b65ed3e145b3da4040151d8615735fd66313b7023c8ae5  src/session.lisp
+6315506484a0ae21589d8c2cfaba608090d8fc4be9e77427118f143e52b0f7e0  src/host.lisp
+8b5d725b7ec6452e9f1cd454bdaee6bdde33a67979df172c66d20b2271250b47  src/pty/package.lisp
+45c346f05dac8f6ebde94618d5a87d5570569ec5d6ca73cbd9e46b51c4675a61  src/pty/posix.lisp
+f47dc232e982250e80d18d19826b46cb6cab22eafdaa06e576b2a87e341f81a6  src/pty/process.lisp
+#+end_example
+The PTY identities now identify the independently approved close repair.
+All target source/test before/after hash checks pass through final acceptance.
+Individual follow-up reports retain detailed test hashes and original executions.
+
+* Evidence preservation and limits
+All original Fastfetch and Autolith captures/provenance plus display-smoke pass
+before/after SHA256 checks during this review. No original evidence bytes were
+edited or restored. Parent's original screenshot inspection and earlier native
+reviews are attributed; this reviewer additionally viewed fresh X11 depth16/24,
+native Wayland, actual Autolith X11/Wayland and Fastfetch X11/Wayland captures.
+This final reviewer changed only dispatcher PTY wiring and
+=evidence/{review-pty-close-followup,review,acceptance}.org=.
+No staging, commits, credential access, private Autolith mutation or primary UI
+changes. These bounded independent reviews are not exhaustive protocol or
+concurrency proofs; graphical saved-core restoration is not claimed.

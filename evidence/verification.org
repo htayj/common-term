@@ -1,0 +1,68 @@
+#+title: Verification record
+#+date: 2026-10-25
+
+* Reproduce
+Build the runtime and verification tools with =scripts/bootstrap-deps --tests=.
+All gates are executable commands under =tests/verify.sh=. Unknown gate names
+exit 2; an unavailable tool or failed assertion is a failure, not a skip.
+
+| Gate | Actual command / assertion scope |
+|------+----------------------------------|
+| deps | packaged ASDF dependencies including vendored xclhb/struct+/cl-weave |
+| unit, self-check | engine, PTY, display and host suites in separate SBCL processes |
+| pty, display, host | corresponding individual suite |
+| pty-spike | disposable real PTY stdio and controlling-terminal spike |
+| x11 | Xvfb depth16 and depth24 keyboard, resize, pixels, disconnect/reopen |
+| wayland | headless Sway, DISPLAY unset, input/repeat, resize/scale, disconnect/reopen, FD cleanup |
+| same-heap [backend] | actual Autolith main and prompt Lisp in graphical heap; combined active-image check |
+| active-image [backend] | same combined test, including a new shell with primary descriptors/streams preserved |
+| recovery | real native host input, detached-session I/O, reopen and quiesce/resume on both backends |
+| integration | actual Autolith checkpoint registry validation/resume, rollback and hosted-main refusal |
+| fastfetch-x11 | real PTY Fastfetch and X server capture |
+| fastfetch-wayland | real PTY Fastfetch and compositor capture, DISPLAY unset |
+| packaging | env -i, fresh HOME/XDG/cache, source-only checkout without .git/.build, application ASDF load, font parse and xkb load |
+| git | diff check, clean committed tree, verified required signature, SSH GitHub remotes |
+
+* Packaging worker observations
+Pinned Nix runtime and verification-tool closures built successfully. The font
+and keyboard library resolve through stable paths in =.build/deps=, rather
+than choosing a coincidental store glob. Actual clean =env -i= packaging load,
+Terminus OTB parse, xkbcommon load and inert-ASDF-load assertions passed.
+
+Reconciliation dispatcher runs passed =deps=, =unit=, =pty-spike=, =pty=,
+=display=, =x11=, =wayland=, =recovery= and =packaging=. The unit run includes 950 engine
+cases and 66 host checks. Native Wayland returned all-true input/resize/scale2/
+disconnect/reopen/FD-cleanup checks with DISPLAY unset. X11 passed at both
+tested depths. Logs are under =.build/evidence/reconcile47/=.
+The recovery rerun passed rollback, live redefinition, FD cleanup and thread
+cleanup on both native backends.
+
+The stronger packaging rerun loaded an isolated source copy with no =.git=
+or =.build= from =env -i= and fresh HOME/XDG directories. Actual Terminus OTB
+parse, xkbcommon load, inert application ASDF load and delivered Bash syntax
+checks passed. The runtime closure was supplied explicitly. The log is
+=.build/evidence/reconcile47/packaging-source-only.log=.
+
+The earlier host =:FAILED-CLOSE-HANDLE-RETRYABLE= failure is repaired; the full
+unit rerun passed. The dependency gate explicitly loads sb-bsd-sockets before
+xclhb. The dispatcher clears inherited ASDF wrapper registry variables to
+avoid duplicate inherit markers.
+
+* Delivery checks to record after integration
+Run the real Autolith combined gate on both backends and
+=tests/verify.sh integration= after integration reconciliation. The original
+Fastfetch captures and their provenance are recorded in [[file:fastfetch.org][fastfetch.org]];
+acceptance reruns must write only ignored per-run captures, preserving those
+original artifacts. The parent must visually inspect the final images.
+The final Git gate requires the parent's signed local commit and a clean tree;
+it cannot pass in this intentionally uncommitted shared implementation tree.
+
+Required signing fingerprint:
+=D0BEDCD5B63A4040FBC5BC00A6398F53FCEC1C10=.
+
+* Evidence handling
+Only selected screenshots and this bounded record belong in delivered
+evidence. Generated logs, compositor sockets, scratch scripts and caches are
+ignored under =.build/= or test directories in =.git/=. Inspect final images
+for private content before committing them. No credentials, private configs
+or full environment dumps are required by these gates.

@@ -1,0 +1,28 @@
+#+title: Security and process boundaries
+
+A terminal shell runs with the invoking user's authority. Lispterm is a local
+UI, not a sandbox or privilege boundary. Treat shell input and evaluated Lisp
+as executable code. In same-image Autolith mode, terminal, extension and agent
+share one heap and can inspect or redefine each other's definitions.
+
+Wayland connects to the selected compositor's local Unix socket and uses
+shared memory and fd passing. The backend opens no network listener. X11 has
+the normal X server trust model: other authorized clients can observe or
+inject input. Prefer a private compositor/X server for automated tests.
+
+Launch the standalone =--autolith= path in its disposable process. Use
+=/graphical-shell= inside an active application to preserve its standard file
+descriptors and streams. Extension runtime quiescence must complete before
+checkpoint fork; hosted graphical main checkpoints are refused before fork
+until graphical restore re-entry is supported.
+
+Dependencies and vendored revisions are pinned and listed in
+[[file:../THIRD_PARTY.org][THIRD_PARTY.org]]. Override runtime/library/font paths only with trusted files.
+The verification scripts create isolated HOME/XDG trees and their own display
+servers. Retain generated logs under ignored =.build/= or test directories in
+=.git/=. Publish only deliberately selected screenshots and bounded evidence;
+inspect them for private terminal content first.
+
+The final Git gate verifies the exact requested signing fingerprint without
+changing global Git/GPG configuration. Signing keys and provider credentials
+are outside the repository and are not test fixtures.

@@ -1,0 +1,125 @@
+#+title: Session and host API
+
+* Entry points
+Package =LISPTERM= shadows CL:OPEN and CL:CLOSE.
+
+- =open &key argv pty (backend :auto) display-name (title "Lispterm") (rows 24) (columns 80)=
+  returns a registered host after its display opens. =:backend= accepts =:auto=,
+  =:x11=, =:wayland=. An explicit backend never falls back. Without =:pty=,
+  spawn =argv= or the user's =$SHELL= on a new PTY. With =:pty=, adopt that
+  endpoint without spawning a process; do not also supply =:argv=. On failure,
+  close a newly created PTY, but preserve a supplied endpoint. If native cleanup
+  itself fails, retain the supervised host and signal =host-error=; obtain that
+  recovery handle with =host-error-host= and retry =close= or =reopen= after
+  resolving the transport failure.
+- =close host= closes the window, joins its owner, closes its PTY and reaps
+  its subprocess if one exists. Repeated calls return the same host.
+- =status &optional host= returns a fresh status plist; without a host, return
+  a list of registered host snapshots. Keys include =:id :state :backend
+  :worker-alive-p :rows :columns :frames :bytes-received :transport-state
+  :process-state :child-pid :error-count=.
+- =host-errors host= returns a fresh newest-first bounded error history.
+- =reopen host= queues window replacement, waiting at most five seconds for
+  acknowledgement. Preserve the PTY and engine. After a window close or
+  connection loss, continue reading output into the engine while detached.
+- =invalidate host= requests a fresh frame. Redefine =lispterm::render-session=
+  in source, then invalidate to exercise the replacement on the next frame.
+- =send-input host input= queues UTF-8 text or octets; each request is at most
+  65536 bytes. Resize/key/paste/focus events pass through the same owner.
+
+** Input acceptance and backpressure
+=send-input= returns the host after its owner accepts a private byte copy into
+one FIFO shared by command input, paste, keys, focus notifications and terminal
+query responses. Acceptance means pending delivery, not that the application
+read the bytes. Inspect =status= keys =:input-pending= and =:input-limit=; the
+FIFO cap is 262144 bytes. Each scheduling step attempts at most 4096 bytes with
+zero PTY write timeout and retains every unaccepted suffix. On =input-backpressure=,
+the request was not accepted; retry it after capacity becomes available. Read
+=input-backpressure-pending= and =input-backpressure-requested= for byte counts.
+Engine query responses awaiting queue capacity retain their order and ownership;
+pause further PTY output reads and reject later input until they fit.
+
+Quiesce preserves pending bytes for resume and refuses new input without an
+active owner. Closing cancels undelivered bytes after closing/reaping the PTY,
+records an error, and signals =input-cancelled= with =input-cancelled-bytes=.
+The host is closed even when this cancellation condition is signalled; a repeated
+close returns normally. A zero pending count means kernel acceptance, not an
+application-level receipt.
+
+Verify deterministic partial writes and real raw-slave backpressure with
+=scripts/sbcl --script tests/run-host-input-tests.lisp=.
+
+* Lifecycle contract for the Autolith adapter
+- =quiesce host= returns an opaque rollback token. Close native display handles
+  on their owner and join that worker before returning. Retain the session,
+  parser, PTY master, and any external subprocess. On native close failure,
+  leave the owner running and signal the error, so a failed quiesce does not
+  silently orphan the session. A timed-out in-progress stop rolls back to a
+  running owner rather than stopping later without a token. Never fork until
+  every quiesce succeeds.
+- =resume host token= validates identity and generation, restarts the owner,
+  and recreates a window if it was attached before quiesce. Reusing the same
+  successful token is idempotent. A recreated-display failure is signalled;
+  the restarted session continues detached and can be reopened.
+- =detach-for-saver host= requires successful quiesce before fork. In the saver
+  child only, call the handles-only =lispterm.pty:detach-pty=. Do not join a
+  nonexistent inherited thread, send a signal, call waitpid, or terminate a
+  subprocess that belongs to the parent. Replace inherited host and registry
+  mutexes without acquiring them, and unregister the child-side host.
+  Parent-side code must resume with its token after a failed checkpoint.
+- The adapter owns TOOL registry integration. Hosted-main checkpoint restore
+  requires graphical stdio re-entry; refuse unsupported snapshots explicitly.
+  These lifecycle functions alone do not implement restored graphical stdio.
+
+The standalone launcher creates a PTY, attaches its slave to fd0/1/2 in a
+verified disposable process, then calls =open :pty pty= before running
+Autolith main on its original main thread. The active-image shell path never
+changes the primary process's standard fds.
+
+* Scheduling and recovery
+Each host has one dedicated session/display owner. Every LTD operation,
+including open, poll, draw, title, present and close, runs on that thread.
+Protect engine reads and updates with the session mutex. External callers
+queue operations rather than using native display handles. Bound command
+queues to 128 requests and error history to 32 entries of 512 characters.
+
+Poll the PTY with zero timeout, at most one bounded read per scheduling step.
+Limit display frames to 60 per second. Clear engine damage only after successful
+presentation. Skip unchanged frames, coalesce output bursts, and sleep between
+iterations, including EOF and detached windows. With no child process,
+PTY EOF/EIO means =:waiting-for-slave=, not application exit. With a child,
+only waitpid-derived process status establishes exit.
+
+Route VT device replies back to the PTY, preserve cursor visibility and
+application-cursor mode, honour bracketed paste, forward requested focus
+notifications, and update the native title. Drain unsupported clipboard,
+passthrough and notification queues after each output chunk to bound detached
+state. The engine owns its bounded scrollback.
+
+Native failures unwind to the owner, enter the error ring, and detach the
+window without terminating the Lisp runtime. The display-step restart scope
+includes =reopen=, =detach= and =abort=. Lifecycle failures are typed
+=host-error= or =host-timeout= (native errors preserve their own types).
+
+* Verification
+Run the fake-transport/real-PTY suite in a disposable process:
+
+#+begin_src sh
+LISPTERM_SBCL="$PWD/.build/deps/bin/sbcl" scripts/sbcl --script tests/run-host-tests.lisp
+#+end_src
+
+Run the full owner-thread host against isolated native servers:
+
+#+begin_src sh
+LISPTERM_SBCL="$PWD/.build/deps/bin/sbcl" tests/host-native.sh x11
+LISPTERM_SBCL="$PWD/.build/deps/bin/sbcl" tests/host-native.sh wayland
+#+end_src
+
+The native harnesses verify compositor-routed keyboard input through the PTY,
+detached output survival, reopen, and rollback after an injected checkpoint
+validation failure. They redefine the renderer with DEFUN in the running heap,
+invalidate, and require a new frame. Rollback preserves the session, parser and
+child PID; final close must restore exact FD and thread baselines. Inspect actual
+server captures and status evidence under =.build/evidence/host-{x11,wayland}/=.
+The Wayland run unsets =DISPLAY=. X11 uses a fresh Xvfb display numbered 100-199.
+Screenshots require ImageMagick =import= on X11 or =grim= on Wayland.

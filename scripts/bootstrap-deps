@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+case ${1:-} in
+ ''|--tests) ;; *) echo 'Usage: scripts/bootstrap-deps [--tests]' >&2; exit 2;;
+esac
+mkdir -p .build
+nix build --impure --expr 'import ./scripts/deps.nix {}' --out-link .build/deps
+if [[ ${1:-} == --tests ]]; then
+ nix build --impure --expr 'import ./scripts/deps.nix { verification = true; }' --out-link .build/test-tools
+fi
+printf 'Runtime ready. Run tests/verify.sh deps\n'

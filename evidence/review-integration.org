@@ -1,0 +1,118 @@
+#+title: Independent final integration review
+#+date: 2026-10-25
+
+* Scope and result
+Read-only TASK-route review of session, renderer, window, host, launcher,
+Autolith adapter, package, executable wrapper, runtime wrapper, and ASDF wiring.
+Two reproduced correctness findings. Production and test sources were not edited.
+The only deliverable written by this review is this report. No commits.
+
+* HIGH: PTY backpressure silently truncates host input
+Locations: =src/session.lisp:20-22=, =src/host.lisp:96-102=;
+related device replies =src/session.lisp:39-48= and events =:60-80=.
+
+=pty-write= returns the accepted prefix length after a bounded write. The
+session wrapper retains no unwritten suffix. =send-input= discards that count
+and returns HOST, so callers receive apparent success after incomplete delivery.
+Paste, text, keys and device replies use the same session helper.
+
+Reproduction used existing fake-display methods from =tests/host-tests.lisp=,
+but a real PTY and real spawned child. Open a host with:
+
+#+begin_src lisp
+(lispterm:open :backend :x11
+  :argv '("sh" "-c" "stty raw -echo; printf READY; sleep 30"))
+#+end_src
+
+Wait for READY in the screen. Wrap =lispterm.pty:pty-write= in the disposable
+image to record and return the original function's return value, without
+changing its arguments. Then call =send-input= with 65536 octets, value 65.
+Observed: requested 65536, accepted 13824, returned HOST, error ring NIL.
+After an additional 0.2 seconds there was still exactly one write call.
+The other 51712 bytes have no retained owner-side queue and cannot be retried.
+The wrapper was restored and the host closed/reaped in unwind-protect.
+
+Execution: =c60f0728-23a8-427c-ae7b-b6f2b00d2ceb=, exit 0.
+Log: =shell-log:M6wE7h9/c60f0728-23a8-427c-ae7b-b6f2b00d2ceb/147E516451707AA7DB5605A5E7DA78B76F96485091849BE9731BE2D4D124CB3D/output=.
+
+Repair: preserve unwritten suffixes in a bounded owner-managed output queue,
+including device replies and events. Flush with bounded work per scheduling
+iteration, preserving order and responsiveness. Reject queue overflow explicitly
+rather than report full success or silently drop bytes. Test genuine partial
+writes followed by resumed reading, exact byte order, and overflow behavior.
+
+* MEDIUM: new shell can escape runtime checkpoint ownership
+Location: =src/autolith-adapter.lisp:145-148=, with =adopt-host:26-34=.
+
+=graphical-shell= opens the host before adopting it. Host creation and runtime
+adoption do not share a lifecycle critical section. If runtime close completes
+between those operations, adoption signals because the runtime is quiesced,
+but the new host remains registered, attached, and running. The runtime reports
+successful quiescence without tracking that live owner or its descriptors.
+No cleanup handler closes the newly opened host after adoption failure.
+
+Deterministic interleaving reproduction in the actual packaged Autolith runtime:
+- Load =lispterm/autolith= and existing fake-display methods.
+- Bind a fresh =lispterm.autolith:*runtime*= and create an actual TOOL registry.
+- Temporarily replace =application-tool-registry= to return that registry for
+  the disposable call, avoiding construction of a primary application UI.
+- Wrap =lispterm.autolith::host-call= so that after its original :OPEN returns,
+  call actual =autolith::tool-runtime-close= on the registered runtime owner,
+  then return the host to =graphical-shell=.
+- Invoke =graphical-shell= with backend :X11 and a real sleeping shell child.
+
+Observed adoption error: "Cannot adopt a host while runtime is :QUIESCED".
+Runtime status: (:STATE :QUIESCED :HOSTS 0 :CHECKPOINT-SUPPORTED-P T).
+Created host status: :ATTACHED, :WORKER-ALIVE-P T, :PROCESS-STATE :RUNNING,
+:ERROR-COUNT 0. This injects the exact lifecycle interleaving, not a claim that
+a particular terminal UI event naturally scheduled it during this test.
+Original functions were restored and the leaked host explicitly closed/reaped.
+
+Execution: =94995391-b1ca-4d09-abd2-74300eeb476a=, exit 0.
+Log: =shell-log:M6wE7h9/94995391-b1ca-4d09-abd2-74300eeb476a/66B8E0D381C01B6D3234555A7437EEBE88F9BC19E21361F649B7825DB74F42AA/output=.
+
+Repair: serialize shell creation and adoption against runtime close, validating
+running state before allocating the host and registering it before releasing
+the lifecycle lock. Close any unadopted host if creation/adoption fails. Avoid
+recursively acquiring the same runtime mutex through the public adoption API.
+Test the explicit close-versus-open interleaving and retained-host cleanup.
+
+* Verified existing behavior and limits
+Independently ran =scripts/sbcl --script tests/run-host-tests.lisp=: exit 0,
+66 checks passed. This includes caller-only display ownership, close-error
+retention, stop timeout rollback, token validation, adopted no-child PTY EIO,
+saver transport detach, bounded error snapshots, and empty final host registry.
+Execution: =fcb1f7fe-d337-4601-8bf6-c4c8fe931818=.
+Log: =shell-log:M6wE7h9/fcb1f7fe-d337-4601-8bf6-c4c8fe931818/86D3C59E9ACD37B56761CA34FF9C9DC0F2770423C185C908136364FF392C0E13/output=.
+
+Source inspection confirms late-bound renderer calls, handles-only
+=detach-pty= in saver children without inherited mutex acquisition, scoped
+standalone registry initialization, hosted-main checkpoint refusal before
+quiescence, active-image shell path without primary stdio replacement, and
+inert ASDF entry-point definitions. Existing source-backed restoration limits
+are correctly distinguished from private replay journal persistence.
+
+Actual X11/Wayland host and Autolith acceptance evidence from reconciliation
+workers was read as supporting data, not independently re-executed by this
+review. Existing screenshots and provenance were untouched. Native transport
+files, full protocol conformance and the previously reported xkb/X11 cleanup
+issues were outside this assignment and were not re-audited. No auth access,
+primary live-image operations, or reviewer-role retries were used.
+
+* Source stability
+SHA256 captured before review and after both reproductions and the host suite.
+All ten hashes are identical before/after. Adapter hash includes the final
+concise "Graphical shell ID" command output announced by reconciliation C2.
+
+| File | Before and after SHA256 |
+|------+-------------------------|
+| src/session.lisp | f9ccc1a6f804c38ddf5d1ddefb8c7ed91153c2f2655b6637d5d932fa59c2011f |
+| src/renderer.lisp | 5a1ab76fcfd6664093d6925e427828a37127965e6c9825c866df52ac1f556212 |
+| src/window.lisp | 1e37d015cd3bc498fa459868c5b142c4be1bb416f8c48ee7d1a1ee26ef8d4e6f |
+| src/host.lisp | 6f25905fc91222350d360dcbc857c5de7a09e975c6c16187d3e3eb699e5f56f6 |
+| src/launcher.lisp | 4f94736d7115a49df9ee6fb055261a175b53de320f4d0d7cd674a7f65fc06231 |
+| src/autolith-adapter.lisp | f316178b0d406625c2bd555afaac3c6d2de15d8c67466235751528b1642b4c8e |
+| src/package.lisp | 062b74ef9185adbc8166500b5101e765c75f627b5592acbd28fb6ac0cfbd5abd |
+| bin/lispterm | 375533e610042507bb0dd2394d87c85349b1dbe298d2707dd67d512f88afb2bc |
+| scripts/autolith-runtime | 40a55c45c26bbab5bf2be2c976ddab0b5f997100ba5c8ea76d073b03bbfce81c |
+| lispterm.asd | 7d88d5a7664ba810ad1c136d96397cd91c7b490a4d07e4b01f6914c408d4bd68 |

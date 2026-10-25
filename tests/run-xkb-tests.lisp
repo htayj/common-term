@@ -1,0 +1,5 @@
+(require :asdf)
+(load "scripts/bootstrap.lisp")
+(asdf:load-system "lispterm/display-wayland")
+(load "tests/xkb-keymap-safety-tests.lisp")
+(lispterm.xkb-safety-tests:run)

@@ -1,0 +1,66 @@
+#+title: Actual Autolith inside Lispterm acceptance
+
+* Reproduction
+
+Run =tests/autolith-gate.sh x11=, =tests/autolith-gate.sh wayland=, and
+=tests/checkpoint-gate.sh=. These use the pinned installed Autolith 0.67.0
+runtime, isolated HOME/XDG trees and private displays, with stdin =/dev/null=.
+They call actual Autolith MAIN in the launcher's SBCL main thread. Autolith
+is not a subprocess of another Lispterm Lisp image.
+
+Final combined execution: =be6f89cb-eabe-4502-bccd-f824c0da445f=, exit 0.
+Logs: =.build/autolith/reconcile-x11-command.log=,
+=.build/autolith/reconcile-wayland-command.log=, and
+=.build/autolith/reconcile-checkpoint-final.log=.
+Structured records are retained under =.build/autolith/{x11,wayland}/=.
+
+* Hosted startup and active-image shell
+
+| Evidence | X11 | Native Wayland |
+|----------+-----+----------------|
+| Actual MAIN/Lisp evaluation PID | 514543 | 514856 |
+| Original SBCL main thread | T | T |
+| isatty descriptors 0,1,2 | T,T,T | T,T,T |
+| Session style / TERM | direct / xterm-256color | direct / xterm-256color |
+| Actual application TOOL registry owner | T | T |
+| Registered graphical-shell command handler | T | T |
+| Fresh shell PTY; primary descriptors/streams identical | T | T |
+| Reopen with original session and PTY | T | T |
+| External native resize and TIOCGWINSZ | 45x140 | 45x140 |
+| Host errors | 0 | 0 |
+| Real prompt live renderer definition, counted calls | 1998 | 8799 |
+
+The probe enters Lisp into the actual terminal prompt, redefines the cell
+renderer to use green foreground, observes calls to the replacement, reopens
+the window and captures the modified output. The replacement exists only in
+these disposable heaps; it is not a private self.commit journal entry.
+The active-image command handler opens a separate shell and receives actual
+PTY output. The primary process descriptors and Lisp stream objects are
+checked before and after that command.
+
+* Runtime and checkpoint validation
+
+The actual installed backend validation/resume callbacks and TOOL registry
+passed 20 assertions: shared registration, two live hosts, close/join/resume,
+later-tool failure rollback, partial owner failure rollback, retained failed
+rollback tokens and retry, hosted-main refusal before terminal disruption,
+and actual forked saver detach/prune followed by usable parent shell input.
+Hosted graphical saved-core restoration is unavailable and explicitly refused
+before fork. Source-backed launch/reload is supported; private replay journal
+and graphical saved-core restoration are not claimed.
+
+* Real captures
+
+Both final captures were personally inspected with =fs.view-image=.
+The visible green Autolith UI includes =SAME-HEAP-VERIFIED=,
+=Graphical shell 2=, and =LIVE-RENDERER-GREEN=.
+
+| File | Dimensions | SHA256 |
+|------+------------+--------|
+| autolith-in-lispterm.png | 1120x720 | 223ddde54784fc100f48a107ccf626cc0ad74cc5032f680105e2ca49bfd9b30e |
+| autolith-wayland.png | 1120x720 | 223ddde54784fc100f48a107ccf626cc0ad74cc5032f680105e2ca49bfd9b30e |
+| autolith-x11.png | 1280x800 | a01cb3fbb68edaa3c58411c923b4662b7b1fe274f9273fb535cf1b9bbf12a385 |
+
+Wayland capture used the private headless compositor with DISPLAY unset;
+X11 capture used a private Xvfb root containing the actual Lispterm window.
+The test terminates the hosted application through its real =/quit= prompt.

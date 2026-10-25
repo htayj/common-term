@@ -1,0 +1,52 @@
+#+title: Independent native transport review
+#+date: 2026-10-25
+
+* Scope and status
+Read-only task-role review replacing failed reviewer44, not a claim from that failed route.
+Read all of src/display/{wayland-wire,wayland-protocol,wayland-shm,xkb,wayland,x11}.lisp and shared protocol.lisp. No production edits, commits, server/window manipulation, or authentication access. Three reproduced findings, pending repair. Original renders and acceptance artifacts untouched.
+
+* HIGH: compositor keymap FD can cause native SIGBUS
+Location: src/display/xkb.lisp:34-48.
+The advertised keymap size is bounded but the received FD's accessible backing bytes are not checked. mmap succeeds beyond EOF; libxkbcommon then accesses invalid pages. A malformed or concurrently truncated keymap can signal a native bus error in the live Lisp heap rather than a typed transport failure.
+
+Disposable reproduction, exit 1 with SBCL Signal 7 CORRUPTION WARNING and bus error:
+#+begin_src sh
+scripts/sbcl --non-interactive --eval '(require :asdf)' --load scripts/bootstrap.lisp --eval '(asdf:load-system "lispterm/display-wayland")' --eval '(let ((fd (lispterm.display.wayland::%memfd-create "review-empty-keymap" 1))) (lispterm.display.wayland::xkb-from-fd fd 8193))'
+#+end_src
+Evidence execution 413c3dd4-4f88-473d-a691-2e3dbdf95e7e; retained shell log D8887347F36A4D0198448D99950DD08CAD5B13A36679A07143139C2690CD5FB4.
+Recommended repair: read the bounded expected bytes into owned memory, reject short reads/invalid terminator, then parse. fstat alone does not prevent concurrent truncation.
+
+* MEDIUM: malformed keymap event loses ancillary FD ownership
+Location: src/display/xkb.lisp:85-86.
+The FD is popped before either payload word is validated. If payload parsing fails, neither xkb-from-fd's unwind-protect nor wire-close owns this FD.
+Reproduction in disposable loaded Wayland system: create memfd, put it alone in %make-wire :fds, create make-wayland-state :wire wire, call keyboard-event state 0 with an empty octet vector under handler-case, then wire-close. Observed INVALID-ARRAY-INDEX-ERROR and sb-posix:fcntl fd sb-posix:f-getfd => 1, wire-fds => NIL. Explicitly closed the leaked test FD afterward.
+Evidence execution 67b1f44c-2d9f-4917-aa16-024cfd2b076d; retained shell log 7A5450F215E480516661BC8DCB6C8F67BC2C79C1E724FB3F1BCA4C741CBD42A0.
+Recommended repair: validate complete payload before popping, and establish unwind-protected local ownership immediately after pop.
+
+* MEDIUM: X11 backend defeats cleanup-pending recovery on close failure
+Location: src/display/x11.lisp:136-140.
+Shared close-display correctly propagates backend failures and tracks cleanup-pending. However X11 backend-close ignores every stream close error and unconditionally discards its state. A failed stream close therefore reports successful quiescence with no retained retry handle.
+Reproduction in disposable loaded X11 system: define a sb-gray:fundamental-binary-input-stream subclass whose close method signals an error. Put an instance into xclhb:make-client :stream, make-x-state :client client, and make-display :backend :x11 :backend-state state :owner sb-thread:*current-thread* :open-p T. Call public close-display.
+Observed normal return, open-stream-p => T, display-cleanup-pending-p => NIL, display-backend-state => NIL.
+Evidence execution f4ec82a6-b549-4c38-bf57-bfdb533ed827; retained shell log C6648E2833F6837FA74818E85002E476F073EF9C855C84C420FF4F63C2EDA1B3.
+This is a distinct backend defect, not the already-fixed shared close-display defect. Test uses injected stream failure; an actual OS close failure was not induced.
+Recommended repair: propagate close failure and retain backend state for retry, clearing state only after successful closure.
+
+* Verified prior fixes and limits
+Independently reran scripts/sbcl --script tests/run-pty-tests.lisp: 66 checks PASS plus 10 fork-detach assertions, including closed stdin/stdout/stderr exec checks, no inherited waitpid/signals, parent ownership/responsiveness/reap.
+Independently reran scripts/sbcl --non-interactive --load tests/run-display-tests.lisp: core, pixels/owner, open failure/key modifiers, close error/timeout/retry/partial-open PASS.
+Execution 84b6637d-7731-47a5-8a38-393e88bf35e6, retained shell log 45A2189EBF45A823B77331AC65C8BD37F51A12F8E658138E15D752AFC3FFD310.
+
+Reviewed wire framing/ancillary ownership, object deletion, nonblocking syscall handling, SHM generation/release/scale bounds, xkb lifecycle/repeat, X11 pixel encoding/input/close. No additional concrete bug established. This is bounded source review and three focused probes, not exhaustive fuzzing or proof of memory/interrupt safety. Existing real Xvfb16/24 and native Sway acceptance evidence is inherited and was not rerun by this reviewer. Host/saver hooks beyond transport close are outside this review. No broad vendored X11 protocol audit.
+
+* SHA256 review baselines
+Identical before and after probes and verification. Any later fix requires targeted re-review of changed files.
+#+begin_example
+76b014e45d2461dbaa7418b4604c6c807521e44eb589887911fa9b2c509dc298  src/display/wayland-wire.lisp
+b87997a46c57f02a223ac25112842c3b3c57855da3e8f52d34084e94081502a9  src/display/wayland-protocol.lisp
+01707c18d0208c005a58f51bc1f696f2c2e84d45969afcb5b3e2163833750424  src/display/wayland-shm.lisp
+ba3221082db39be9862980e4be4a37770ce69d6e7a70c3b4d8f11ddb5033429a  src/display/xkb.lisp
+3edaa932aee20a825966bd21abfce68dbb81360322f75f9aa40c7ae0761a160e  src/display/wayland.lisp
+3f00cba632a4b065cd9eaa46f5bcbce72db0008f427b62958ce2c1b3f4cd244d  src/display/x11.lisp
+614aae7d435b7ebe10d750a801f633d9a041a6cf9c3bbcb1e920e0a7de1752c4  src/display/protocol.lisp
+#+end_example

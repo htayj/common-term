@@ -1,0 +1,196 @@
+#+TITLE: Autolith host contract
+
+* Scope and evidence
+
+This contract targets installed Autolith 0.67.0, SBCL 2.6.6 on Linux.
+=AL/= below means
+=/nix/store/ycpg6dripw0zi0gvkkiw2484raad0q7m-sbcl-autolith-0.67.0/=.
+The requirements below are implementation contracts, not claims that every
+acceptance test has already run. Research inspected installed sources and
+probed ASDF discovery, without loading/building Autolith or changing its live UI.
+
+* Standalone graphical entry
+
+1. Start one SBCL process with the packaged dependency environment. Load
+   Autolith definitions and lispterm before calling =autolith::main=.
+2. On that process's main thread, create a PTY master/slave pair. Set its
+   dimensions before terminal construction. Arrange a controlling terminal and
+   foreground process group in this dedicated process, with checked errors;
+   do not assume =openpty= alone establishes signal/job-control ownership.
+3. Duplicate the slave onto process descriptors 0, 1, and 2 before Autolith
+   constructs terminal streams. Use fresh streams or verify SBCL standard
+   streams follow the replaced descriptors; flush bootstrap output first.
+   Keep a separate diagnostic file descriptor. Close redundant slave handles.
+4. Set =AUTOLITH_SESSION_STYLE=direct= and =TERM=xterm-256color= before main.
+   Run the VT reader and display supervisor in owned threads. Call
+   =autolith::main= synchronously on the original main thread. Autolith is
+   not an external child program. Shells may be child programs.
+5. Keep the master open throughout display loss and window recreation.
+   On normal exit, join owned threads and close descriptors exactly once.
+   Main can quit the process, so the executable also needs external-process
+   cleanup semantics; an unwind-protect alone cannot cover process death.
+
+Why these details matter: =application-terminal-ui-create= constructs the
+existing stream terminal (AL/src/application/runtime.lisp:426-442).
+=stream-terminal-create= defaults to standard streams and fd 0
+(AL/src/terminal/stream.lisp:33-50). Terminal size and clinedi raw input use
+fd 0. =main--client-session-p= may select a separate localgroup process unless
+session style is direct (AL/src/startup/main.lisp:957-978).
+
+Resize changes the engine size and PTY winsize in one serialized operation.
+For the hosted Autolith PTY, verify delivery of SIGWINCH to its foreground
+process group; do not install another process-global signal handler.
+Autolith already watches SIGWINCH (AL/src/core/platform-posix.lisp:288-294;
+AL/src/startup/main.lisp:409-413). A shell PTY has its own foreground group.
+
+* Entry from an active image
+
+A graphical-shell command opens a new session and window, then returns a
+session identifier. It must not redirect descriptors 0/1/2, replace standard
+streams, change the process session/controlling terminal, or run another
+Autolith main. Only the spawned shell receives its PTY slave as stdio and
+controlling terminal. Close inherited master/window/primary terminal handles
+in that child. Use a spawn path safe for an already multithreaded SBCL.
+
+Register the command using the complete =define-application-command= form,
+with accurate terminal-ownership and active-turn metadata
+(AL/src/application/command.lisp:1135-1175). Do not claim shell-window entry
+reparents the existing primary Autolith UI. That is a separate future operation.
+
+* Session, window, and recovery ownership
+
+The session owns PTY, emulator, reader, buffered output, and program identity.
+A window owns only display connection, renderer, input translation, and its
+subscription to the session. Closing or losing the window detaches it; explicit
+session termination closes the PTY or signals the child. Detachment must keep
+draining PTY output into bounded history rather than block Autolith indefinitely.
+
+Each UI thread binds a local condition/debugger policy. Catch display failures
+inside that thread before Autolith's fatal debugger path; publish an inspectable
+failure record with operation, cause and session ID. Offer retry/reopen/detach/
+terminate operations through the supervisor. A restart has dynamic extent:
+queue a recovery action, or keep the restart in a supervised handler extent;
+do not retain a restart object after its thread has unwound.
+
+Window recreation reuses the same session and redraws the complete grid.
+Keep renderer calls late-bound so a live redefinition is observed without
+restarting the session. Thread failures must not terminate the runtime.
+A backend with a native fatal I/O-error policy needs explicit validation;
+catching Lisp ERROR does not intercept a native library's process exit.
+
+* Checkpoint integration
+
+A =checkpoint-detach-state :before= method is not pre-fork quiescence.
+The saver invokes detach after the fork
+(AL/src/state/generations.lisp:410-427). Moreover, telemetry already defines
+=:before ((application application))= (AL/src/telemetry/hooks.lisp:212).
+Defining that same method would replace telemetry's hook.
+
+Use an extension-owned subclass of =autolith::tool= as the runtime owner,
+registered in the active application's tool registry. Specialize only on
+that subclass, never on Autolith's general application/tool classes:
+
+- =tool-runtime-identity=: return the shared lispterm runtime identity.
+- =tool-runtime-close=: cooperatively stop and join every extension thread,
+  close display connections, and retain a parent-only resume description.
+  Retain the live parent's PTY master/session while stopping its reader;
+  checkpoint work must not close the hosted main's only terminal.
+- =tool-runtime-resume=: restart the stopped reader/supervisor and recreate
+  windows in the parent, including after failed validation.
+- =tool-runtime-detach=: in the saver child, close inherited descriptors
+  without signaling external children or issuing X requests, clear all global
+  registry/session/window roots, and drop foreign handles and thread objects.
+- =tool-runtime-prune-checkpoint-state=: remove any residual transient owner
+  binding from the saved registry if necessary.
+
+The registry selects tools with non-NIL runtime identity and deduplicates
+shared runtimes (AL/src/tools/registry.lisp:662-695, 930-999). Checkpoint
+validation closes tool runtimes before fork, and the resume callback restarts
+successfully closed runtimes (AL/src/state/generations.lisp:472-503).
+Application shutdown also closes registry runtimes
+(AL/src/startup/main.lisp:376-399). Because close is shared by checkpoint and
+shutdown, it should quiesce safely and be idempotent; the standalone launcher's
+outer cleanup owns final session termination. A partial close failure must
+restore its own partial work before signaling, since only successful closes
+are passed to resume.
+
+Autolith's inner fork guard covers telemetry, secrets and live mutation
+(AL/src/state/generations.lisp:397-408); the dynamically bound application
+quiescer covers its reader, updates, localgroup, management and slynk threads
+(AL/src/startup/main.lisp:486-498). Binding a quiescer outside main would be
+shadowed by that inner binding. No global replacement of either function or
+method is needed with the runtime-owner protocol.
+
+Gate real checkpoint support on: a registered runtime owner, no surviving
+extension thread at fork, no inherited external handles in the saved graph,
+parent recovery after failure, and graphical rebootstrap on resume. A restored
+stock checkpoint enters =checkpoint-resume-main=, not the graphical launcher
+(AL/src/state/generations.lisp:315-331), so checkpoint restoration into a new
+window needs an explicit graphical entry arrangement too. Until that gate is
+implemented, expose checkpoint support as unavailable, not detach-only support.
+
+* Source tracking and private replay
+
+Default mode is source-backed, not privately journaled. ASDF loading and
+ordinary evaluation/redefinition in package LISPTERM do not create Autolith
+self-mutation journal entries. An explicit self.redefine with package LISPTERM
+can inspect/change an already loaded package, but that does not establish safe
+persistence. Use repository edits/reloads for durable extension development.
+
+Private replay precedes user init
+(AL/src/application/runtime.lisp:943-975; AL/src/startup/user-init.lisp:65-75).
+Therefore loading lispterm only from init cannot replay LISPTERM mutations.
+The graphical launcher must load extension definitions before main to make
+startup replay possible. It must not open windows while merely loading ASDF.
+
+This alone does not make self.commit safe: the clean replay probe starts a
+fresh pinned Autolith process through =active-image-process-command=
+(AL/src/state/image-commits.lisp:903-924). That command selects a stock active
+core or AL/bin/autolith-active and bypasses the graphical launcher
+(AL/src/startup/active-image.lisp:77-97). User init is too late there too.
+
+A supported journal mode must preload the same pinned extension and its
+dependencies before replay in *all* paths: graphical startup, selected active
+core, clean commit probe, and checkpoint/recovery entry. An extension-aware
+preloaded active/probe core, built and selected with correct provenance, or an
+upstream explicit early-bootstrap hook can provide this. A bootstrap wrapper
+around only the user executable cannot. No such universal hook was established
+for installed 0.67.0. Do not advertise private LISPTERM commit persistence until
+a clean-process commit probe and subsequent boot both pass. Record the
+extension revision separately; same-heap visibility is not source provenance.
+
+* Installed loading route and isolated verification
+
+Verified discovery probe with unused HOME and XDG config/data/state roots,
+=--no-userinit --no-sysinit=, and no Autolith load:
+
+- Packaged SBCL command:
+  =/nix/store/m4594yh4fzx4lhfw0qfmgq7hzsmm8iaq-sbcl-with-packages/bin/sbcl=.
+- =asdf:find-system= locates Autolith at the AL root above.
+- Native runtime is
+  =/nix/store/7w6b9dz90jlg0bm92xwiw8xq6nah286c-sbcl-2.6.6/bin/sbcl=.
+  Prefer the packaged command, which supplies the dependency environment.
+
+AL/bin/autolith-active:11-40 loads AL/.qlot/setup.lisp, registers autolith.asd,
+loads :autolith, then invokes main. In this Nix installation .qlot/setup.lisp
+is a small ASDF adapter, not a network Quicklisp installer; it adjusts the AL
+output translation using AUTOLITH_NIX_SOURCE_ROOT and AUTOLITH_ASDF_CACHE.
+A custom graphical source bootstrap can reproduce those loading steps and
+insert lispterm before main; do not load bin/autolith-active wholesale because
+it immediately calls main. The stock core's toplevel also immediately calls
+main (AL/src/startup/active-image.lisp:121-140).
+
+For an actual launch test, use a fresh directory under .git/autolith-builds,
+set HOME, all XDG roots, AUTOLITH_ASDF_CACHE and the ASDF writable output cache
+there, and preserve packaged dependency mappings. Override inherited user
+cache values explicitly. Set AUTOLITH_SOURCE_ROOT=AL and direct session style;
+use command-local Git safe.directory entries for AL and AL/.git, following
+AL/nix/package.nix:947-970. No user credentials/configuration are needed for a
+local Lisp prompt test; provider-backed tests need separate authorization.
+
+Start with stdin=/dev/null and stdout/stderr to evidence files, no tmux/xterm.
+Record main-thread identity and PID from inside actual Autolith, exercise its
+prompt with injected PTY keys, resize, redefine a renderer function, detach and
+recreate the window while retaining session identity, then close cleanly.
+Capture and inspect the real window. This research did not run that startup
+or establish full dependency load success; ASDF discovery alone is narrower.

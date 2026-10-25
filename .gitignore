@@ -1,0 +1,7 @@
+*.fasl
+*.core
+*.log
+.cache/
+.build/
+result
+result-*

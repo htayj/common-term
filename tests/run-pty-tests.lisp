@@ -1,0 +1,15 @@
+;;;; sbcl --no-userinit --no-sysinit --script tests/run-pty-tests.lisp
+(load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
+(asdf:load-system :cffi)
+(let ((root (merge-pathnames "../" *load-truename*)))
+  (dolist (file '("package" "ffi" "posix" "process"))
+    (load (merge-pathnames (format nil "src/pty/~A.lisp" file) root))))
+(load (merge-pathnames "pty-tests.lisp" *load-truename*))
+(cond ((member "--attach-child" sb-ext:*posix-argv* :test #'string=)
+       (lispterm.pty.tests::attach-child))
+      ((member "--closed-stdio-child" sb-ext:*posix-argv* :test #'string=)
+       (lispterm.pty.tests::closed-stdio-child
+        (parse-integer (car (last sb-ext:*posix-argv*)))))
+      ((member "--detach-fork-child" sb-ext:*posix-argv* :test #'string=)
+       (lispterm.pty.tests::detach-fork-child))
+      (t (lispterm.pty.tests::run-tests)))

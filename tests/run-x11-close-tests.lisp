@@ -1,0 +1,5 @@
+(load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
+(require :sb-posix)
+(require :sb-bsd-sockets)
+(asdf:load-system "lispterm/display-x11")
+(load (merge-pathnames "x11-close-tests.lisp" *load-truename*))

@@ -1,0 +1,30 @@
+#+title: Layer boundaries
+
+ASDF load order: lispterm/engine (compat, vendored engine, adapter), lispterm/pty,
+lispterm/display (shared renderer/protocol), lispterm/display-x11 and
+lispterm/display-wayland (independent backend extensions), then lispterm
+(session and public entry points). lispterm/tests loads the upstream terminal
+suite and local engine adapter tests. Later layer files are declared only when
+they exist; their owners must extend lispterm.asd with the same system names.
+
+Engine package LISPTERM.ENGINE, independent of display and PTY:
+make-screen &key columns rows; feed screen octets; resize screen rows columns;
+rows, columns, cursor-row, cursor-column; cell-at screen row column;
+cell-character, cell-width, cell-foreground, cell-background, cell-bold-p,
+cell-inverse-p, cell-underline-p. Colours are NIL defaults or RGB integers.
+dirty-p screen and clear-damage screen. Adapter exposes engine cells read-only;
+renderers copy the values into display cells. No backend objects enter engine.
+
+* Reproducible foundation tests
+Run scripts/bootstrap-deps, then set LISPTERM_SBCL=$PWD/.build/deps/bin/sbcl.
+Run tests/verify.sh deps, tests/verify.sh unit, tests/verify.sh pty-spike.
+All launcher calls pass --no-userinit --no-sysinit. bootstrap.lisp registers
+only this repository and its named vendor directories; Nix supplies compiled
+source system discovery independently of HOME. The PTY spike is disposable:
+it intentionally rebinds its own stdio, never the primary Autolith process.
+Unknown/unimplemented verify.sh gate names exit 2.
+
+Baseline on SBCL 2.6.6: 946 expanded upstream cases plus 4 local adapter cases,
+950 passed, zero skipped/todo/failed/errored. Both the installed packaged SBCL
+and a newly built scripts/deps.nix runtime pass with a fresh HOME and XDG tree.
+A clean cl-weave compile emits one non-fatal forward-structure style warning.

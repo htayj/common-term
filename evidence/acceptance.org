@@ -1,0 +1,137 @@
+#+title: Final precommit acceptance
+#+date: 2026-10-25
+
+* Status
+All non-Git mission command gates pass. Independent PTY close review resolves
+the final runtime blocker; see [[file:review-pty-close-followup.org][close follow-up]]. Authorized delivery hygiene
+resolves trailing spaces and all staged blank-at-EOF warnings without semantic
+source changes. Post-cleanup unit and source-only packaging checks pass.
+The intended423-file index passes =git diff --cached --check= and is ready to sign.
+
+* Actual sequential commands
+Run from the repository root with =./tests/verify.sh GATE=. Each row records a
+real command, exit status and wall elapsed seconds; no skips or success stubs.
+Logs are =.build/evidence/final-acceptance60/GATE.log=; machine-readable results
+are =results.tsv= in that directory.
+
+| Gate | Exit | Seconds | Evidence |
+|------+------|---------|----------|
+| deps | 0 | 0 | Packaged dependencies loaded |
+| unit | 0 | 9 | Engine950, PTY66 + fork10, shared display, host66, input52 |
+| pty-spike | 0 | 2 | Real controlling terminal and own FD assertions |
+| pty | 0 | 14 | PTY66 + fork10, close503 / 120 concurrency iterations |
+| display | 0 | 2 | Shared display cleanup, XKB54, X11-close39 |
+| x11 | 0 | 2 | Real Xvfb depths16/24, keyboard/resize/pixels/disconnect/reopen |
+| wayland | 0 | 3 | Native Sway, DISPLAY unset, input11/resize4/scale2/disconnect/reopen/FD cleanup |
+| same-heap | 0 | 9 | Actual Autolith main/prompt in Wayland graphical heap |
+| active-image | 0 | 10 | Actual Autolith active command and shell in same Wayland heap |
+| recovery | 0 | 4 | Native X11 and Wayland rollback/live redefinition/FD+thread cleanup |
+| integration | 0 | 5 | Adoption40, actual checkpoint TOOL20 |
+| fastfetch-x11 | 0 | 1 | Real PTY process, native capture, Fastfetch exit0, no host errors |
+| fastfetch-wayland | 0 | 1 | Same, DISPLAY unset on native Wayland |
+| packaging | 0 | 4 | env -i, fresh HOME/XDG/cache, source-only isolated checkout |
+| same-heap x11 | 0 | 10 | Additional explicit actual Autolith X11 main/prompt+active-shell acceptance |
+
+All gates passed on their first attempt in this round. Unknown gate returns2.
+The explicit X11 combined gate follows the14 requested sequential mission gates.
+Independent original30s read/close reproduction also passes12 runs, max0.001s.
+Both independent503-check runs recorded close+all-join max0.068s, p95 0.067999s,
+zero measurements >=1s. Original source/test manifests verify unchanged.
+
+* Backend and lifecycle proof
+Actual Autolith X11 PID538460 and Wayland PID537611 report original main thread,
+TTY(T T T), direct style, registered command, fresh PTY, unchanged stdio and
+identical stream objects. Active command runs in the same PID/heap. Live prompt
+DEFUN changes the renderer (X11 1884 calls, Wayland8799 calls); reopen preserves
+session and PTY, resize reaches45x140, and each records zero host errors.
+The graphical startup/quit checks passed. This is actual installed Autolith,
+not a substitute prompt or external terminal.
+
+Actual checkpoint TOOL checks cover validation rollback, failed-rollback retry,
+hosted-main checkpoint refusal, saver-child handle detach/root pruning and a
+usable parent terminal afterward. Graphical saved-core restoration is outside
+the implemented scope and is not claimed. Packaging parses the delivered
+Terminus font and loads xkbcommon, loads application ASDF with an empty host
+registry, and uses no repository metadata or previous caches.
+
+* Fresh captures inspected
+This reviewer personally viewed these new native captures with =fs.view-image=:
+- =.build/x11/run.L9uXEC/depth-{16,24}.png=: readable Terminus text, box, colors.
+- =.git/autolith-tests/wayland/native-wayland.png=: actual1600x960 native output.
+- =.build/autolith/x11/run.zPl10U/autolith-x11.png=.
+- =.build/autolith/wayland/run.QEmAp4/autolith-in-lispterm.png=.
+  Both show actual Autolith, SAME-HEAP-VERIFIED, Graphical shell2 and
+  LIVE-RENDERER-GREEN. The narrow X11 capture wraps prompt forms and shows a
+  clipped status segment; acceptance markers and the prompt are readable.
+- =.git/fastfetch-x11.cXQ74Y/original.png= and
+  =.git/fastfetch-wayland.dWtyQp/original.png=: actual NixOS logo/colors/system
+  output and FASTFETCH_EXIT=0 with each new run's nonce.
+
+The Wayland native gate uses its existing ignored default artifact directory;
+X11 and Autolith gates create unique ignored per-run directories. Prior build
+clones and protected displays91-96 were not intentionally accessed.
+
+* Original evidence and identities
+Every original evidence PNG plus =fastfetch.org= and =autolith.org= passes
+before/after SHA256 checks with no restoration or edits. Exact manifest:
+=.build/evidence/final-acceptance60/originals-before.sha256=, checked by
+=originals-after-check.log=. Production and test identities are captured by
+=source-before.sha256= and checked by =source-after-check.log=; PTY-specific
+hashes and review reasoning are in [[file:review-pty-close-followup.org][close follow-up]].
+
+* Delivery audit
+The final reviewer found trailing spaces in untracked inputs. Authorized delivery
+reconciliation removed trailing spaces only at these inspected locations:
+- =tests/x11-gate.lisp:63=.
+- =engine/nerimux/src/erase.lisp:102,114,173=;
+  =parser-dcs.lisp:51=, =parser-osc-clipboard.lisp:59=,
+  =parser-osc-dispatch.lisp:50= in that same source directory;
+  =engine/nerimux/t/scroll-tests-d.lisp:105=.
+- =vendor/struct-plus/README.md:62=;
+  =vendor/xclhb/connection.lisp:8,31,48=.
+All are Lisp form whitespace, including the README's fenced Lisp example; no
+string content or Markdown hard break was changed. =diff -w= against per-file
+snapshots passes for all eight files. Third-party provenance records this cleanup.
+
+After cleanup, actual =tests/verify.sh unit=, =pty=, =display= and =packaging=
+all pass. PTY close503 stress: max and p95 0.067999s, zero measurements >=1s.
+Logs and snapshots: =.build/evidence/delivery61/=. The original eight PNG and
+provenance files pass SHA256 checks against both the final-review manifest and
+the delivery manifest, without restoration.
+
+The explicit audit of all423 intended untracked files passes: no trailing spaces
+in text; Bash syntax passes for all shell entrypoints. Nontext deliverables are
+exactly the six intentional PNGs. All vendors are ordinary files, with no nested
+Git markers or symlinks. Filename and bounded private-key/token pattern checks
+found no matching deliverables; this is not an exhaustive secret-content audit.
+The earlier =git diff --check= alone was insufficient with the unborn empty index.
+Actual root staging exposed26 additional blank-at-EOF warnings in upstream
+engine/vendor inputs. Extended cleanup authority covers these nonsemantic lines.
+Each inspected target was snapshotted before removing only excess terminal LF
+bytes, preserving exactly one terminal newline. =diff -w --ignore-blank-lines=
+against each snapshot passes; no strings or meaningful content changed.
+Logs, target list and snapshots: =.build/evidence/delivery62/=. No original review
+snapshots, captures/provenance, private Autolith selection, credentials or global
+Git configuration were edited.
+
+** Resolved staged whitespace warnings
+The following original Git warnings are now resolved:
+- =engine/nerimux/LICENSE.cl-tty-kit:22=.
+- =vendor/cl-weave/src/continuations.lisp:52=, =logic.lisp:326=,
+  =matcher-builtins.lisp:249=, =matcher-core.lisp:135=, =mocks.lisp:245=,
+  =mutation-runner.lisp:81=, =registration.lisp:162=,
+  =reporter-mutation.lisp:75=, =runner-collection.lisp:368=,
+  =runner-control.lisp:66=, =watch-suite-diff.lisp:341=.
+- =vendor/cl-weave/t/continuations-test.lisp:33=, =helpers-property.lisp:7=,
+  =property-generators-test.lisp:541=, =registration-todos-test.lisp:85=,
+  =runner-api-list-mode-test.lisp:562=, =runner-control-bail-test.lisp:79=,
+  =runner-selection-sharding-test.lisp:116=.
+- =vendor/xclhb/connection.lisp:144=, =keysym.lisp:152=, =package.lisp:8=,
+  =process-input.lisp:73=, =resource-id.lisp:38=, =xproto.lisp:2400=,
+  =xproto2.lisp:39=.
+All26 targets pass the staged check after cleanup. The complete417-text-file
+whitespace audit passes; the only six binary files are the intended PNGs.
+Actual post-EOF-cleanup =tests/verify.sh unit= and =packaging= both exit0.
+Original six PNGs and two provenance files match the final-review SHA256 manifest.
+Final staged stat, summary, whitespace and shell syntax audits precede signing;
+the postcommit Git gate and full mission verification are separate checks.

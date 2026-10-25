@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Always bypass user init files. Set LISPTERM_SBCL to an explicit packaged runtime.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+runtime=${LISPTERM_RUNTIME:-$root/.build/deps}
+if [[ -d $runtime ]]; then
+ export LISPTERM_FONT=${LISPTERM_FONT:-$runtime/share/fonts/terminus/ter-u16n.otb}
+ export LISPTERM_XKBCOMMON_LIBRARY=${LISPTERM_XKBCOMMON_LIBRARY:-$runtime/lib/libxkbcommon.so.0}
+fi
+# A Nix SBCL wrapper supplies its own registry. Do not append an inherited
+# wrapper registry, which can contain a second ASDF inherit marker.
+unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
+exec "${LISPTERM_SBCL:-$runtime/bin/sbcl}" --no-userinit --no-sysinit "$@"

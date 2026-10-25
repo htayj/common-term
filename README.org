@@ -1,0 +1,66 @@
+#+title: Lispterm
+
+A Linux Common Lisp terminal with native Wayland and X11 windows. The VT engine,
+PTY host and renderer run in one SBCL heap. In Autolith mode, Autolith's main
+controller runs in that heap on the original main thread.
+
+* Build and run
+Requires Linux x86-64 glibc, Bash, Nix with =nix-command= and =flakes= enabled,
+and a Wayland compositor supporting xdg-shell/SHM or an X11 server.
+
+#+begin_src sh
+scripts/bootstrap-deps
+bin/lispterm
+bin/lispterm --backend wayland -- /bin/sh
+bin/lispterm --backend x11 -- /bin/sh
+bin/lispterm --autolith --backend wayland
+#+end_src
+
+Without program arguments after =--=, open =SHELL= (or =/bin/sh=).
+Automatic backend selection prefers native Wayland when =WAYLAND_DISPLAY= is
+set, otherwise X11 when =DISPLAY= is set. Explicit selection does not fall back.
+Use =--display NAME=, =--rows N=, =--columns N= and =--title TITLE= to customize
+the window. The pinned runtime includes Terminus OTB and libxkbcommon. See
+[[file:docs/packaging.org][packaging]] for overrides and the installed Autolith dependency closure.
+
+* Use inside Autolith
+Load this repository's =scripts/bootstrap.lisp=, then
+=(asdf:load-system "lispterm/autolith")= in the existing image. Invoke
+=/graphical-shell= to open a new shell, preserving the primary standard
+file descriptors and Lisp streams. The executable's =--autolith= path instead
+attaches its disposable process's descriptors 0/1/2 to a slave PTY, selects
+direct session style and calls actual Autolith =main=.
+
+Extension definitions are source-backed. Save durable changes in this
+repository and reload them. Private self-mutation replay of Lispterm is not
+advertised: the stock clean commit probe does not preload this extension.
+Hosted-main graphical checkpoints are explicitly refused before fork because
+restoring graphical main needs a supported re-entry arrangement. Separate
+shell runtimes participate in Autolith's registered tool lifecycle. See
+[[file:docs/autolith-contract.org][the integration contract]] for these boundaries.
+
+* Verify
+#+begin_src sh
+scripts/bootstrap-deps --tests
+tests/verify.sh deps
+tests/verify.sh unit
+tests/verify.sh x11
+tests/verify.sh wayland
+tests/verify.sh same-heap wayland
+tests/verify.sh active-image x11
+tests/verify.sh recovery
+tests/verify.sh integration
+tests/verify.sh fastfetch-x11
+tests/verify.sh fastfetch-wayland
+tests/verify.sh packaging
+#+end_src
+
+=same-heap= and =active-image= run the combined real Autolith startup and
+new-shell/stdio-preservation test on the requested backend. Run
+=tests/verify.sh git= after the final signed commit. See
+[[file:evidence/verification.org][verification]] for gate meanings and results. Graphical tests create private displays.
+
+[[file:docs/architecture.org][Architecture]] · [[file:docs/security.org][Security]] · [[file:THIRD_PARTY.org][Third-party provenance]]
+
+Project code is MIT licensed. Vendored notices apply to their respective
+files; the runtime font is a separately packaged dependency.

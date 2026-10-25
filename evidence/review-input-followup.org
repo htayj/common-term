@@ -1,0 +1,114 @@
+#+title: Independent input follow-up and acceptance wiring
+#+date: 2026-10-25
+
+* Verdict
+The HIGH silent-input-loss finding in =review-integration.org= is resolved at
+input54's source hashes below. Independent execution and mechanism inspection
+found no remaining concrete input-FIFO defect. Final acceptance is BLOCKED by a
+separate reproduced PTY close-starvation finding described below. A successful
+unit retry does not resolve that finding.
+
+TASK route only. Changed only the five approved package exports, acceptance
+wiring, this report and =review.org=. No implementation/test-body edits, commits,
+staging, credentials, private-image changes or UI operations.
+
+* Input mechanism inspection
+The window owner serializes command, paste/key/focus and device-response enqueue.
+SEND-INPUT copies caller bytes before command publication; SESSION-WRITE copies
+again into FIFO-owned storage. Capacity rejection precedes insertion. Successful
+calls acknowledge complete enqueue, not delivery. The owner holds INPUT-LOCK
+while removing exactly the returned accepted prefix; zero and partial writes
+retain the correct offset and suffix. Each scheduler turn writes at most 4096
+bytes through PTY-WRITE :TIMEOUT 0. The existing scheduler processes controls
+before I/O and sleeps .005 seconds, avoiding a new polling spin.
+
+Responses remain in the engine queue when their entire batch cannot fit. Later
+user input is explicitly rejected while that queue is nonempty; further PTY
+reads pause until the retained response batch can enter the FIFO. The batch is
+ordered by reversing the engine's reverse-chronological queue. Screen and input
+lock ordering agrees with status/close; ordinary FIFO write/flush does not acquire
+the screen mutex in the inverse order. Quiesce joins the owner without clearing
+input. Close stops the owner, closes/reaps the PTY, then clears/counts queued and
+engine-owned bytes and signals INPUT-CANCELLED after marking the host closed.
+Saver detach replaces the added input mutex without acquiring its inherited copy.
+
+* Independent input execution
+=scripts/sbcl --script tests/run-host-input-tests.lisp= exited 0, 52 checks.
+The real initially nonreading raw slave accepted a 65536-byte host command while
+kernel backpressure left a nonzero owner suffix. After query/paste/TAIL enqueue,
+quiesce preserved that suffix, resume restored the owner, and reader release
+produced the complete byte-for-byte expected payload, paste, both actual terminal
+query replies and TAIL. Deterministic injected zero/partial writes test private
+copy and FIFO offsets. Overflow rejects without partial insertion. Cancellation
+is explicit and close/idempotence pass. Execution
+=475f6da6-43af-409c-86ef-a637af5e5f7c=; =input.log=.
+
+A separate disposable stdin probe added 14 checks: all five approved symbols are
+external, public backpressure readers return supplied counts, four concurrent
+64KiB callers each complete enqueue, pending bytes remain bounded, quiesce freezes
+an exact suffix count, cancellation reports exactly that count, the actual PTY is
+closed and child reaped, FIFO clears, state is CLOSED and repeated close succeeds.
+Execution =841ba2f3-3262-407f-a1ff-d92c357fdc5d=; =extra-retry.log=.
+An earlier draft of that stdin probe had an unmatched parenthesis and failed to
+read before executing its assertions; it made no source changes (=extra.log=).
+
+* New MEDIUM: PTY read-loop mutex reacquisition starves close
+Locations: =src/pty/posix.lisp:50-71= and =src/pty/process.lisp:88-102=.
+PTY-READ releases the transport mutex after each .05-second poll and calls
+THREAD-YIELD, but can immediately reacquire it repeatedly ahead of CLOSE-PTY.
+CLOSE-PTY cannot publish close intent until it obtains that same mutex. A long
+read deadline therefore defeats the claimed short-slice close bound.
+
+The existing PTY suite's CLOSE-BOUNDED assertion failed twice independently:
+=unit.log= and =pty-retry.log=. A subsequent identical unit dispatcher passed.
+A separate 12-iteration real PTY probe confirmed this is not just assertion
+printing overhead: open a PTY with no child, start PTY-READ :TIMEOUT 30 in another
+thread, sleep .1, time CLOSE-PTY plus joining the reader, without printing inside
+the timed region. Observed seconds:
+#+begin_example
+4.565932 .952986 .001 1.30398 5.419919 10.740839
+2.908956 2.113969 .65499 .001 1.453978 .051
+#+end_example
+Seven of twelve exceed the existing 1-second assertion. All readers eventually
+returned :EOF; there is no child termination delay in this probe. Full input and
+output are retained in execution =841ba2f3-3262-407f-a1ff-d92c357fdc5d=,
+=extra-retry.log=. The observed delay is established; unfair repeated mutex
+reacquisition is the source-supported explanation, not an instrumented scheduler
+trace. Parent notified promptly for a separate repair. No repair attempted here.
+A fix should establish a reliable close/control handoff, preserve fd-reuse safety,
+and independently rerun repeated long-read/close plus the PTY suite.
+
+* Acceptance wiring and actual results
+Added exactly INPUT-BACKPRESSURE, INPUT-BACKPRESSURE-PENDING,
+INPUT-BACKPRESSURE-REQUESTED, INPUT-CANCELLED and INPUT-CANCELLED-BYTES exports.
+Unit/self-check executes input tests after existing host tests. Integration runs
+actual-runtime adoption tests before the existing checkpoint gate. Display keeps
+shared display, XKB54 and X11-close39 checks. Unknown gate exits 2.
+
+Executed =tests/verify.sh unit=: first failure above, identical retry exit 0,
+including engine, PTY66 plus fork-detach10, shared display, host66 and input52.
+=tests/verify.sh integration= exited 0: adoption40 and actual checkpoint TOOL20.
+=tests/verify.sh display= exited 0: shared display, XKB54 and X11-close39.
+=tests/verify.sh unknown= exited 2. =bash -n tests/verify.sh= passed.
+Combined dispatcher execution =ec2ead3b-e83d-436f-a5f1-c94bf93eb40a=.
+Logs/manifests are under =.build/evidence/input-followup58/=. No native capture
+gates ran during this recheck; final full acceptance is a separate operation.
+
+* Reviewed SHA256
+Implementation hashes match input54 and were not changed here:
+#+begin_example
+1dc10d0f3bd31a1ed6b65ed3e145b3da4040151d8615735fd66313b7023c8ae5  src/session.lisp
+6315506484a0ae21589d8c2cfaba608090d8fc4be9e77427118f143e52b0f7e0  src/host.lisp
+9d70c40511263b338cc7457d76d5c8e3a140fb0ffd96df094227683b998d7697  src/pty/posix.lisp
+b2a9c0351e26567edc6e416c4266e4f834459b9f03e5d9d9d4c141b82848981f  tests/host-input-tests.lisp
+bf619af8e9f5f779b22c121581145487e83405ee3fd5e48bc76de8e6b2c8fe10  tests/run-host-input-tests.lisp
+17799a295a5441ed10d7219febc6e49eed2a491b196e466768bb9d6ddbc1877d  src/package.lisp
+ca925a3d03c7b048d70329b0751e0a28dad8bcf56b096f85d7a5d262fb625ffe  tests/verify.sh
+#+end_example
+All original evidence PNGs, fastfetch.org and autolith.org passed before/after
+SHA256 verification, including display-smoke. No restoration was needed.
+
+* Limits
+Targeted input/lifecycle review, not exhaustive concurrency or allocation-failure
+proof. No new native screenshot inspection or saved graphical core claim.
+The PTY close finding prevents a ready-for-final-acceptance verdict.

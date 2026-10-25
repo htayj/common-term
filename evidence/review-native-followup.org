@@ -1,0 +1,57 @@
+#+title: Independent native safety fix follow-up
+#+date: 2026-10-25
+
+* Verdict and scope
+All three reproduced findings in review-native.org are resolved at the source hashes below. Independent task-role recheck53 read the changed XKB and X11 close code, shared cleanup protocol, original findings and regression implementations, then executed the tests in disposable SBCL processes. No production edits, staging, commits, configuration or credential access. Host/adapter integration belongs to separate review52.
+
+* Reproduced failures after repair
+- HIGH keymap SIGBUS: xkb-from-fd now bounds size to 2..16777216 and copies with pread into private temporary storage. There is no file-backed mmap in this path. Empty memfd advertised as 8193 and short backing storage now signal typed transport errors, close the FD and never reach the instrumented native parser. A real ftruncate between two partial preads likewise fails safely. Native parser reads owned memory, so subsequent file truncation cannot produce the original mapped-page SIGBUS.
+- Keymap FD leak: exact eight-byte payload validation precedes wire-fd-pop. The suite checks malformed lengths 0/1/4/7/9 and FD cleanup. An additional independent empty-payload probe inspected ownership BEFORE wire-close: typed error, original FD still in wire-fds and F_GETFD successful; after wire-close F_GETFD returned -1. Unsupported format consumes and closes its FD.
+- X11 false cleanup completion: backend-close propagates the identical stream CLOSE condition and clears backend-state only after normal return. The 39-check suite exercised failures before and after real descriptor closure. State/client/stream/window/GC stay reachable, display remains unusable with cleanup pending, nonowner retry is rejected, owner retry finishes cleanup, descriptor becomes EBADF, and subsequent close is idempotent. Shared tests also exercised timeout, retained partial-open cleanup and blocked reopen.
+
+XKB's 54 checks additionally cover invalid sizes, missing/embedded NUL, invalid UTF-8, invalid XKB syntax, EINTR plus partial reads, actual valid keymap parsing and A input, native pointer teardown and exact FD baseline. Unsafe inputs are rejected before the instrumented native parser; intentionally invalid syntax reaches it and prints the expected libxkbcommon diagnostic. A separate independent injected pread EIO check verified typed error, zero parser calls and FD closure. No corruption warning, fatal signal or process failure occurred.
+
+* Commands and evidence
+All following commands exited 0 unless stated. Logs and fresh renders are under .build/evidence/native-followup53/.
+#+begin_src sh
+scripts/sbcl --script tests/run-xkb-tests.lisp
+scripts/sbcl --script tests/run-x11-close-tests.lisp
+scripts/sbcl --script tests/run-display-tests.lisp
+LISPTERM_WAYLAND_ARTIFACTS="$PWD/.build/evidence/native-followup53/wayland" tests/wayland-gate.sh
+tests/x11-gate.sh
+tests/verify.sh display
+bash -n tests/verify.sh
+sha256sum --check .build/evidence/native-followup53/before.sha256
+git diff --check
+#+end_src
+Standalone results: XKB 54 checks, X11 close 39 checks; shared core reports CORE, PIXEL/WIDE/INVERSE/UNDERLINE/OWNER, OPEN FAILURE/KEY MODIFIERS and CLOSE ERROR/TIMEOUT/RETRY/PARTIAL-OPEN PASS. Dispatcher display independently reran all three successfully. Unknown dispatcher gate returned exactly 2.
+
+Native Wayland: own isolated headless Sway, xwayland disabled, DISPLAY unset. Result (:NATIVE-WAYLAND T :DISPLAY-UNSET T :INPUT 10 :RESIZE 4 :SCALE2 T :DISCONNECT T :REOPEN T :FD-CLEANUP T). Execution 27700a25-7f9a-4332-9d47-df947bf4e871.
+
+X11: both depths 16 and 24 passed real input, resize, pixel readback, disconnect and reopen. Execution 31e9a6f1-7662-487c-9b2f-6aad6b304ce2. Command environment prepended .build/test-tools/bin, unset inherited CL_SOURCE_REGISTRY/ASDF_OUTPUT_TRANSLATIONS, exported sbcl shell function invoking scripts/sbcl after stripping initial --noinform, and exported seq function limiting free display search to 140..199. This avoids the protected displays91..96 and incompatible inherited runtime flags. The harness itself was unchanged. Original display-smoke.png was saved before execution and restored in EXIT trap, then verified by SHA256. The first identical shell invocation could not allocate its capture manifest, matching known papercut d49c2611; the exact retry succeeded. No duplicate incident filed.
+
+Independent supplemental probes: scripts/sbcl --non-interactive --load tests/run-xkb-tests.lisp followed by --eval probes for retained queue ownership on empty payload and injected pread EIO. Execution 841c774e-651d-49b1-8099-0ce83daa1dc6; full retained output also copied to independent-extra.log. Dispatcher execution b88ea9d1-99b9-48ec-94a0-a34bf2a8f8ac.
+
+Personally viewed both fresh server captures with fs.view-image: wayland/native-wayland.png (1600x960), readable native Wayland test text; x11-depth24.png (640x384), readable Terminus text, border and color swatches. Depth16 passed assertions but its intermediate capture was not retained separately.
+
+* Acceptance wiring
+Only tests/verify.sh changed: display now executes shared display tests, then XKB safety tests and X11-close tests, failing on any error. Existing x11/wayland branches continue their native acceptance without repeating these suites. Unknown gate handling still exits 2. This is actual execution, not a success marker.
+
+* Before/after SHA256
+Identical before and after all probes, native runs and dispatcher execution:
+#+begin_example
+546fb3b4423952d7305853af0e8d67b1277925d997fcb4e787303166747798ee  src/display/xkb.lisp
+26a10eef0861f778e9eec6c77ce00d6de0388e408be7596aa859577feb552a11  src/display/x11.lisp
+614aae7d435b7ebe10d750a801f633d9a041a6cf9c3bbcb1e920e0a7de1752c4  src/display/protocol.lisp
+6c15af80f8aa0972bed978c576d987352df0ccad6c05a07ff0d4bdfbd46abcbe  evidence/fastfetch-x11.png
+265b1be09c46e5ce66d2a41642a9d1da696a0fe9d4aa8c701cddfd7d382c9824  evidence/fastfetch-wayland.png
+8b02c4252c6275d81e46e22f77f8fb7c2e1980a60c6fc82c367709b2c3075ad5  evidence/fastfetch.org
+223ddde54784fc100f48a107ccf626cc0ad74cc5032f680105e2ca49bfd9b30e  evidence/autolith-in-lispterm.png
+223ddde54784fc100f48a107ccf626cc0ad74cc5032f680105e2ca49bfd9b30e  evidence/autolith-wayland.png
+a01cb3fbb68edaa3c58411c923b4662b7b1fe274f9273fb535cf1b9bbf12a385  evidence/autolith-x11.png
+012d7e9b12bcc7333cab452ec5ad60788b31e17de60914fe75a879cba51e967b  evidence/autolith.org
+375c8461d3c28a91e1f50be5be9597182295199e4bf6356e43f771b763aad669  evidence/display-smoke.png
+#+end_example
+
+* Limits
+This is targeted independent reproduction and code review of the three fixes, not exhaustive fuzzing, a broad vendored protocol audit, or proof against arbitrary asynchronous interruption at every instruction. EIO and close-error paths were deliberately injected; no real kernel close failure was induced. Native server acceptance and FD baselines passed. No concrete remaining finding in this scope.

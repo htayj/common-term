@@ -1,0 +1,5 @@
+(require :asdf)
+(load "scripts/bootstrap.lisp")
+(asdf:load-system "lispterm/display-wayland")
+(load "tests/wayland-gate.lisp")
+(lispterm.wayland-tests:run)
