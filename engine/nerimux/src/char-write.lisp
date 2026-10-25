@@ -1,15 +1,14 @@
 (in-package #:nerimux/terminal/actions)
 
 (defun %remap-charset-char (screen ch)
-  "Apply a pending single shift or the active DEC graphics charset to CH."
-  (let ((shift (screen-single-shift screen)))
-    (cond
-      (shift
-        (setf (screen-single-shift screen) nil)
-        (if (eq (screen-invoked-charset screen shift) :dec-graphics)
-            (%dec-graphics-char ch)
-            ch))
-      ((eq (screen-charset screen) :dec-graphics) (%dec-graphics-char ch))
+  "Map CH through the invoked charset, consuming any pending single shift."
+  (let* ((shift (screen-single-shift screen))
+         (charset (if shift (screen-invoked-charset screen shift)
+                      (screen-charset screen))))
+    (when shift (setf (screen-single-shift screen) nil))
+    (case charset
+      (:dec-graphics (%dec-graphics-char ch))
+      (:british (if (char= ch #\#) #\£ ch))
       (t ch))))
 
 (defun %consume-pending-wrap (screen)

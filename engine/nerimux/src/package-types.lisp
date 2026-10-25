@@ -97,6 +97,8 @@
    #:screen-reverse-screen
    #:screen-bracketed-paste
    #:screen-app-cursor-keys
+   #:screen-app-keypad
+   #:screen-vt52-mode
    #:screen-title
    #:screen-title-stack
    #:screen-cwd

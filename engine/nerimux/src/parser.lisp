@@ -37,6 +37,8 @@
   (#x44  (cursor-lf  screen)     #'ground-state)
   (#x45  (cursor-nel screen)     #'ground-state)
   (#x48  (set-tab-stop screen)   #'ground-state)
+  (#x3D  (setf (screen-app-keypad screen) t)   #'ground-state)
+  (#x3E  (setf (screen-app-keypad screen) nil) #'ground-state)
   (#x28  (make-charset-designator-k :g0))
   (#x29  (make-charset-designator-k :g1))
   (#x2A  (make-charset-designator-k :g2))

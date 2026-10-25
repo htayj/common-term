@@ -137,6 +137,7 @@
 (:file "parser-state-cps-tests")
 (:file "emulator-tests")
 (:file "parser-fuzz-tests")
+(:file "vt100-foundation-tests")
 )) (:file "tests/engine-tests")))
 
 (defmethod perform ((operation test-op) (system (eql (find-system "lispterm/tests"))))

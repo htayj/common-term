@@ -6,6 +6,15 @@
   "Push REPLY string onto SCREEN's response queue."
   (push reply (screen-response-queue screen)))
 
+(defun enqueue-terminal-parameters-reply (screen request)
+  "DECREPTPARM for a validated DECREQTPARM 0/1 request.
+   Virtual serial profile: no parity, 8 bits, 9600 baud transmit/receive,
+   clock multiplier 16, no STP flags. No unsolicited SET-UP reports are emitted.
+   VT100 User Guide chapter 3, DECREQTPARM: speed code 112 is 9600 baud.
+   https://vt100.net/docs/vt100-ug/chapter3.html#DECREQTPARM"
+  (%enqueue-reply screen
+                  (format nil "~C[~D;1;1;112;112;1;0x" #\Escape (+ request 2))))
+
 (define-fixed-reply-enqueuers
  (enqueue-dsr-reply (format nil "~C[0n" #\Escape)
                     "Push Device Status Report OK (ESC[0n) onto SCREEN's response queue.")

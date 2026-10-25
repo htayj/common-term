@@ -79,13 +79,13 @@
                                         params
                                         param-accumulator
                                         subparams)
-  "Flush the trailing parameter (if any), reverse the collected PARAMS into
-   final CSI dispatch order, and call EXECUTE-CSI with the assembled sequence.
-   Called by make-csi-k's continuation once a final byte (0x40-0x7E) closes
-   the sequence.  Always returns #'GROUND-STATE."
+  "Flush the trailing parameter, reverse PARAMS into final CSI dispatch order,
+   and call EXECUTE-CSI. Once a separator has collected a parameter, an absent
+   trailing value is another default (0), not an absent parameter. An entirely
+   omitted parameter list stays NIL. Always returns #'GROUND-STATE."
   (let ((all-params
          (nreverse
-          (if (or param-accumulator subparams)
+          (if (or param-accumulator subparams params)
               (cons (%finish-param param-accumulator subparams) params)
               params))))
     (execute-csi screen (code-char byte) intermed private all-params))
@@ -108,6 +108,12 @@
   (lambda (screen byte)
     (declare (type screen screen) (type (unsigned-byte 8) byte))
     (cond
+      ;; VT100 User Guide 3.3.1: execute embedded C0 without losing CSI state.
+      ((= byte #x1B) #'escape-state)
+      ((member byte '(#x18 #x1A)) #'ground-state)
+      ((or (< byte #x20) (= byte #x7F))
+       (ground-state screen byte)
+       (make-csi-k params param-accumulator intermed private subparams))
       ((and (>= byte +csi-digit-low+) (<= byte +csi-digit-high+))
        (make-csi-k params
                    (+ (* (or param-accumulator 0) 10) (- byte +csi-digit-low+))

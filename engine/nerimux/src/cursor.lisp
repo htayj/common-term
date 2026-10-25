@@ -34,13 +34,17 @@
   (%clear-line-wrapped screen (screen-cursor-y screen)))
 
 (define-cursor-movements
- (cursor-up "Move the cursor up N rows, clamping to the scroll-top boundary."
+ (cursor-up "Move up N rows, stopping at the top margin unless already above it."
             screen-cursor-y
-            (max (screen-scroll-top screen) (- (screen-cursor-y screen) n)))
+            (max (if (< (screen-cursor-y screen) (screen-scroll-top screen))
+                     0 (screen-scroll-top screen))
+                 (- (screen-cursor-y screen) n)))
  (cursor-down
-  "Move the cursor down N rows, clamping to the scroll-bottom boundary."
+  "Move down N rows, stopping at the bottom margin unless already below it."
   screen-cursor-y
-  (min (screen-scroll-bottom screen) (+ (screen-cursor-y screen) n)))
+  (min (if (> (screen-cursor-y screen) (screen-scroll-bottom screen))
+           (1- (screen-height screen)) (screen-scroll-bottom screen))
+       (+ (screen-cursor-y screen) n)))
  (cursor-right "Move the cursor right N columns, clamping to width-1."
                screen-cursor-x
                (min (1- (screen-width screen)) (+ (screen-cursor-x screen) n)))
@@ -51,9 +55,10 @@
 (defun cursor-down/scroll (screen)
   "Move cursor down one line, scrolling when at the bottom of the scroll region.
    This is the internal helper used by write-char-at-cursor and the LF handler."
-  (if (< (screen-cursor-y screen) (screen-scroll-bottom screen))
-      (incf (screen-cursor-y screen))
-      (scroll-up-one screen)))
+  (cond ((= (screen-cursor-y screen) (screen-scroll-bottom screen))
+         (scroll-up-one screen))
+        ((< (screen-cursor-y screen) (1- (screen-height screen)))
+         (incf (screen-cursor-y screen)))))
 
 (defun cursor-lf (screen)
   "Line feed: move cursor down, scrolling the scroll region if at the bottom."
@@ -85,12 +90,11 @@
                                    #'<)))
 
 (defun clear-tab-stops (screen mode)
-  "TBC (CSI N g), clear tab stops.  MODE 3 clears ALL stops; any other value
-   (including 0) clears the stop at the current cursor column."
-  (setf (screen-tab-stops screen) (if (= mode 3)
-                                      '()
-                                      (remove (screen-cursor-x screen)
-                                              (%materialize-tab-stops screen)))))
+  "TBC: 0 clears the current horizontal stop, 3 clears all; other modes do nothing."
+  (case mode
+    (0 (setf (screen-tab-stops screen)
+             (remove (screen-cursor-x screen) (%materialize-tab-stops screen))))
+    (3 (setf (screen-tab-stops screen) nil))))
 
 (defun %next-tab-stop (stops x max-x)
   "Return the column of the next tab stop after X.
@@ -149,9 +153,10 @@
 (defun cursor-ri (screen)
   "Reverse index (ESC M): move cursor up one line, scrolling down if at top."
   (%cancel-wrap screen)
-  (if (= (screen-cursor-y screen) (screen-scroll-top screen))
-      (scroll-down-one screen)
-      (decf (screen-cursor-y screen))))
+  (cond ((= (screen-cursor-y screen) (screen-scroll-top screen))
+         (scroll-down-one screen))
+        ((plusp (screen-cursor-y screen))
+         (decf (screen-cursor-y screen)))))
 
 (defun cursor-cr (screen)
   "Carriage return: move the cursor to column 0."

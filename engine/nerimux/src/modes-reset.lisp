@@ -19,6 +19,9 @@
         (screen-insert-mode screen) nil
         (screen-newline-mode screen) nil
         (screen-reverse-screen screen) nil
+        (screen-app-cursor-keys screen) nil
+        (screen-app-keypad screen) nil
+        (screen-vt52-mode screen) nil
         (screen-pending-wrap screen) nil)
   (clrhash (screen-line-sizes screen)))
 
@@ -40,12 +43,11 @@
    power-on defaults but, unlike RIS, does NOT clear the screen or move the cursor.
    Resets the SGR pen, the terminal modes (charset / origin / autowrap / insert /
    scroll region / cursor visibility / pending wrap / tab stops via
-   reset-terminal-modes), application cursor keys, bracketed-paste mode, and the
-   DECSC saved-cursor (a later DECRC then homes, per xterm)."
+   reset-terminal-modes), bracketed-paste mode, and the DECSC saved-cursor
+   (a later DECRC then homes, per xterm)."
   (reset-sgr-pen screen)
   (reset-terminal-modes screen)
-  (setf (screen-app-cursor-keys screen) nil
-        (screen-bracketed-paste screen) nil
+  (setf (screen-bracketed-paste screen) nil
         (screen-saved-cursor screen) nil))
 
 (defun decaln-action (screen)

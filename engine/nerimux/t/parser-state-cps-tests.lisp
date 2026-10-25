@@ -151,11 +151,19 @@
         (expect (eq #'nerimux/terminal/parser:ground-state result))
         (expect (= 2 (nerimux/terminal/types:screen-cursor-shape s))))))
 
-  (it "make-csi-k-non-final-invalid-byte-aborts-to-ground"
-    (with-screen (s 10 5)
-      (let* ((k0 (nerimux/terminal/parser:make-csi-k))
-             (result (funcall k0 s #x01)))
-        (expect (eq #'nerimux/terminal/parser:ground-state result)))))
+  (it "make-csi-k-ignored-controls-preserve-parameters-through-final-dispatch"
+    ;; VT100 User Guide 3.3.1: embedded controls execute immediately and
+    ;; collection continues, except ESC restarts and CAN/SUB cancel.
+    ;; https://vt100.net/docs/vt100-ug/chapter3.html#S3.3.1
+    (dolist (ignored '(#x00 #x01))
+      (with-screen (s 40 5)
+        (let* ((k0 (nerimux/terminal/parser:make-csi-k))
+               (k1 (funcall k0 s #x31))
+               (k2 (funcall k1 s ignored))
+               (k3 (funcall k2 s #x32))
+               (result (funcall k3 s #x43)))
+          (expect (eq #'nerimux/terminal/parser:ground-state result))
+          (check-cursor s 12 0)))))
 
 
   (it "make-utf8-k-assembles-two-byte-sequence"

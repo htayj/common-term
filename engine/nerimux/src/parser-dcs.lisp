@@ -202,17 +202,19 @@
    G (:g0 for ESC (, :g1 for ESC )) to the corresponding charset, then returns to
    ground:
      #x30 '0' → DEC special graphics (line-drawing)
+     #x41 'A' → British (US ASCII with # replaced by £)
      #x42 'B' → US ASCII
-     all other designators → ASCII (accepted silently).
+     '1'/'2' (optional alternate ROMs), and other designators → ASCII fallback.
    Designating does NOT activate G1, that requires a SO (0x0E) locking shift."
   (lambda (screen byte)
     (declare (type screen screen)
              (type (unsigned-byte 8) byte))
     (designate-charset screen
                        g
-                       (if (= byte #x30)
-                           :dec-graphics
-                           :ascii))
+                       (case byte
+                         (#x30 :dec-graphics)
+                         (#x41 :british)
+                         (t :ascii)))
     #'ground-state))
 
 (defun make-ignore-final-byte-k ()

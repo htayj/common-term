@@ -3,10 +3,10 @@
 (define-csi-rule-set csi-screen-rules
 
   ((and (null intermed) (char= final #\A))
-   (set-cursor screen (screen-cursor-x screen) (- (screen-cursor-y screen) p1*)))
+   (cursor-up screen p1*))
 
   ((and (null intermed) (char= final #\B))
-   (set-cursor screen (screen-cursor-x screen) (+ (screen-cursor-y screen) p1*)))
+   (cursor-down screen p1*))
 
   ((and (null intermed) (char= final #\C))
    (set-cursor screen (+ (screen-cursor-x screen) p1*) (screen-cursor-y screen)))
@@ -15,10 +15,12 @@
    (set-cursor screen (- (screen-cursor-x screen) p1*) (screen-cursor-y screen)))
 
   ((and (null intermed) (char= final #\E))
-   (set-cursor screen 0 (+ (screen-cursor-y screen) p1*)))
+   (cursor-down screen p1*)
+   (cursor-cr screen))
 
   ((and (null intermed) (char= final #\F))
-   (set-cursor screen 0 (- (screen-cursor-y screen) p1*)))
+   (cursor-up screen p1*)
+   (cursor-cr screen))
 
   ((and (null intermed) (char= final #\G))
    (set-cursor screen (1- p1*) (screen-cursor-y screen)))
@@ -30,7 +32,7 @@
    (set-cursor screen (+ (screen-cursor-x screen) p1*) (screen-cursor-y screen)))
 
   ((and (null intermed) (char= final #\e))
-   (set-cursor screen (screen-cursor-x screen) (+ (screen-cursor-y screen) p1*)))
+   (cursor-down screen p1*))
 
   ((and (null intermed) (char= final #\s))
    (save-cursor screen))

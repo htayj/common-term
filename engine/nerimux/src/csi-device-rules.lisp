@@ -1,6 +1,16 @@
 (in-package #:nerimux/terminal/csi)
 
 (define-csi-rule-set csi-device-rules
+                     ((and (null intermed) (null private) (char= final #\x)
+                           (or (null params) (equal params '(0)) (equal params '(1))))
+                      (enqueue-terminal-parameters-reply screen p1))
+                     ;; Software terminal policy: accept keyboard LEDs and hardware
+                     ;; confidence tests silently; no physical option or reply is emulated.
+                     ((and (null intermed) (null private) (char= final #\q))
+                      (values))
+                     ((and (null intermed) (null private) (char= final #\y)
+                           (= p1 2))
+                      (values))
                      ((and (null intermed) (char= final #\n) (= p1 5))
                       (enqueue-dsr-reply screen))
                      ((and (null intermed) (char= final #\n) (= p1 6))
