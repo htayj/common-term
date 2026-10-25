@@ -45,12 +45,24 @@
                                 bg)))))))
     (push (list x y (min (* span cw) (- (display-width d) x)) ch) (display-damage d))))
 
+(defun same-cell-p (a b)
+  "Compare all CELL fields for framebuffer cache reuse, with case-sensitive characters.
+Keep this comparison in sync with the CELL structure when adding render state."
+  (and a b
+       (eql (cell-char a) (cell-char b))
+       (eql (cell-width a) (cell-width b))
+       (eql (cell-fg a) (cell-fg b))
+       (eql (cell-bg a) (cell-bg b))
+       (eql (cell-bold a) (cell-bold b))
+       (eql (cell-inverse a) (cell-inverse b))
+       (eql (cell-underline a) (cell-underline b))))
+
 (defun draw-cells (d row column cells)
   (assert-owner d)
   (loop for cell across (coerce cells 'vector)
         for col from column
         when (and (<= 0 row) (< row (display-rows d)) (<= 0 col) (< col (display-columns d)))
-        do (unless (equalp cell (aref (display-grid d) row col))
+        do (unless (same-cell-p cell (aref (display-grid d) row col))
              (setf (aref (display-grid d) row col) (copy-cell cell))
              (unless (zerop (cell-width cell)) (render-cell d row col cell))))
   d)

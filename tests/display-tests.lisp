@@ -24,6 +24,27 @@
  (assert (equalp #(27 3) (key-event-bytes (make-key-event :key #\c :modifiers '(:alt :control)))))
  (assert (equalp #(206 187) (key-event-bytes (make-key-event :key #\λ))))
  (format t "DISPLAY CORE PASS~%"))
+;; Each visible cell field must invalidate the cache independently. In particular,
+;; EQUALP considers #\E and #\e equal even though their glyph pixels differ.
+(let ((font (load-font nil 16)))
+  (dolist (change '((:char #\e) (:width 2) (:fg #xff0000) (:bg #x0000ff)
+                    (:bold t) (:inverse t) (:underline t)))
+    (let* ((d (make-display :font font :owner sb-thread:*current-thread*))
+           (original (make-cell :char #\E :fg #xffffff :bg #x123456))
+           (changed (apply #'make-cell
+                           (append change '(:char #\E :fg #xffffff :bg #x123456)))))
+      (resize-display d 16 16)
+      (draw-cells d 0 0 (list original))
+      (setf (display-damage d) nil)
+      (draw-cells d 0 0 (list (copy-cell original)))
+      (assert (null (display-damage d)))
+      (let ((before (copy-seq (display-framebuffer d))))
+        (draw-cells d 0 0 (list changed))
+        (assert (equal (display-damage d)
+                       (list (list 0 0 (* 8 (cell-width changed)) 16))))
+        (assert (plusp (count nil (map 'vector #'= before (display-framebuffer d)))))))))
+(format t "DISPLAY CASE-SENSITIVE/FIELD DAMAGE AND PIXELS PASS~%")
+
 (let* ((font (load-font nil 16)) (d (make-display :font font :owner sb-thread:*current-thread*)))
   (resize-display d 24 16)
   (draw-cells d 0 0 (list (make-cell :char #\A :fg #x102030 :bg #x405060 :inverse t)))
