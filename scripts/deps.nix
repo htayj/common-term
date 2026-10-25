@@ -11,8 +11,8 @@ in pkgs.symlinkJoin {
   name = if verification then "lispterm-test-tools" else "lispterm-runtime";
   paths = [ lisp pkgs.terminus_font pkgs.libxkbcommon ]
     ++ pkgs.lib.optionals verification (with pkgs; [
-      xorg.xorgserver xdotool imagemagick sway-unwrapped wtype grim fastfetch
-      bash coreutils git util-linux procps
+      xorg.xorgserver xorg.xdpyinfo xdotool imagemagick sway-unwrapped wtype grim fastfetch vttest
+      bash coreutils git util-linux procps jq
     ]);
   # Stable runtime paths consumed by scripts/sbcl, independent of store hashes.
   postBuild = ''

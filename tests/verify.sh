@@ -18,6 +18,8 @@ case $gate in
   scripts/sbcl --script tests/run-pty-tests.lisp
   scripts/sbcl --script tests/run-display-tests.lisp
   scripts/sbcl --script tests/run-host-tests.lisp
+  scripts/sbcl --script tests/run-vt100-input-tests.lisp
+  scripts/sbcl --script tests/run-vt100-rendition-tests.lisp
   exec scripts/sbcl --script tests/run-host-input-tests.lisp ;;
  pty)
   scripts/sbcl --script tests/run-pty-tests.lisp
@@ -44,6 +46,10 @@ case $gate in
   exec tests/checkpoint-gate.sh "$@" ;;
  fastfetch-x11) exec tests/fastfetch-gate.sh x11 ;;
  fastfetch-wayland) exec tests/fastfetch-gate.sh wayland ;;
+ vttest-x11) exec tests/vttest-gate.sh x11 ;;
+ vttest-wayland) exec tests/vttest-gate.sh wayland ;;
+ vttest-check) exec scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$@" ;;
+ vttest-harness) exec tests/vttest-harness-tests.sh ;;
  packaging) exec tests/packaging-gate.sh "$@" ;;
  git) exec tests/git-gate.sh "$@" ;;
  *) echo "Unknown verification gate: ${gate:-<none>}" >&2; exit 2 ;;

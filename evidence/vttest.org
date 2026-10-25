@@ -1,0 +1,331 @@
+#+title: VT100 baseline with upstream vttest
+
+* Measurement
+
+Baseline HEAD: =5b3336f91735ad042ea426ba40a3cfe51f7657e8= (Wayland resize repair).
+Measured 2026-10-25 with the actual vttest subprocess on a Lispterm PTY.
+This is baseline evidence for selecting fixes, not conformance acceptance.
+The recorder's exit status describes recording, not terminal correctness.
+
+Upstream: https://invisible-island.net/vttest/
+Source: https://invisible-island.net/archives/vttest/vttest-20251205.tgz
+Version: =2.7 (20251205)=.
+Tar SHA256: =cd6886f9aefe6a3f6c566fa61271a55710901a71849c630bf5376aa984bf77cc=.
+Nixpkgs pin: =d482ef84049d9b7276b83a06e4e4d76983830097=.
+Installed binary: =.build/test-tools/bin/vttest=, resolving to the pinned Nix package.
+Retained tar and upstream source hashes: =.build/evidence/vttest-analysis78/=.
+
+Both backends used Terminus 8x16 cells, 24x80 initial geometry, =TERM=vt100=,
+=LANG=C=, vttest size argument =24x80.132=, and no UTF-8/8-bit/padding switches.
+Each selected menu path ran in a fresh host/PTY; paths do not inherit modes.
+X11 used a private Xvfb and explicit =:x11=; Wayland used headless Sway,
+Xwayland disabled, DISPLAY unset, a private runtime, and explicit =:wayland=.
+Sway floating-window rules established a matching 640x384 fixture.
+The application ignored 132-column switching; that is a measured failure,
+not a reason to pretend the 80-column window had 132 columns.
+
+* Reproduction and evidence layout
+
+Run =tests/verify.sh vttest-x11= and then =tests/verify.sh vttest-wayland=.
+Set =LISPTERM_VTTEST_FILTER= to a case-label substring for a smaller run,
+for example =reports-dsr=, =keyboard=, =bug-d=, or =screen=.
+The recorder serializes its GUI runs with =.build/vttest-gui.lock=.
+The native fixture holds a task-owned virtual keyboard open so that separate
+wtype calls do not remove and recreate the seat's sole keyboard capability.
+
+Each run has a new ignored =.build/evidence/vttest-BACKEND.XXXXXX/= directory:
+- =NNN-case-pauseNN.png= is a real import/grim capture, with corresponding
+  =.grid.txt= and =.status.sexp=.
+- =case.transcript.raw= contains bytes actually read from the PTY.
+- =case.input.raw= contains only prefixes actually accepted by PTY writes,
+  including driver input and terminal replies, in their actual order.
+- =case.vttest.log= is upstream's own log; =case.process.txt= records TTY fds
+  and initial stty dimensions; =case.exit= records a normal vttest exit.
+- =case.result.sexp= records menu completion, host state, and error ring.
+  =case.failure.sexp= records an unfinished recorder operation.
+- =native-keys.txt= records attempted native injections. With
+  =LISPTERM_VTTEST_TRACE_KEYBOARD=1=, =native-events.sexp= records Wayland
+  keyboard event boundaries and normalized injected keys.
+- =provenance.sha256= protects captures, grids and raw streams.
+  New runs also retain the harness source and hashes.
+
+Select these immutable baseline observations rather than the latest-run pointers:
+
+| Dataset | Directory under .build/evidence/ | Selected captures |
+|---------+---------------------------------+-------------------|
+| X11 main | vttest-x11.soyWA3 | 001-043 and 045-084 |
+| X11 custom Bug D supplement | vttest-x11.WWeFA5 | all 3 |
+| Native main | vttest-wayland.4pz8fm | 001-043 and 045-058 |
+| Native verified keyboard supplement | vttest-wayland.P7So6b | all 26 |
+| Native custom Bug D supplement | vttest-wayland.FRsQvq | all 3 |
+
+Thus there are 86 selected captures per backend. There are 20 selected case
+paths per backend, 19 with normal return/exit after supplements. Menu 2 stops
+on the engine error described below. No application fix was installed for
+these measurements.
+
+The original main-run Bug D capture 044 is superseded by explicit driving of
+its custom =Enter 0 to exit= prompt. Native main-run keyboard captures 059+
+are superseded by the continuous-keyboard fixture: repeated wtype device
+removal prevented input advancement and caused repeated screens/timeouts.
+The =GB2wEi= and =kweKRi= X11 trials had recorder bugs (pathname extension
+inheritance and treating the :EOF sentinel as bytes); do not use their host
+errors as application failures. =Zsr183= Wayland used tiling geometry160x50
+and is exploratory only. These artifacts are retained, not overwritten.
+
+* Baseline coverage matrix
+
+Capture numbers below refer to X11 main and native main unless a supplement
+is named. PASS means only the stated pattern or reply was observed. Parent
+visual acceptance and independent review are pending for every row.
+
+| Path / source | VT class | Captures / criterion | Baseline observation |
+|---------------+----------+----------------------+----------------------|
+| 1 / main.c tst_movements | core | 001; unbroken *+ border, central E frame, correct text | Grid correct at80; screenshot retains uppercase E in lowercase text |
+| 1 | core | 002; same pattern at132 | FAIL:80 columns, clipping/wrapping |
+| 1 | core | 003-004; ordered letters on both margins,80/132 |80 ordered I-Z/i-z portion visible; stale border due missing column-mode clear;132 FAIL |
+| 1 | core | 005; four identical A-I lines with embedded C0 in CSI | FAIL: CSI suffixes printed as garbage |
+| 1 | core | 006; leading-zero CSI positions sentence | PASS observed |
+| 2 / main.c tst_screen | core | 007; exactly three full star rows | PASS observed |
+| 2 | core | 008; TAB setting/resetting rows identical | FAIL: different star positions |
+| 2 | core | 009-012;80/132 and light/dark screen backgrounds | FAIL:132 unsupported; light background remains dark |
+| 2 | core | 013; scrolling region and reverse-index | BLOCKED: negative row/index error |
+| 2 later screens | core / AVO | SGR combinations, blink, DECOM, DECSC/DECRC, later scroll phases | UNTESTED beyond error; rerun after crash fix |
+| 3 / charsets.c tst_vt100_charsets | core | 014; ASCII, British and DEC graphics in G0/G1 | ASCII and DEC0 mapping visibly present; British still shows # instead of pound sign |
+| 3 alternate ROM1/2 | ROM option | 014; installed alternate-ROM sets | No alternate graphics mapping observed; optional ROM policy unresolved |
+| 3 SI/SO | core | 014 G0/SI and G1/SO side-by-side | Both invocation paths exercised; dedicated VT220-level SI/SO submenu not separately selected |
+| 4 / main.c tst_doublesize | core / AVO rendition | 015-020; twice-wide glyphs, joined top/bottom halves, box/half-box | FAIL: ordinary glyph dimensions, duplicated unscaled height halves;132 also fails |
+| 5.4 / keyboard.c | core | X11 059-066; native P7So6b001-008; four arrows normal/application | PASS: CSI A/B/D/C and SS3 A/B/D/C recognized |
+| 5.4 VT52 phase | core VT52 mode | X11 067-071; native P7So6b009-013 | FAIL: SS3 arrows instead of ESC A/B/D/C; unknown key messages |
+| 5.5 / keyboard.c | core | X11 072-084; native P7So6b014-026;1/2/Enter in four keypad modes | X11 no keypad PTY bytes; native numeric works, application modes incorrectly send ordinary1/2/CR |
+| 5 other submenus | keyboard / options | LED, autorepeat, layout, PF1-4, controls, answerback | UNTESTED; three sampled keypad keys are not the whole keypad |
+| 6.3 / reports.c tst_DSR | core | 021; DSR5 and two CPR reports | PASS: ESC[0n and ESC[5;1R twice, including origin-relative test |
+| 6.4 / reports.c tst_DA | core / AVO advertised | 022; primary DA | PASS: ESC[?1;2c, upstream identifies VT100 with AVO |
+| 6.7 / reports.c tst_DECREQTPARM | core | 023; valid parameter reports0/1 | FAIL: no response, upstream Bad format twice |
+| 6.1 / 6.2 | configurable answerback / core LNM | ENQ, newline-mode report exercise | UNTESTED; no standard answerback content is required |
+| 6.5 / 6.6 | VT220 / VT420 | secondary / tertiary DA | Outside VT100 baseline scope |
+| 7 / vt52.c | VT100's VT52 mode | 024-026; rectangle, graphics, identify reply | FAIL: raw addressing bytes, broken layout, no identify reply |
+| 8 / main.c tst_insdel | VT102 extension | 027-033; IL/DL accordion, IRM, DCH, staggered lines and optional ICH |80-column ordinary-size patterns observed; double-width subset fails; cosmetic case-staleness present |
+| 8 | VT102 extension | 034-040;132 variants | FAIL dependent on missing132-column support |
+| 9.2 Bug B | core | 041-042; double-wide row11, scroll F-P into region | Double-width FAIL; further scroll-position review needed, no blanket pass |
+| 9.3 Bug C | core | 043; blank except explanatory line | Pattern observed, but actual132 transition absent, so incomplete |
+| 9.4 Bug D | core / blink / double size | WWeFA5 / FRsQvq001-003; bottom blinking text, explicit0 exit | Text visible but unscaled; two captures700ms apart unchanged; temporal blink acceptance pending |
+| 9.5 Bug E | core | 045; X at line3 column100 | FAIL: cannot address100 in80-column grid |
+| 9.6 Bug F | core | 046-047; reverse132 then nonreverse80 | FAIL first phase, dependent on DECSCNM and132; second dark80 phase observed |
+| 9.7 wrap | core | 048; top plus row, right star column | PASS observed pattern |
+| 9.8 double-width erase | core | 049-054;80->40->80 and132->66->132 character extents | FAIL: no width transformation;132 wraps |
+| 9.9 funny scroll regions | core | 055-056; retain20 labeled lines | Observed20-line pattern; full semantic acceptance pending |
+| 9.1 smooth-scroll Bug A | timing option | no captures | UNTESTED; animation timing not inferred from a static PNG |
+| 10.1 / reset.c RIS | core | 057-058; reset clears display | Observed clear and normal menu exit; complete reset-state assertions pending |
+| 10.2 DECTST | hardware confidence test | no captures | UNTESTED; software acceptance/ignore policy needs explicit test |
+| 10.3 DECSTR | VT220 extension | no captures | Outside VT100 baseline scope |
+| 11 | VT220+ / xterm / graphics extensions | no captures | Outside scope: color, Sixel, DRCS, mouse, printer, Tek, etc. |
+
+LED hardware, printer options, interlace, keyboard repeat rate, configured
+answerback contents, smooth-scroll timing,8-bit controls and padding have no
+passing claim here. The primary DA advertises AVO, but that reply does not
+prove the advertised rendition features work.
+
+* Concrete minimal repros and fix batches
+
+1. Engine safety and cursor margins first. On a fresh24x80 screen feed octets
+   =27 91 49 50 59 49 51 114 27 91 49 59 49 72 27 77 83=:
+   =ESC[12;13r ESC[1;1H ESC M S=. Cursor becomes(-1,0); S indexes-80.
+   Bytewise replay of the captured menu2 transcript first errors at offset7452.
+   See =.build/evidence/vttest-analysis78/engine-replay.sexp=.
+   Inspect =cursor-ri= and directional movement outside the scrolling region;
+   test cursor bounds and region scrolling before rerunning menu2.
+2. Small renderer correction: =draw-cells= in =src/display/framebuffer.lisp=
+   uses =EQUALP= on cell structures. EQUALP treats E/e as equal, so case-only
+   updates are skipped. Capture001's grid and PNG disagree accordingly.
+   Use an explicit case-sensitive cell comparison, with a focused pixel test.
+3. Engine parser/reports: execute C0 controls without abandoning CSI; make
+   TBC parameters 1 and 2 no-ops instead of clearing the current stop; add
+   British designation and DECREQTPARM. Rerun 005, 008, 014, 023 with
+   deterministic byte-level regression checks.
+4. Renderer/adapter rendition: expose reverse-screen, line size and blink;
+   implement actual double-size geometry, half-width logical row bounds and
+   temporal rendition. Rerun menu2 after batch1, then4 and9.8. Engine and
+   renderer owners must agree on line-size semantics before parallel edits.
+5. Geometry: implement a coherent DECCOLM resize/clear path through engine,
+   host and both backends. Extend the baseline recorder's fixed640-pixel native
+   crop when native windows can actually become132 columns.
+6. VT52 plus input: parser states, addressing, graphics and identify response;
+   retain keypad identity through X11/XKB normalization and encode numeric vs
+   application modes (ANSI and VT52). Rerun7,5.4,5.5 on both native backends.
+
+A secondary native-input observation is outside the VT100 byte protocol:
+removing the headless seat's sole virtual keyboard between wtype invocations
+left later key events absent. The continuous keyboard fixture avoids this.
+The trace in =vttest-wayland.mDsHMJ/native-events.sexp= shows first Up reaching
+the client and then focus leave; the cause of missing later events is not yet
+established. Do not mistake those incomplete trials for keypad conformance.
+
+* Visual inspection and next acceptance
+
+All 84 X11 main PNGs and all 3 X11 Bug D supplements were viewed at full size
+in labeled 2x2 panels using =fs.view-image=. Twelve representative native main
+PNGs, all 26 verified native keyboard PNGs, and all 3 native Bug D supplements
+were also viewed. This accounts for 127 of the 172 selected captures; the
+superseded original X11 Bug D image was also viewed.
+Inspection panels are in =.build/evidence/vttest-analysis78/x11-panels/=
+and =native-panels/=. Native/core panel 1 includes 001, 008, 009, 013; panel 2
+includes 014, 015, 021, 023; panel 3 includes 024, 027, 042, 055.
+Other native main screens have grid/raw evidence and the pixel comparison in
+=backend-pixel-comparison.tsv=, not a claim of individual visual inspection.
+The complete selected capture index with observation and inspection flags is
+=capture-index.sexp= / =capture-index.tsv=. Exact accepted-input checks are in
+=protocol-checks.sexp=, and process completion is in =dataset-summary.sexp=.
+
+Parent priority: view001(grid vs PNG),005(C0-in-CSI),008(tabs),009(light
+background/width),013(crash),014(charsets),015(double-size),021/023(reports),
+024(VT52), and both normal/application keypad phases in the native supplement.
+The source-defined on-screen instructions supply the criteria, not vttest's
+exit status. After fixes, rerun every reached and previously blocked screen,
+review screenshots independently, run engine/host/display regression gates,
+and obtain parent visual acceptance before creating final acceptance artifacts
+or signed commits. No ACCEPTANCE.sexp was created for this baseline.
+
+* Recorder verification
+
+=tests/verify.sh unit= exited 0; retained log:
+=.build/evidence/vttest-analysis78/unit.log=.
+Final filtered =reports-dsr= runs through the new =vttest-x11= and
+=vttest-wayland= dispatchers both exited 0 with normal vttest exit, matching
+replies and no host errors. Shell syntax, Lisp delimiter checking, and
+=git diff --check= passed. All five selected dataset SHA manifests were
+rechecked successfully; retained =*.hash-check.log= files record the checks.
+Only harness, dependency-list, dispatcher and this baseline document changed.
+No application source, commit, push or private publication was made.
+
+* Recorder v2: batch 1C, separate from the retained baseline
+
+The historical 172 selected captures above were generated by recorder v1.
+Their files and manifests were not rewritten. Recorder v2 changes are in
+=tests/vttest-gate.{sh,lisp}= and =tests/vttest-protocol.lisp=. The historical
+baseline HEAD is =5b3336f91735ad042ea426ba40a3cfe51f7657e8=; the redraw-only
+commit present during this work is =6252f6852a4c3dc7568a13cf79d9fdb3880298b8=.
+Future fixtures record their actual HEAD, dirty diff and source hashes.
+
+** Modes and offline checks
+
+Use =LISPTERM_VTTEST_MODE=record= (the default) for baseline measurement.
+A recorded blocked case is evidence, not a conformance verdict; recording may
+finish with an incomplete completed-case inventory. Infrastructure errors,
+empty selections and the total watchdog still return nonzero.
+
+Use =LISPTERM_VTTEST_MODE=accept= with =tests/verify.sh vttest-x11= or
+=vttest-wayland= for fail-closed mechanical checks. A nonempty filtered selection
+is required. Expected, attempted and completed labels must agree. Reject host
+errors, unexpected/stale prompts, phase deadlines, loop exhaustion, missing
+captures, premature menu returns, nonzero/missing child exit markers, pending
+input, and a PTY that has not reached both exited and hangup. The fixed inventory
+contains 20 selected paths per backend, not every VT100 submenu. The other
+submenus retain their untested status; success for a filtered selection does
+not establish full-suite coverage.
+
+Run =tests/verify.sh vttest-check measure ARTIFACT-DIR...= offline to reproduce
+legacy byte measurements. Run =vttest-check accept ARTIFACT-DIR...= for strict
+v2 validation. Legacy evidence has no interleaved phase events and cannot be
+accepted retrospectively. The new event stream records monotonic sequence/time,
+both wire directions with octet offsets and exact bytes, enqueue origins,
+actual accepted partial writes, driver intent, native-key brackets, captures
+and phase boundaries. Validate the entire stream against the two raw files;
+check exact query/reply inventory, order, phase, deadline, bytes and counts.
+Startup DA is distinct from the requested DA test. Check every injected key
+individually in ANSI normal/application and VT52 normal/application phases.
+
+The DECREQTPARM contract is the explicit virtual profile verified against the
+VT100 User Guide, chapter 3, DECREQTPARM/DECREPTPARM parameter table:
+=https://vt100.net/docs/vt100-ug/chapter3.html#DECREQTPARM=.
+Default/0 requires =ESC[2;1;1;112;112;1;0x=; 1 requires
+=ESC[3;1;1;112;112;1;0x=. Code 112 means 9600 baud, parity1 means no parity,
+bits1 means eight bits, clock1 means multiplier16, and flags0 is the virtual
+STP setting. These are virtual terminal settings, not measured physical-line
+speeds. The terminal has no SET-UP mode and sends no unsolicited setup reports.
+The retained source is in =.build/evidence/vttest-repairs83/engine/=.
+
+** Capture, ownership and provenance
+
+Identify source-written per-pause captions and the exact source-defined pause,
+keyboard and navigation inventories. Require fresh output after each advance;
+a generic menu prompt in an unrelated submenu cannot complete a case.
+Before capture, require a session frame after the final PTY read. Native capture
+additionally waits for the compositor frame callback acknowledging a commit
+containing that read. This is not presentation-time instrumentation. Preserve
+the target output offset, before/after frame counts and native acknowledgement.
+
+Allocate Xvfb with =-displayfd=; use a unique exact window title on that private
+server and reject ambiguous matches or a conflicting PID. On native Wayland,
+require the exact title and recorder PID in the private Sway tree. Derive the
+actual capture rectangle after every resize. Compare the logical grid and PNG
+size with the most recent DECCOLM request, not only with one another; a terminal
+that ignores 132-column mode must fail. The fixture font is pinned at 8x16.
+X11 received keycode, mapping levels, raw modifiers and normalized key are
+traced inside the disposable recorder. The core Mod2 bit is recorded without
+assuming its NumLock interpretation. Native keypad identity attribution awaits
+the later scheduled GUI/input review; injection intent alone is insufficient.
+
+The total watchdog defaults to 1800 seconds. Track only descendants of newly
+launched fixture roots, retaining each PID's start token. Cleanup sends bounded
+TERM then KILL only when that identity still matches. Native helper startup is
+bounded; verify its private config before adopting its compositor PID. Remove
+its private runtime directory only after owned processes stop. Retain cleanup
+outcomes and owned process metadata. No existing peer is signalled.
+
+Acceptance requires the reviewed pinned Nix vttest binary, including its exact
+SHA256; a different VTTEST override is rejected before any display starts.
+Record the binary/font identities, pinned dependency definition, effective
+command, filter/mode, source files, current Git HEAD/status/diff, fixture
+configuration, status/results/exits, window trees/geometry, wire events, images
+and cleanup. Hash all generated metadata as well as PNG/grid/raw files after
+cleanup. A record-mode binary override is identified explicitly in fixture
+metadata; it is not accepted merely because its version string matches.
+
+** Offline verification and limits
+
+=tests/verify.sh vttest-harness= performs standalone analyzer, recorder-boundary
+and disposable process-tree checks. Logs are in
+=.build/evidence/vttest-harness85/=. The analyzer reproduces DSR5, both CPRs,
+startup/requested DA, absent parameter replies, native numeric keypad bytes,
+missing X11 keypad bytes and incorrect VT52 arrows from the selected old data.
+Both core datasets and the native keyboard supplement fail strict acceptance.
+
+The positive recorder fixture is synthetic and uses an offline-generated PNG.
+It establishes that the checker can accept a complete internally consistent
+fixture; it is not a Lispterm capture. Negative fixtures cover empty/broken
+inventories, wrong/missing/duplicate replies, input-origin spoofing, offset and
+phase/time corruption, missing/nonzero exits, nonexited PTYs, loop exhaustion,
+and missing/wrong-sized captures. Boundary fakes establish timeout/stale-prompt,
+wrong-menu and render-ack failure handling without opening a GUI. The owned-tree
+fixture establishes TERM/KILL escalation, watchdog expiry and survival of an
+unowned/stale-token negative control created by the test itself.
+
+Review96 corrections additionally require unique result labels covering every
+expected case, matching result filenames, source-defined per-phase query counts,
+and contiguous query read spans ending before reply enqueue and accepted writes.
+Every query/reply byte boundary and single-byte chunks are exercised offline.
+Correction logs and original85 negative controls are in
+=.build/evidence/vttest-checker97/=; both original coverage/phase bypasses fail
+there, while correctly split reads pass. No original review fixture was edited.
+
+No v2 GUI run or final acceptance artifact was created in this batch. The actual
+transport instrumentation, caption inventory, resized captures and native frame
+barrier require independent review and the parent's scheduled real reruns.
+Blink-phase sampling, double-size pixel assertions, compositor resize behavior
+and final screenshot inspection belong to later rendition/geometry acceptance.
+The unit dispatcher runs the dedicated VT100 input and rendition runners once
+before the full host-input suite. Focused terminal-key-modes overlap is
+intentional; FIFO/raw-slave coverage is not replaced.
+
+Verification after review96 corrections: 112 analyzer checks, 11 recorder-boundary
+checks and the disposable ownership/watchdog checks pass. The real recorder's
+empty-selection entry point returns nonzero after instrumentation installation;
+the binary-override launcher rejects before display setup. After the rendition
+and VT52 source freeze, the full unit gate passes with a fresh cache: 997 engine
+tests (no skips/failures/errors), 278 focused input checks, 10258 rendition
+checks, 66 host checks and 67 host-input FIFO/raw-slave checks. All five original dataset hash
+manifests recheck successfully. Shell syntax, dependency-expression parsing and
+=git diff --check= pass. The final observed current HEAD is
+=d8772ec=, following the separately committed engine/input foundations; this
+harness batch is uncommitted for independent review.
