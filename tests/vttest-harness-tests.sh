@@ -68,6 +68,64 @@ if socket_inode_match 0 /private/socket "$art/mock-fd" "$art/mock-unix"; then ex
   if flock -n "$root/.build/vttest-gui.lock" true; then echo 'Lock was not held' >&2; exit 1; fi
 )
 printf 'PASS scale validation, endpoint poisoning, socket-inode join, headless outputs, inherited FD9 proof\n' > "$art/isolation-tests.log"
+# Exercise the production registration helper without compositor or client launches.
+(
+  LISPTERM_NATIVE_FUNCTIONS_ONLY=1 source tests/vt100-native-geometry.sh
+  LISPTERM_SWAYMSG=mock-swaymsg
+  title=Lispterm-native-rule-control-133
+  rule_checks=0
+  timeout() {
+    local number rule
+    [[ $# == 3 && $1 == 5 && $2 == mock-swaymsg ]] || return 90
+    number=$(( $(wc -l < "$art/rule-calls") + 1 ))
+    case $number in 1) rule='floating enable';; 2) rule='border none';; 3) rule='move position 0 0';; *) return 91;; esac
+    [[ $3 == "for_window [title=\"^$title\$\"] $rule" ]] || return 92
+    printf '%s\n' "$3" >> "$art/rule-calls"
+    if [[ $number != "$fail_at" ]]; then printf '[{"success":true}]\n'; return; fi
+    case $reply_kind in
+      exit) printf '[{"success":true}]\n'; return 2;;
+      empty) return 0;;
+      malformed) printf '{broken\n';;
+      false) printf '[{"success":false,"parse_error":true}]\n';;
+      mixed) printf '[{"success":true},{"success":false}]\n';;
+      extra) printf '[{"success":false}]\n[{"success":true}]\n';;
+      parse) printf '[{"success":true,"parse_error":true}]\n';;
+    esac
+  }
+  : > "$art/rule-calls"
+  fail_at=0 reply_kind=success
+  native_window_rules "$title" "$art/rule-success.json"
+  [[ $(wc -l < "$art/rule-calls") == 3 ]]
+  jq -es 'length == 3 and all(.[]; length == 1 and .[0].success == true)' "$art/rule-success.json" > /dev/null
+  ((rule_checks+=1))
+  for fail_at in 1 2 3; do
+    for reply_kind in exit empty malformed false mixed extra parse; do
+      : > "$art/rule-calls"
+      if native_window_rules "$title" "$art/rule-$fail_at-$reply_kind.json" 2> "$art/rule-$fail_at-$reply_kind.stderr"; then
+        echo "Registration accepted $reply_kind at $fail_at" >&2; exit 1
+      fi
+      [[ $(wc -l < "$art/rule-calls") == "$fail_at" ]]
+      ((rule_checks+=1))
+    done
+  done
+  export -f native_window_rules timeout
+  export art title LISPTERM_SWAYMSG fail_at reply_kind
+  reply_kind=exit
+  for fail_at in 1 2 3; do
+    : > "$art/rule-calls"
+    code=0
+    bash -c 'set -euo pipefail; native_window_rules "$title" "$art/rule-errexit-$fail_at.json"; touch "$art/rule-continued"' || code=$?
+    [[ $code == 1 && ! -e $art/rule-continued && $(wc -l < "$art/rule-calls") == "$fail_at" ]]
+    ((rule_checks+=1))
+  done
+  for bad_title in '' 'foreign.*' 'owned"' 'owned; border none' 'owned, move position 0 0' 'owned]' 'owned\\' $'owned\nforeign'; do
+    : > "$art/rule-calls"
+    if native_window_rules "$bad_title" "$art/rule-invalid.json"; then exit 1; fi
+    [[ ! -s $art/rule-calls && ! -e $art/rule-invalid.json ]]
+    ((rule_checks+=1))
+  done
+  printf 'PASS %s registration controls: exact selector per action, ordered policies, IPC/reply failure stops, invalid selector rejection\n' "$rule_checks" > "$art/window-rule-tests.log"
+)
 export LISPTERM_SBCL=${LISPTERM_SBCL:-$root/.build/deps/bin/sbcl}
 export LISPTERM_HARNESS_TEST_ARTIFACTS="$art/fixtures-$(date +%s%N)/"
 export LISPTERM_VTTEST_ARTIFACTS="$LISPTERM_HARNESS_TEST_ARTIFACTS"

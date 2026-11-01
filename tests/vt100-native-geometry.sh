@@ -3,6 +3,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
+# Register each future-view command separately: commas end for_window registration.
+native_window_rules() {
+ local title=$1 reply=$2 rule
+ [[ $title =~ ^[[:alnum:]_-]+$ ]] || return 1
+ for rule in 'floating enable' 'border none' 'move position 0 0'; do
+  timeout 5 "$LISPTERM_SWAYMSG" "for_window [title=\"^$title\$\"] $rule" |
+   tee -a "$reply" |
+   jq -es 'length == 1 and (.[0] | type == "array" and length == 1 and
+     .[0].success == true and .[0].parse_error != true)' > /dev/null || return 1
+ done
+}
+# Source only these registration helpers for offline parser/IPC controls.
+[[ ${LISPTERM_NATIVE_FUNCTIONS_ONLY:-0} != 1 ]] || return 0
 help() {
  cat <<'HELP'
 Usage: tests/verify.sh native-geometry self-test
@@ -89,7 +102,7 @@ else
  timeout 15 tests/wayland-gate.sh start "$art/compositor" "$scale"
  source "$art/compositor/env.sh"
  server=$(cat "$art/compositor/compositor.pid"); remember "$server"
- timeout 5 "$LISPTERM_SWAYMSG" "for_window [title=\"^$LISPTERM_NATIVE_TITLE\$\"] floating enable, border none, move position 0 0" > "$art/window-rule.json"
+ native_window_rules "$LISPTERM_NATIVE_TITLE" "$art/window-rule.json"
 fi
 fixture_isolation > "$art/isolation.txt"
 unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
