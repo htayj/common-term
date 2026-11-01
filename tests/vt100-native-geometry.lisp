@@ -26,9 +26,17 @@
         when result return result
         when (> (now) end) do (error "Native fixture deadline (~ds)" seconds)
         do (sleep .01)))
-(defun publish (name value)
-  (save "publish.tmp" value)
-  (rename-file (path "publish.tmp") (path name)))
+(defun publish (name value &key text)
+  ;; Each process owns its temporary file. Producer ACKs and owner requests must
+  ;; never share a staging name, including an owner's unwind-time stop request.
+  (uiop:with-temporary-file (:stream out :pathname temporary :directory *art*
+                            :prefix ".publish-" :type "tmp")
+    (if text (write-string value out)
+        (let ((*print-pretty* nil)) (write value :stream out) (terpri out)))
+    (close out)
+    ;; CL RENAME-FILE merges a missing destination type with the source's type.
+    ;; POSIX rename uses these exact names and atomically replaces on this FS.
+    (sb-posix:rename (namestring temporary) (namestring (path name)))))
 (defun status (host)
   (let ((s (lispterm:status host)))
     (append-value "status-history.sexp" (list :time (now) :status s))
@@ -120,9 +128,9 @@
       (save (concatenate 'string name ".ready.sexp") ready)
       (snapshot host name)
       ;; C5 request includes cell width for full132 output-fit validation.
-      (with-open-file (s (path "capture.tmp") :direction :output :if-exists :supersede)
-        (format s "~a ~d ~d ~d ~d~%" name (getf g :actual-width) (getf g :actual-height) *scale* (getf g :cell-width)))
-      (rename-file (path "capture.tmp") (path "capture-request"))
+      (publish "capture-request"
+               (format nil "~a ~d ~d ~d ~d~%" name (getf g :actual-width) (getf g :actual-height) *scale* (getf g :cell-width))
+               :text t)
       (await (lambda () (probe-file (path "capture-ack"))))
       (with-open-file (s (path "capture-ack"))
         (unless (string= name (read-line s)) (error "Wrong native capture ACK")))
@@ -140,9 +148,7 @@
           (error "Native capture proof failed: ~a" name))
         final))))
 (defun action (kind &optional w h)
-  (with-open-file (s (path "action.tmp") :direction :output :if-exists :supersede)
-    (format s "~a~@[ ~d~]~@[ ~d~]~%" kind w h))
-  (rename-file (path "action.tmp") (path "action-request"))
+  (publish "action-request" (format nil "~a~@[ ~d~]~@[ ~d~]~%" kind w h) :text t)
   (await (lambda () (probe-file (path "action-ack"))))
   (append-value "actions.sexp" (list :kind kind :width w :height h :time (now)))
   (delete-file (path "action-ack")))
@@ -377,10 +383,92 @@
             (lispterm.engine:feed screen (babel:string-to-octets wire :encoding :latin-1))
             (funcall check (= columns (lispterm.engine:columns screen)))
             (funcall check (eql (eq mutation :valid) (not (null (markers-p host columns rows)))))))))))
+(defun publication-regressions (check)
+  ;; Real files and the production writer/readers, never a display or a PTY.
+  (let* ((directory (uiop:ensure-directory-pathname
+                     (sb-posix:mkdtemp
+                      (namestring (merge-pathnames "lispterm-publish-XXXXXX" (uiop:temporary-directory))))))
+         (*art* directory))
+    (unwind-protect
+         (progn
+           (funcall check (= #o700 (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring directory))))))
+           (dolist (name '("producer-request" "producer-ack" "capture-request" "capture-ack"
+                           "action-request" "action-ack" "status.sexp"))
+             (let ((stale (concatenate 'string name ".tmp")))
+               (save stale '(:serial -1))
+               ;; A leftover suffixed file cannot satisfy any exact-name reader.
+               (funcall check (not (vttest-check:read-value (path name))))
+               (dotimes (i 3)
+                 (let ((value (list :serial i :name name)))
+                   (publish name value)
+                   (funcall check (equal value (vttest-check:read-value (path name))))
+                   (funcall check (equal '(:serial -1) (vttest-check:read-value (path stale))))))
+               (delete-file (path name))
+               (delete-file (path stale))))
+           ;; Exercise the serial request/ACK handshake on the exact filenames.
+           (dotimes (serial 4)
+             (publish "producer-request" (list :serial serial :kind :wide))
+             (let ((request (await (lambda () (vttest-check:read-value (path "producer-request"))))))
+               (funcall check (= serial (getf request :serial)))
+               (delete-file (path "producer-request"))
+               (publish "producer-ack" (list :serial (getf request :serial) :bytes 100)))
+             (let ((ack (await (lambda () (vttest-check:read-value (path "producer-ack"))))))
+               (funcall check (= serial (getf ack :serial)))
+               (funcall check (= 100 (getf ack :bytes)))
+               (delete-file (path "producer-ack"))))
+           ;; Shell capture/action endpoints use lines rather than Lisp values.
+           (dolist (pair '(("capture-request" . "001-initial 640 384 1 8")
+                           ("capture-ack" . "001-initial")
+                           ("action-request" . "resize 800 416")
+                           ("action-ack" . "resize 1234")))
+             (dotimes (i 3)
+               (declare (ignorable i))
+               (publish (car pair) (format nil "~a~%" (cdr pair)) :text t)
+               (funcall check (probe-file (path (car pair))))
+               (with-open-file (in (path (car pair)))
+                 (funcall check (string= (cdr pair) (read-line in)))
+                 (funcall check (eq :eof (read-line in nil :eof)))))
+             (funcall check (not (probe-file (path (concatenate 'string (car pair) ".tmp")))))
+             (delete-file (path (car pair))))
+           ;; Concurrent producer ACK / owner stop publication used to share
+           ;; publish.tmp. Stress independent writers and inspect every read for
+           ;; a complete payload, also while replacing one common target.
+           (labels ((value (writer serial) (list :writer writer :serial serial :body (make-string 8192 :initial-element #\X)))
+                    (valid (x) (and (member (getf x :writer) '(1 2))
+                                    (typep (getf x :serial) '(integer 0 49))
+                                    (equal (getf x :body) (make-string 8192 :initial-element #\X)))))
+             (publish "shared.sexp" (value 1 0))
+             (let ((threads
+                     (loop for writer in '(1 2) collect
+                       (let ((id writer))
+                         (sb-thread:make-thread
+                          (lambda ()
+                            (let ((*art* directory))
+                              (dotimes (serial 50)
+                                (publish (if (= id 1) "producer-request" "producer-ack") (value id serial))
+                                (publish "shared.sexp" (value id serial)))
+                              :complete)))))))
+               (unwind-protect
+                    (progn
+                      (dotimes (i 100)
+                        (funcall check (valid (vttest-check:read-value (path "shared.sexp")))))
+                      (dolist (thread threads)
+                        (funcall check (eq :complete (sb-thread:join-thread thread))))
+                      (dolist (name '("producer-request" "producer-ack"))
+                        (funcall check (= 49 (getf (vttest-check:read-value (path name)) :serial)))))
+                 (dolist (thread threads) (when (sb-thread:thread-alive-p thread) (sb-thread:join-thread thread)))))
+             (dolist (name '("shared.sexp" "producer-request" "producer-ack")) (delete-file (path name))))
+           ;; Failed writes must remove their privately owned staging files too.
+           (funcall check (handler-case (progn (publish "bad" 42 :text t) nil) (type-error () t)))
+           (funcall check (not (probe-file (path "bad"))))
+           (funcall check (null (uiop:directory-files directory))))
+      (uiop:delete-directory-tree directory :validate t :if-does-not-exist :ignore))
+    (funcall check (not (probe-file directory)))))
 (defun self-test ()
   (let ((checks 0))
     (flet ((check (truth) (incf checks) (unless truth (error "C5 self-test ~d failed" checks))))
       (fixture-regressions #'check)
+      (publication-regressions #'check)
       (dolist (backend '(:x11 :wayland))
         (dolist (scale (if (eq backend :x11) '(1) '(1 2)))
           (dolist (id '(nil 7))
