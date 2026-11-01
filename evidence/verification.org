@@ -71,3 +71,18 @@ The =vttest-x11= and =vttest-wayland= fixtures retain a new run directory and
 print its absolute path on exit. Use that path for the current run's evidence.
 The =vttest-BACKEND-latest= pointer is created only when absent; existing files,
 symlinks and directories are preserved, so a historical pointer may name an older run.
+
+* Native fixture resize action
+For a deliberate Wayland external resize, retain the validated pre-action
+capture-safe top-left anchor. Resize the exact owned floating con_id using
+producer-supplied logical dimensions, then explicitly move that same owned view
+back to the anchor before publishing the action ACK. Retain command/reply files,
+pre-resize, post-resize and post-anchor trees, and validated output snapshots.
+Reject failed IPC, ambiguous identity, stale ownership, unsafe anchors and
+out-of-output dimensions. The producer then verifies ordinary 100x26 adoption
+before its new 132-column request. Capture-time movement is not part of this
+action; both independent strict capture containment checks apply.
+
+The offline harness exercises these production helpers with a stateful
+center-preserving resize model, font-derived logical sizes and scales 1/2.
+These controls establish fixture behavior, not native compositor acceptance.

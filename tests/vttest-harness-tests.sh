@@ -36,6 +36,152 @@ unset LISPTERM_VTTEST_FUNCTIONS_ONLY
   if fixture_latest_pointer "$art/missing-parent/latest"; then exit 1; fi
 )
 printf 'PASS latest create-once and historical regular/symlink/dangling/directory preservation; publication error rejects\n' > "$art/pointer-tests.log"
+# Run the real native action dispatcher against a stateful, non-GUI Sway model.
+(
+  art=$art/placement-controls; mkdir -p "$art"
+  LISPTERM_NATIVE_FUNCTIONS_ONLY=1 source "$root/tests/vt100-native-geometry.sh"
+  clear_session_endpoints
+  unset XDG_RUNTIME_DIR
+  backend=wayland; client=$BASHPID; server=$client; remember "$client"
+  export LISPTERM_NATIVE_TITLE=placement-control
+  export LISPTERM_SWAYMSG=$art/swaymsg
+  cat > "$LISPTERM_SWAYMSG" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+base=${0%/*}
+state=$base/state.json
+fault=$(cat "$base/fault")
+if [[ $* == '-t get_tree' ]]; then
+  case $fault in
+    tree-transport) exit 7;;
+    tree-empty) exit 0;;
+    tree-malformed) echo '{'; exit 0;;
+    tree-multiple) cat "$state" "$state"; exit 0;;
+  esac
+  cat "$state"; exit 0
+elif [[ $* == '-t get_outputs' ]]; then
+  case $fault in
+    outputs-transport) exit 7;;
+    outputs-empty) exit 0;;
+    outputs-malformed) echo '{'; exit 0;;
+    outputs-multiple) cat "$base/outputs.json" "$base/outputs.json"; exit 0;;
+  esac
+  cat "$base/outputs.json"; exit 0
+fi
+printf '%s\n' "$*" >> "$base/operations"
+read -ra words <<< "$1"
+case ${words[1]:-} in
+  resize)
+    kind=resize; w=${words[4]}; h=${words[7]}
+    jq --argjson w "$w" --argjson h "$h" '
+      .rect.x += ((.rect.width-$w)/2) | .rect.y += ((.rect.height-$h)/2) |
+      .rect.width=$w | .rect.height=$h' "$state" > "$state.tmp";;
+  move)
+    kind=anchor; x=${words[3]}; y=${words[4]}
+    jq --argjson x "$x" --argjson y "$y" '.rect.x=$x | .rect.y=$y' "$state" > "$state.tmp";;
+  *) exit 90;;
+esac
+mv "$state.tmp" "$state"
+if [[ $fault == stale-$kind ]]; then
+  jq '.id+=1' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == wrong-$kind ]]; then
+  jq '.pid+=1' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == duplicate-$kind ]]; then
+  jq '[.,.]' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == oversized-$kind ]]; then
+  jq '.rect.width=9999' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == unmoved-$kind ]]; then
+  jq '.rect.y = -16' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+case $fault in
+  transport-$kind) exit 7;;
+  false-$kind) echo '[{"success":false}]';;
+  parse-$kind) echo '[{"success":true,"parse_error":true}]';;
+  malformed-$kind) echo '{';;
+  empty-$kind) :;;
+  arrayempty-$kind) echo '[]';;
+  mixed-$kind) echo '[{"success":true},{"success":false}]';;
+  two-$kind) echo '[{"success":true},{"success":true}]';;
+  parsetype-$kind) echo '[{"success":true,"parse_error":"false"}]';;
+  multiple-$kind) printf '[{"success":true}]\n[{"success":true}]\n';;
+  object-$kind) echo '{"success":true}';;
+  *) echo '[{"success":true}]';;
+esac
+MOCK
+  chmod +x "$LISPTERM_SWAYMSG"
+  placement_reset() {
+    rm -f "$art/action-ack" "$art/action-ack.tmp"
+    : > "$art/operations"; printf '%s\n' "${1:-none}" > "$art/fault"
+    jq -n --arg t "$LISPTERM_NATIVE_TITLE" --argjson p "$client" \
+      --argjson w "$((132*cw))" --argjson h "$((24*ch))" \
+      '{id:5,name:$t,pid:$p,type:"floating_con",rect:{x:0,y:0,width:$w,height:$h}}' > "$art/state.json"
+    jq -n --argjson s "$scale" '[{name:"HEADLESS-1",active:true,scale:$s,
+      current_mode:{width:(1280*$s),height:(800*$s)},rect:{x:0,y:0,width:1280,height:800}}]' > "$art/outputs.json"
+    printf 'resize %s %s\n' "$((100*cw))" "$((26*ch))" > "$art/action-request"
+  }
+  # The 8x16 case is saved139's 006->007 center shift; other strikes/scales
+  # use logical font metrics, never scaled pixel dimensions in IPC commands.
+  for scale in 1 2; do
+    for metrics in '7 14' '8 16' '9 18'; do
+      read -r cw ch <<< "$metrics"
+      placement_reset
+      external_action
+      [[ $(cat "$art/action-ack") == 'resize 5' ]]
+      printf '[con_id=5] resize set width %s px height %s px\n[con_id=5] move position 0 0\n' "$((100*cw))" "$((26*ch))" > "$art/expected-operations"
+      cmp "$art/operations" "$art/expected-operations"
+      jq -e --argjson w "$((100*cw))" --argjson h "$((26*ch))" \
+        '.id==5 and .rect=={x:0,y:0,width:$w,height:$h}' "$art/state.json" > /dev/null
+      cp "$art/state.json" "$art/success-scale${scale}-${cw}x${ch}.json"
+      if [[ $cw == 8 && $scale == 1 ]]; then
+        jq -es 'any(.[]; .rect=={x:128,y:-16,width:800,height:416})' "$art"/action-*.resized.tree.json > /dev/null
+      fi
+    done
+  done
+  scale=1; cw=8; ch=16
+  for fault in stale-resize stale-anchor wrong-resize wrong-anchor duplicate-resize duplicate-anchor \
+      oversized-anchor unmoved-anchor \
+      transport-resize transport-anchor false-resize false-anchor parse-resize parse-anchor \
+      malformed-resize malformed-anchor empty-resize empty-anchor arrayempty-resize arrayempty-anchor \
+      mixed-resize mixed-anchor multiple-resize multiple-anchor object-resize object-anchor \
+      two-resize two-anchor parsetype-resize parsetype-anchor \
+      tree-transport tree-empty tree-malformed tree-multiple \
+      outputs-transport outputs-empty outputs-malformed outputs-multiple; do
+    placement_reset "$fault"
+    if external_action; then echo "Accepted placement fault: $fault" >&2; exit 1; fi
+    [[ ! -e $art/action-ack && -e $art/action-request ]]
+    cp "$art/operations" "$art/fault-$fault.operations"
+  done
+  for fault in wrong-title wrong-pid duplicate unsafe-anchor oversized-request stale-owner missing-owner write-failure; do
+    placement_reset
+    case $fault in
+      wrong-title) jq '.name="other"' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
+      wrong-pid) jq '.pid+=1' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
+      duplicate) jq '[.,.]' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
+      unsafe-anchor) jq '.rect.y = -16' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
+      oversized-request) printf 'resize 9999 416\n' > "$art/action-request";;
+      stale-owner) owned[$client]=stale;;
+      missing-owner) unset 'owned[$client]';;
+      write-failure) mkdir "$art/action-ack.tmp";;
+    esac
+    if external_action; then echo "Accepted placement fault: $fault" >&2; exit 1; fi
+    [[ ! -e $art/action-ack ]]
+    remember "$client"
+    [[ $fault != write-failure ]] || rmdir "$art/action-ack.tmp"
+  done
+  # Positive nonzero anchor is retained; negative geometry and oversize fail fit.
+  placement_reset
+  jq '.rect.x=32 | .rect.y=48' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json"
+  external_action
+  jq -e '.rect.x==32 and .rect.y==48' "$art/state.json" > /dev/null
+  if native_action_fit "$art/outputs.json" 128 -16 1056 416; then exit 1; fi
+  if native_action_fit "$art/outputs.json" 0 0 9999 416; then exit 1; fi
+  if native_action_ipc '[con_id=5] move position 0 0' "$art/missing-parent/action"; then exit 1; fi
+  printf 'PASS six metric/scale combinations, exact resize/anchor ordering, saved139 shift, nonzero anchor; 46 dispatcher rejection controls, IPC write failure; no ACK on failure\n' > "$art/tests.log"
+)
 # Deterministic non-GUI shutdown windows against the production shell helpers.
 (
   art=$art/shutdown-controls; mkdir -p "$art"

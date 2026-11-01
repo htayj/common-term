@@ -14,7 +14,94 @@ native_window_rules() {
      .[0].success == true and .[0].parse_error != true)' > /dev/null || return 1
  done
 }
-# Source only these registration helpers for offline parser/IPC controls.
+# Identity is re-read for every action and capture, never inferred from a title alone.
+window_identity() {
+ if [[ $backend == x11 ]]; then
+  mapfile -t windows < <(timeout 5 xdotool search --name "^$LISPTERM_NATIVE_TITLE\$" || true)
+  [[ ${#windows[@]} == 1 ]] || return 1
+  window=${windows[0]}
+  owner=$(timeout 5 xdotool getwindowpid "$window" 2>/dev/null || true)
+  [[ -z $owner || $owner == "$client" ]]
+ else
+  timeout 5 "$LISPTERM_SWAYMSG" -t get_tree > "$art/current-tree.json" || return 1
+  node=$(jq -ces --arg t "$LISPTERM_NATIVE_TITLE" --argjson p "$client" '
+   if length != 1 then error("tree count") else .[0] end |
+   [..|objects|select(.name?==$t and .pid?==$p and (.type?=="floating_con" or .type?=="con"))] |
+   if length==1 then .[0] else error("owned window not unique") end |
+   select(.id|type=="number" and .>0 and floor==.)' "$art/current-tree.json") || return 1
+  window=$(jq -r .id <<< "$node") || return 1
+ fi
+}
+# Exactly one command, one JSON document, one successful reply. Retain failures too.
+native_action_ipc() {
+ local command=$1 prefix=$2
+ printf '%s\n' "$command" > "$prefix.command" || return 1
+ timeout 5 "$LISPTERM_SWAYMSG" "$command" > "$prefix.reply.json" || return 1
+ jq -es 'length==1 and (.[0]|type=="array" and length==1 and
+  (.[0]|type=="object" and .success==true and
+   ((has("parse_error")|not) or .parse_error==false)))' "$prefix.reply.json" > /dev/null
+}
+native_action_outputs() {
+ timeout 5 "$LISPTERM_SWAYMSG" -t get_outputs > "$1" || return 1
+ jq -es 'length==1 and (.[0]|type=="array")' "$1" > /dev/null || return 1
+ fixture_outputs "$1"
+}
+# Integer logical rectangles must fit exactly one validated private output.
+native_action_fit() {
+ local outputs=$1 x=$2 y=$3 w=$4 h=$5
+ jq -e --argjson x "$x" --argjson y "$y" --argjson w "$w" --argjson h "$h" '
+  ([$x,$y,$w,$h]|all(type=="number" and floor==.)) and $w>0 and $h>0 and
+  ([.[]|select($x>=.rect.x and $y>=.rect.y and
+    ($x+$w)<=(.rect.x+.rect.width) and ($y+$h)<=(.rect.y+.rect.height))]|length==1)' "$outputs" > /dev/null
+}
+native_resize_wayland() {
+ local w=$1 h=$2 prefix=$3 target=$window ax ay aw ah px py pw ph
+ is_owned "$client" && is_owned "$server" || return 1
+ [[ $(jq -r .type <<< "$node") == floating_con ]] || return 1
+ cp "$art/current-tree.json" "$prefix.before.tree.json" || return 1
+ native_action_outputs "$prefix.outputs.json" || return 1
+ read -r ax ay aw ah < <(jq -er '[.rect.x,.rect.y,.rect.width,.rect.height]|@tsv' <<< "$node") || return 1
+ native_action_fit "$prefix.outputs.json" "$ax" "$ay" "$aw" "$ah" || return 1
+ native_action_fit "$prefix.outputs.json" "$ax" "$ay" "$w" "$h" || return 1
+ is_owned "$client" && is_owned "$server" || return 1
+ native_action_ipc "[con_id=$target] resize set width $w px height $h px" "$prefix.resize" || return 1
+ window_identity || return 1
+ cp "$art/current-tree.json" "$prefix.resized.tree.json" || return 1
+ [[ $window == "$target" && $(jq -r .type <<< "$node") == floating_con ]] || return 1
+ is_owned "$client" && is_owned "$server" || return 1
+ native_action_ipc "[con_id=$target] move position $ax $ay" "$prefix.anchor" || return 1
+ window_identity || return 1
+ cp "$art/current-tree.json" "$prefix.anchored.tree.json" || return 1
+ [[ $window == "$target" && $(jq -r .type <<< "$node") == floating_con ]] || return 1
+ is_owned "$client" && is_owned "$server" || return 1
+ read -r px py pw ph < <(jq -er '[.rect.x,.rect.y,.rect.width,.rect.height]|@tsv' <<< "$node") || return 1
+ [[ $px == "$ax" && $py == "$ay" ]] || return 1
+ native_action_outputs "$prefix.after.outputs.json" || return 1
+ native_action_fit "$prefix.after.outputs.json" "$px" "$py" "$pw" "$ph" || return 1
+ is_owned "$client" && is_owned "$server"
+}
+external_action() {
+ local action w h extra prefix
+ read -r action w h extra < "$art/action-request" || return 1
+ [[ -z $extra ]] || return 1
+ window_identity || return 1
+ prefix=$art/action-$(date +%s%N)
+ case $action in
+  resize)
+   [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]] || return 1
+   if [[ $backend == x11 ]]; then timeout 5 xdotool windowsize --sync "$window" "$w" "$h" > "$prefix.json" || return 1
+   else native_resize_wayland "$w" "$h" "$prefix" || return 1; fi;;
+  tiled) [[ $backend == wayland ]] || return 1
+   timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] floating disable, fullscreen enable" > "$prefix.json" || return 1;;
+  floating) [[ $backend == wayland ]] || return 1
+   timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] fullscreen disable, floating enable, border none, move position 0 0" > "$prefix.json" || return 1;;
+  *) return 1;;
+ esac
+ rm "$art/action-request" || return 1
+ printf '%s\n' "$action $window" > "$art/action-ack.tmp" || return 1
+ mv "$art/action-ack.tmp" "$art/action-ack"
+}
+# Source only fixture helpers for offline parser/IPC/action controls.
 [[ ${LISPTERM_NATIVE_FUNCTIONS_ONLY:-0} != 1 ]] || return 0
 help() {
  cat <<'HELP'
@@ -109,33 +196,6 @@ fixture_isolation > "$art/isolation.txt"
 unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
 scripts/sbcl --script tests/vt100-native-geometry.lisp --native < /dev/null > "$art/client.log" 2>&1 & client=$!; remember "$client"
 audit_client_tree
-window_identity() {
- if [[ $backend == x11 ]]; then
-  mapfile -t windows < <(timeout 5 xdotool search --name "^$LISPTERM_NATIVE_TITLE\$" || true)
-  [[ ${#windows[@]} == 1 ]]; window=${windows[0]}
-  owner=$(timeout 5 xdotool getwindowpid "$window" 2>/dev/null || true)
-  [[ -z $owner || $owner == "$client" ]]
- else
-  timeout 5 "$LISPTERM_SWAYMSG" -t get_tree > "$art/current-tree.json"
-  node=$(jq -ce --arg t "$LISPTERM_NATIVE_TITLE" --argjson p "$client" '[..|objects|select(.name?==$t and .pid?==$p and (.type?=="floating_con" or .type?=="con"))]|if length==1 then .[0] else error("owned window not unique") end' "$art/current-tree.json")
-  window=$(jq -r .id <<< "$node")
- fi
-}
-external_action() {
- local action w h extra
- read -r action w h extra < "$art/action-request"
- [[ -z $extra ]]; window_identity
- case $action in
-  resize)
-   [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]]
-   if [[ $backend == x11 ]]; then timeout 5 xdotool windowsize --sync "$window" "$w" "$h";
-   else timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] resize set width $w px height $h px"; fi;;
-  tiled) [[ $backend == wayland ]]; timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] floating disable, fullscreen enable";;
-  floating) [[ $backend == wayland ]]; timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] fullscreen disable, floating enable, border none, move position 0 0";;
-  *) return 1;;
- esac > "$art/action-$(date +%s%N).json"
- rm "$art/action-request"; printf '%s\n' "$action $window" > "$art/action-ack.tmp"; mv "$art/action-ack.tmp" "$art/action-ack"
-}
 capture_native() {
  local name ew eh ds cw extra
  read -r name ew eh ds cw extra < "$art/capture-request"
