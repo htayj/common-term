@@ -329,3 +329,55 @@ manifests recheck successfully. Shell syntax, dependency-expression parsing and
 =git diff --check= pass. The final observed current HEAD is
 =d8772ec=, following the separately committed engine/input foundations; this
 harness batch is uncommitted for independent review.
+
+* Capture contract v3 (C2/C4)
+
+Strict acceptance now requires recorder-version3 in the inventory, finish record,
+barrier and external capture proof. Inspect older v2 artifacts in measure mode;
+no historical artifact has been converted. Source-action/query/reply/phase
+causality checks are independent of the geometry contract.
+
+Load =tests/vttest-protocol.lisp= alone to use the pure exported predicate
+=vttest-check:geometry-capture-ready-p STATUS DESIRED-SCALE=. It returns
+=(values BOOLEAN REASON)=. It checks one nested =:geometry= snapshot, actual
+positive cell metrics, engine/grid/PTY agreement, logical dimensions and scale.
+Initial request-id NIL, phase idle, engine generation0 and target NIL are valid.
+A requested geometry requires phase settled and request-id equal to engine
+generation, with matching requested and actual metrics-derived dimensions.
+Refused, timed-out, cancelled and superseded requests reject normal acceptance.
+Epoch, display-epoch and metric-generation are required; retries reuse request-id.
+This predicate establishes static readiness only, not fresh-frame provenance.
+
+The recorder first samples static readiness, invalidates, and waits for a newer
+session frame with identical attempt/dimensions and nondecreasing presentation.
+Presentation counts geometry settlements, not ordinary redraws: X11 increments
+it in =x11-geometry-presented=, Wayland in =protocol-geometry-frame=. Merely
+reaching target-presentation does not prove a post-settlement frame. Wayland
+also requires newer commit/frame generations, configured state, no pending
+frame, matching committed logical/physical dimensions and the desired fixture
+buffer scale after surface enter. Ordinary post-closing-sync frames have NIL
+request tokens; non-NIL tokens must match the current request and epoch.
+Retain the final PTY-read/output and native callback ACK checks.
+
+Each barrier carries =:recorder-version 3 :desired-scale :target-output
+:before-frame :before-status :status :native-ack-output=. The initial baseline,
+ready, capture and final post-shell-ACK status samples must correlate by
+request-id, epoch, display/metric generation, engine generation, grid/PTY,
+metrics, requested/actual dimensions, phase, target and backend/scale. Frame
+and presentation progress cannot go backwards. The recorder saves
+=NAME.final-status.sexp= and checks unchanged bytes/output after capture.
+
+The shell request is four fields: NAME LOGICAL_WIDTH LOGICAL_HEIGHT SCALE.
+=NAME.external.sexp= contains recorder-version3, logical-width/height, scale,
+pixel-width/height, x/y, output-x/y and output-width/height from native rectangle, output and
+PNG observations. The analyzer independently checks those fields against the
+status metrics and PNG header. Logical capture rectangles must fit an output;
+physical PNG dimensions must equal scale times logical dimensions. Full132
+width is 132 times the actual cell width, without a fixed8x16 runtime assumption.
+The output must fit that full width even when the current initial capture has80 columns.
+
+Use =LISPTERM_VTTEST_SCALE=1|2= (default1); X11 accepts1 only. Fixtures use
+private endpoints and the shared inherited-FD9 lock protocol. V3 directories
+include backend, scale and version. Offline9x18/scale2 fixtures establish
+validation coverage only. Native fixture implementation, actual GUI runs,
+independent review and parent PNG inspection follow separately.

@@ -31,6 +31,7 @@ case $gate in
   exec scripts/sbcl --script tests/run-x11-close-tests.lisp ;;
  host) exec scripts/sbcl --script tests/run-host-tests.lisp ;;
  geometry) exec scripts/sbcl --script tests/run-vt100-geometry-tests.lisp ;;
+ native-geometry) exec tests/vt100-native-geometry.sh "$@" ;;
  pty-spike)
   log=$(mktemp)
   trap 'rm -f "$log"' EXIT

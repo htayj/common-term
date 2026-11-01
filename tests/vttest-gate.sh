@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Recorder v2: private fixtures, bounded ownership-based cleanup, explicit verdict mode.
+# Recorder v3: private fixtures, bounded ownership-based cleanup, explicit verdict mode.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 # These functions are also sourced by the disposable non-GUI cleanup test.
-declare -A owned=()
+declare -A owned=() audited=()
 process_token() {
   local stat rest
   [[ $1 =~ ^[0-9]+$ && -r /proc/$1/stat ]] || return 1
@@ -51,9 +51,114 @@ stop_owned() {
   printf 'all-owned-stopped\n' >> "$art/cleanup.log"
 }
 watchdog_check() { ((SECONDS < $1)) || { echo "vttest total watchdog expired" >&2; return 124; }; }
+# Shared shell interface for the later native fixture: source with FUNCTIONS_ONLY.
+fixture_scale() {
+  [[ $2 == 1 || $2 == 2 ]] && [[ $1 == wayland || ( $1 == x11 && $2 == 1 ) ]]
+}
+fixture_lock() {
+  local path=$root/.build/vttest-gui.lock
+  if [[ ${LISPTERM_GUI_LOCK_HELD:-} == 1 ]]; then
+    # fdinfo describes the lock attached to this open file description, including
+    # inherited descriptors. A marker or another process's lock is insufficient.
+    [[ /proc/$BASHPID/fd/9 -ef $path ]] && grep -q 'FLOCK *ADVISORY *WRITE' /proc/$BASHPID/fdinfo/9 || return 1
+  else
+    exec 9> "$path"
+    flock -w 120 9 || return 1
+    export LISPTERM_GUI_LOCK_HELD=1
+  fi
+}
+clear_session_endpoints() {
+  local key
+  for key in ${!DBUS_@}; do unset "$key"; done
+  unset DISPLAY WAYLAND_DISPLAY SWAYSOCK XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE
+}
+private_runtime() {
+  [[ $1 =~ ^/tmp/lispterm-(x11|wayland)\.[[:alnum:]]+$ && -d $1 && -O $1 && ! -L $1 ]] &&
+    [[ $(stat -c %a "$1") == 700 ]]
+}
+socket_inode_match() {
+  # Match kernel socket inodes, not the misleading fd symlink pathname.
+  local fd target inode row path=$2 fds=${3:-/proc/$1/fd} table=${4:-/proc/net/unix}
+  for fd in "$fds"/*; do
+    target=$(readlink "$fd") || continue
+    [[ $target =~ ^socket:\[([0-9]+)\]$ ]] || continue
+    inode=${BASH_REMATCH[1]}
+    row=$(awk -v n="$inode" -v p="$path" '$7==n && $8==p {print $7, $8}' "$table")
+    if [[ -n $row ]]; then printf '%s\n' "$row"; return 0; fi
+  done
+  return 1
+}
+fixture_outputs() {
+  jq -e --argjson scale "$scale" '
+    length > 0 and all(.[]; (.name | startswith("HEADLESS-")) and .active == true and
+      .scale == $scale and .current_mode.width >= (1280*$scale) and
+      .current_mode.height >= (800*$scale))' "$1" > /dev/null
+}
+fixture_isolation() {
+  private_runtime "$XDG_RUNTIME_DIR" && is_owned "$server" || return 1
+  [[ ! -v DBUS_SESSION_BUS_ADDRESS && ! -v DBUS_SESSION_BUS_PID && ! -v DBUS_SESSION_BUS_WINDOWID && ! -v XAUTHORITY ]] || return 1
+  if [[ $backend == x11 ]]; then
+    local number; number=$(cat "$art/display-number")
+    [[ $number =~ ^[0-9]+$ && $DISPLAY == :$number && ! -v WAYLAND_DISPLAY && ! -v SWAYSOCK ]] || return 1
+    grep -zFxq -- '-displayfd' /proc/"$server"/cmdline || return 1
+    socket_inode_match "$server" "/tmp/.X11-unix/X$number" ||
+      socket_inode_match "$server" "@/tmp/.X11-unix/X$number" || return 1
+  else
+    [[ ! -v DISPLAY && $WAYLAND_DISPLAY == wayland-1 && $XDG_RUNTIME_DIR == "$(cat "$art/compositor/runtime-path")" &&
+       $SWAYSOCK == "$XDG_RUNTIME_DIR/sway-ipc.$UID.$server.sock" ]] || return 1
+    grep -zFxq -- "$art/compositor/sway.conf" /proc/"$server"/cmdline || return 1
+    socket_inode_match "$server" "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" &&
+      socket_inode_match "$server" "$SWAYSOCK" || return 1
+    timeout 5 "$LISPTERM_SWAYMSG" -t get_outputs > "$art/isolation-outputs.json" || return 1
+    fixture_outputs "$art/isolation-outputs.json" || return 1
+  fi
+  printf 'backend=%s scale=%s server=%s start=%s runtime=%s\n' "$backend" "$scale" "$server" "${owned[$server]}" "$XDG_RUNTIME_DIR"
+}
+audit_endpoint_file() {
+  local item key value seen_runtime=0 seen_display=0
+  while IFS= read -r -d '' item; do
+    key=${item%%=*}; value=${item#*=}
+    case $key in
+      XDG_RUNTIME_DIR) [[ $value == "$XDG_RUNTIME_DIR" ]] || return 1; seen_runtime=1;;
+      DISPLAY) [[ $backend == x11 && $value == "$DISPLAY" ]] || return 1; seen_display=1;;
+      WAYLAND_DISPLAY) [[ $backend == wayland && $value == "$WAYLAND_DISPLAY" ]] || return 1; seen_display=1;;
+      SWAYSOCK) [[ $backend == wayland && $value == "$SWAYSOCK" ]] || return 1;;
+      DBUS_*|XAUTHORITY) return 1;;
+    esac
+  done < "$1"
+  [[ $seen_runtime == 1 && $seen_display == 1 ]]
+}
+audit_client_tree() {
+  local pid child
+  is_owned "$client" || return 1
+  collect_tree "$client"
+  # Audit the client subtree only, not the server or unrelated owned helpers.
+  local -A clients=(); local -a pending=("$client")
+  while ((${#pending[@]})); do
+    pid=${pending[0]}; pending=("${pending[@]:1}")
+    is_owned "$pid" || continue
+    clients[$pid]=1
+    while read -r child; do [[ -z $child ]] || pending+=("$child"); done < <(ps -o pid= --ppid "$pid")
+  done
+  for pid in "${!clients[@]}"; do
+    if ! audit_endpoint_file "/proc/$pid/environ"; then
+      # A vanished descendant has no endpoints left to audit; a live mismatch fails.
+      is_owned "$pid" || continue
+      printf 'endpoint-mismatch pid=%s\n' "$pid" >> "$art/isolation.txt"; return 1
+    fi
+    if [[ ${audited[$pid]:-} != "${owned[$pid]}" ]]; then
+      printf 'client=%s start=%s endpoints=private\n' "$pid" "${owned[$pid]}" >> "$art/isolation.txt"
+      audited[$pid]=${owned[$pid]}
+    fi
+  done
+}
 if [[ ${LISPTERM_VTTEST_FUNCTIONS_ONLY:-} == 1 ]]; then return 0; fi
 backend=${1:-}
 [[ $backend == x11 || $backend == wayland ]] || { echo 'Usage: tests/vttest-gate.sh x11|wayland' >&2; exit 2; }
+# LISPTERM_VTTEST_SCALE=1|2 selects Wayland buffer/output scale; X11 accepts 1 only.
+scale=${LISPTERM_VTTEST_SCALE:-1}
+fixture_scale "$backend" "$scale" || { echo "Scale must be 1 (X11) or 1|2 (Wayland)" >&2; exit 2; }
+export LISPTERM_VTTEST_SCALE=$scale
 mode=${LISPTERM_VTTEST_MODE:-record}
 [[ $mode == record || $mode == accept ]] || { echo 'Mode must be record or accept' >&2; exit 2; }
 export LISPTERM_VTTEST_MODE=$mode
@@ -73,9 +178,8 @@ if [[ ! -f ${LISPTERM_FONT:-} ]]; then
   export LISPTERM_FONT=${fonts[0]}
 fi
 mkdir -p "$root/.build/evidence"
-exec 9> "$root/.build/vttest-gui.lock"
-flock -w 120 9
-art=$(mktemp -d "$root/.build/evidence/vttest-${backend}-v2.XXXXXX")
+fixture_lock || { echo "Invalid inherited GUI lock" >&2; exit 1; }
+art=$(mktemp -d "$root/.build/evidence/vttest-${backend}-scale${scale}-v3.XXXXXX")
 export LISPTERM_VTTEST_ARTIFACTS="$art/" LISPTERM_VTTEST_BACKEND=$backend LISPTERM_VTTEST_BASH=$BASH
 export LISPTERM_VTTEST_TITLE="Lispterm-vttest-${art##*.}-$$"
 client='' server='' keyboard_holder='' runtime=''
@@ -87,7 +191,7 @@ cleanup() {
   # is a second identity check when startup failed before its PID was adopted.
   if [[ -f $art/compositor/compositor.pid ]]; then
     pid=$(cat "$art/compositor/compositor.pid")
-    if [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/cmdline ]] && grep -zFxq -- "$art/compositor/sway.conf" "/proc/$pid/cmdline"; then remember "$pid"; fi
+    if [[ $pid =~ ^[0-9]+$ && -r $art/compositor/compositor.start && $(process_token "$pid") == "$(cat "$art/compositor/compositor.start")" ]] && grep -zFxq -- "$art/compositor/sway.conf" "/proc/$pid/cmdline"; then remember "$pid"; fi
   fi
   : > "$art/process-tree-final.txt"
   for pid in "${!owned[@]}"; do
@@ -97,8 +201,9 @@ cleanup() {
   stop_owned || { code=1; stopped=0; }
   if [[ $stopped == 1 && -f $art/compositor/runtime-path ]]; then
     runtime=$(cat "$art/compositor/runtime-path")
-    if [[ $runtime == /tmp/lispterm-wayland.* && -d $runtime && -O $runtime && ! -L $runtime ]]; then rm -rf -- "$runtime"; fi
+    if private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
   fi
+  if [[ $stopped == 1 && $backend == x11 ]] && private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
   printf '%s\n' "$code" > "$art/harness.exit"
   # Hash all data and metadata after cleanup, with relative filenames.
   if ! (cd "$art"; find . -type f ! -name provenance.sha256 -print0 | sort -z | xargs -0 sha256sum > provenance.sha256); then
@@ -113,7 +218,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/verify.sh scripts/deps.nix "$art/"
 {
-  printf 'recorder-version=2\nmode=%s\nfilter=%s\nbackend=%s\ntitle=%s\n' "$mode" "${LISPTERM_VTTEST_FILTER:-all}" "$backend" "$LISPTERM_VTTEST_TITLE"
+  printf 'recorder-version=3\nmode=%s\nfilter=%s\nbackend=%s\ntitle=%s\n' "$mode" "${LISPTERM_VTTEST_FILTER:-all}" "$backend" "$LISPTERM_VTTEST_TITLE"
+  printf 'fixture-scale=%s\n' "$scale"
   printf 'pinned-binary=%s\noverride=%s\n' "$(realpath "$pinned")" "$([[ $(realpath "$VTTEST") == "$(realpath "$pinned")" ]] && echo false || echo true)"
   printf 'binary=%s\nsbcl=%s\nfont=%s\n' "$(realpath "$VTTEST")" "$(realpath "$LISPTERM_SBCL")" "$LISPTERM_FONT"
   printf 'command='; printf '%q ' "$root/scripts/sbcl" --script tests/vttest-gate.lisp; printf '\n'
@@ -144,8 +250,12 @@ find src engine tests scripts -type f -print0 | sort -z | xargs -0 sha256sum > "
 for tool in Xvfb xdotool import sway swaymsg wtype grim jq timeout ps; do
   command -v "$tool" >> "$art/dependencies.txt" 2>/dev/null || true
 done
+clear_session_endpoints
 if [[ $backend == x11 ]]; then
-  unset WAYLAND_DISPLAY SWAYSOCK
+  runtime=$(mktemp -d /tmp/lispterm-x11.XXXXXX)
+  chmod 700 "$runtime"
+  export XDG_RUNTIME_DIR=$runtime
+  unset WAYLAND_DISPLAY SWAYSOCK DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID DBUS_SESSION_BUS_WINDOWID
   Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3> "$art/display-number" > "$art/xvfb.log" 2>&1 & server=$!
   remember "$server"
   for ((i=0;i<100;i++)); do
@@ -154,24 +264,28 @@ if [[ $backend == x11 ]]; then
   done
   number=$(cat "$art/display-number"); [[ $number =~ ^[0-9]+$ ]]
   export DISPLAY=:$number
+  fixture_isolation > "$art/isolation.txt" || exit 1
   timeout 10 xdpyinfo -display "$DISPLAY" > "$art/x-display.txt"
   printf 'DISPLAY=%s\nserver=%s\nstart=%s\n' "$DISPLAY" "$server" "${owned[$server]}" > "$art/transport.txt"
 else
-  timeout 15 tests/wayland-gate.sh start "$art/compositor"
+  timeout 15 tests/wayland-gate.sh start "$art/compositor" "$scale"
   source "$art/compositor/env.sh"
   server=$(cat "$art/compositor/compositor.pid"); remember "$server"
   [[ -z ${DISPLAY+x} ]]
+  fixture_isolation > "$art/isolation.txt" || exit 1
   # Initial size only. Subsequent capture rectangles follow actual native geometry.
-  for rule in 'floating enable' 'resize set 640 384' 'move position 0 0'; do
+  for rule in 'floating enable' 'move position 0 0'; do
     timeout 5 "$LISPTERM_SWAYMSG" "for_window [title=\"^$LISPTERM_VTTEST_TITLE\$\"] $rule" >> "$art/window-rule.json"
   done
   printf 'DISPLAY=unset\nWAYLAND_DISPLAY=%s\n' "$WAYLAND_DISPLAY" > "$art/transport.txt"
   "$LISPTERM_WTYPE" -s "$(( (${LISPTERM_VTTEST_TIMEOUT:-1800} + 60) * 1000 ))" > "$art/keyboard-holder.log" 2>&1 & keyboard_holder=$!
   remember "$keyboard_holder"; sleep .3; is_owned "$keyboard_holder"
 fi
+fixture_isolation > "$art/isolation.txt" || { echo "Endpoint isolation failed" >&2; exit 1; }
 unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
 "$root/scripts/sbcl" --script tests/vttest-gate.lisp < /dev/null > "$art/client.log" 2>&1 & client=$!
 remember "$client"
+audit_client_tree || { echo "Client endpoint audit failed" >&2; exit 1; }
 # Strictly one exact-title window on this private display. Native PID must equal
 # our client. X11 may omit _NET_WM_PID, so private server + unguessable title is
 # the identity fallback; never search an inherited display or choose head -1.
@@ -193,28 +307,39 @@ end=$((SECONDS + ${LISPTERM_VTTEST_TIMEOUT:-1800}))
 while is_owned "$client"; do
   watchdog_check "$end"
   collect_tree "$client"
+  audit_client_tree || exit 1
   if [[ -f $art/capture-request ]]; then
-    read -r name expected_width expected_height < "$art/capture-request"
+    read -r name expected_width expected_height requested_scale extra < "$art/capture-request"
     [[ $name =~ ^[0-9]+-[a-z0-9_-]+$ && $expected_width =~ ^[0-9]+$ && $expected_height =~ ^[0-9]+$ ]]
+    [[ $requested_scale == "$scale" && -z $extra && $expected_width -gt 0 && $expected_height -gt 0 ]]
     window_identity
     if [[ $backend == x11 ]]; then
       timeout 5 xdotool getwindowgeometry --shell "$window" > "$art/$name.geometry.txt"
       width=$(sed -n 's/^WIDTH=//p' "$art/$name.geometry.txt")
       height=$(sed -n 's/^HEIGHT=//p' "$art/$name.geometry.txt")
+      output_x=0; output_y=0
+      read -r output_width output_height < <(timeout 5 xdotool getdisplaygeometry)
+      x=$(sed -n 's/^X=//p' "$art/$name.geometry.txt")
+      y=$(sed -n 's/^Y=//p' "$art/$name.geometry.txt")
+      [[ $x -ge 0 && $y -ge 0 && $((x + width)) -le $output_width && $((y + height)) -le $output_height ]]
       timeout 10 import -display "$DISPLAY" -window "$window" "$art/$name.png"
     else
       cp "$art/current-tree.json" "$art/$name.tree.json"
       jq '{id,pid,name,rect,window_rect,geometry}' <<< "$node" > "$art/$name.geometry.json"
       read -r x y width height < <(jq -r '[.rect.x,.rect.y,.rect.width,.rect.height] | @tsv' <<< "$node")
+      jq -e --argjson x "$x" --argjson y "$y" --argjson w "$width" --argjson h "$height" 'any(.[]; $x >= .rect.x and $y >= .rect.y and ($x+$w) <= (.rect.x+.rect.width) and ($y+$h) <= (.rect.y+.rect.height))' "$art/isolation-outputs.json" > /dev/null
+      read -r output_x output_y output_width output_height < <(jq -r --argjson x "$x" --argjson y "$y" --argjson w "$width" --argjson h "$height" '.[] | select($x >= .rect.x and $y >= .rect.y and ($x+$w) <= (.rect.x+.rect.width) and ($y+$h) <= (.rect.y+.rect.height)) | [.rect.x,.rect.y,.rect.width,.rect.height] | @tsv' "$art/isolation-outputs.json")
       timeout 10 "$LISPTERM_GRIM" -g "$x,$y ${width}x$height" "$art/$name.png"
     fi
-    printf 'expected=%sx%s actual=%sx%s window=%s\n' "$expected_width" "$expected_height" "$width" "$height" "$window" > "$art/$name.dimensions.txt"
+    printf 'expected=%sx%s actual=%sx%s window=%s fixture-scale=%s\n' "$expected_width" "$expected_height" "$width" "$height" "$window" "$scale" > "$art/$name.dimensions.txt"
     if [[ $mode == accept ]]; then
       [[ $width == "$expected_width" && $height == "$expected_height" ]] || { echo 'Capture geometry mismatch' >&2; exit 1; }
     fi
     timeout 5 identify -format '%w %h\n' "$art/$name.png" > "$art/$name.image-size.txt"
     read -r image_width image_height < "$art/$name.image-size.txt"
-    [[ $image_width == "$width" && $image_height == "$height" ]]
+    [[ $image_width == "$((scale * width))" && $image_height == "$((scale * height))" ]]
+    printf '(:recorder-version 3 :logical-width %s :logical-height %s :scale %s :pixel-width %s :pixel-height %s :output-width %s :output-height %s :x %s :y %s :output-x %s :output-y %s)\n' \
+      "$width" "$height" "$scale" "$image_width" "$image_height" "$output_width" "$output_height" "$x" "$y" "$output_x" "$output_y" > "$art/$name.external.sexp"
     rm "$art/capture-request"; touch "$art/captured"
   fi
   if [[ -f $art/key-request ]]; then
@@ -237,4 +362,4 @@ wait "$client"; client=''
 [[ -f $art/finished.sexp ]]
 check_mode=measure; [[ $mode != accept ]] || check_mode=accept
 scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$check_mode" "$art" > "$art/offline-check.log"
-echo "Recorder v2 $mode complete (mechanical checks only, visual acceptance separate)"
+echo "Recorder v3 $mode complete (mechanical checks only, visual acceptance separate)"

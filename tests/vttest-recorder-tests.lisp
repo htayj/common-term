@@ -28,13 +28,24 @@
 (verify (= 20 (length *cases*)) "selected VT100 case inventory is explicit")
 (verify (menu-p "Test of cursor movements Enter choice number" (menu-title nil)) "main menu identity")
 (verify (not (menu-p "Keyboard Tests Enter choice number" (menu-title nil))) "wrong submenu not a main return")
-(let ((text "Push <RETURN>") (s '(:frames 1 :bytes-received 1 :columns 80 :rows 24
-                                   :process-state :running :backend :x11 :input-pending 0)))
+(let ((text "Push <RETURN>")
+      (s '(:frames 1 :bytes-received 1 :columns 80 :rows 24 :pty-columns 80 :pty-rows 24
+           :engine-geometry-generation 0 :error-count 0
+           :geometry (:request-id nil :phase :idle :epoch 0 :display-epoch 1 :metric-generation 0
+                      :cell-width 9 :cell-height 18 :columns 80 :rows 24
+                      :actual-width 720 :actual-height 432 :presentation 0 :target-presentation nil
+                      :buffer-scale 1 :configured-p t :frame-pending-p nil
+                      :committed-width 720 :committed-height 432 :committed-buffer-width 720
+                      :committed-buffer-height 432 :buffer-width 720 :buffer-height 432
+                      :commit-generation 1 :frame-generation 1)
+           :process-state :running :backend :x11 :input-pending 0)))
   (with-functions
       (list (cons 'grid-text (lambda (host) (declare (ignore host)) text))
-            (cons 'lispterm:status (lambda (&optional host) (declare (ignore host)) (copy-list s)))
+            (cons 'lispterm:status (lambda (&optional host) (declare (ignore host)) (copy-tree s)))
             (cons 'lispterm:host-errors (lambda (host) (declare (ignore host)) nil))
-            (cons 'lispterm:invalidate (lambda (host) (declare (ignore host)) (incf (getf s :frames)))))
+            (cons 'lispterm:invalidate (lambda (host) (declare (ignore host)) (incf (getf s :frames))
+                    (incf (getf (getf s :geometry) :commit-generation))
+                    (incf (getf (getf s :geometry) :frame-generation)))))
     (lambda ()
       (setf *output-count* 1)
       (verify (equal text (wait-screen :fake :seconds .5 :after 0 :predicate (lambda (x) (search "Push <RETURN>" x))))
@@ -53,6 +64,60 @@
       (with-functions (list (cons 'deadline (lambda (seconds) (declare (ignore seconds)) (+ (get-internal-real-time) (* .05 internal-time-units-per-second)))))
         (lambda ()
           (verify (errors-p (lambda () (frame-barrier :fake))) "native unacknowledged target frame fails closed")
+          (setf *wayland-ack-output* 1)
+          (let ((saved (copy-tree s)))
+            (unwind-protect
+                (progn
+                  (let ((g (getf s :geometry)))
+                    (setf (getf s :engine-geometry-generation) 7
+                          (getf g :request-id) 7 (getf g :phase) :settled
+                          (getf g :target-presentation) 0
+                          (getf g :requested-columns) 80 (getf g :requested-rows) 24
+                          (getf g :requested-width) 720 (getf g :requested-height) 432)
+                    (setf (getf s :geometry) g)
+                    (verify (getf (frame-barrier :fake) :status)
+                            "settled request needs subsequent redraw, presentation may be unchanged"))
+                  (setf s (copy-tree saved))
+                  (let ((*desired-scale* 2) (samples 0))
+                    (with-functions
+                        (list (cons 'lispterm:status
+                                    (lambda (&optional host) (declare (ignore host))
+                                      (when (> (incf samples) 1)
+                                        (let ((g (getf s :geometry)))
+                                          (setf (getf g :buffer-scale) 2
+                                                (getf g :committed-buffer-width) 1440
+                                                (getf g :committed-buffer-height) 864
+                                                (getf g :buffer-width) 1440 (getf g :buffer-height) 864)))
+                                      (copy-tree s))))
+                      (lambda () (verify (getf (frame-barrier :fake) :status)
+                                         "scale2 waits for actual initial surface-enter scale"))))
+                  (setf s (copy-tree saved))
+                  (dolist (phase '(:refused :timed-out :cancelled :superseded))
+                    (setf (getf (getf s :geometry) :phase) phase)
+                    (verify (errors-p (lambda () (frame-barrier :fake)))
+                            (format nil "terminal ~a cannot enter normal capture" phase)))
+                  (setf s (copy-tree saved))
+                  (with-functions (list (cons 'lispterm:invalidate (lambda (host) (declare (ignore host)) nil)))
+                    (lambda ()
+                      (verify (errors-p (lambda () (frame-barrier :fake)))
+                              "settlement target without invalidate-frame progress fails")))
+                  (with-functions
+                      (list (cons 'lispterm:invalidate
+                                  (lambda (host) (declare (ignore host))
+                                    (incf (getf s :frames)) (incf (getf (getf s :geometry) :epoch)))))
+                    (lambda () (verify (errors-p (lambda () (frame-barrier :fake)))
+                                       "retry epoch changed after settled baseline fails")))
+                  (setf s (copy-tree saved))
+                  (let ((samples 0))
+                    (with-functions
+                        (list (cons 'lispterm:status
+                                    (lambda (&optional host) (declare (ignore host))
+                                      (let ((snapshot (copy-tree s)))
+                                        (when (= 1 (incf samples)) (setf (getf snapshot :geometry) nil))
+                                        snapshot))))
+                      (lambda () (verify (getf (frame-barrier :fake) :status)
+                                         "initial NIL geometry waits for attached display")))))
+              (setf s saved)))
           (setf text "wrong screen" *expected* '("reports-dsr") *attempted* nil *completed* nil)
           (with-functions
               (list (cons 'lispterm:open (lambda (&rest args) (declare (ignore args)) :fake))

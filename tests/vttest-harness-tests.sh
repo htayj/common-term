@@ -12,12 +12,68 @@ printf 'ARTIFACTS %s\n' "$art"
 export LISPTERM_VTTEST_FUNCTIONS_ONLY=1
 source tests/vttest-gate.sh
 unset LISPTERM_VTTEST_FUNCTIONS_ONLY
+# Pure/mock isolation tests, with a real disposable lock but no GUI processes.
+fixture_scale x11 1; fixture_scale wayland 1; fixture_scale wayland 2
+for spec in 'x11 2' 'wayland 0' 'wayland 3' 'wayland 02' 'wayland 1.0' 'unknown 1'; do
+  read -r b s <<< "$spec"
+  if fixture_scale "$b" "$s"; then echo "Invalid scale accepted: $spec" >&2; exit 1; fi
+done
+(
+  clear_session_endpoints
+  export XDG_RUNTIME_DIR=/tmp/lispterm-mock WAYLAND_DISPLAY=wayland-1 SWAYSOCK=/tmp/lispterm-mock/ipc
+  backend=wayland
+  printf 'XDG_RUNTIME_DIR=%s\0WAYLAND_DISPLAY=%s\0SWAYSOCK=%s\0' "$XDG_RUNTIME_DIR" "$WAYLAND_DISPLAY" "$SWAYSOCK" > "$art/mock-env"
+  audit_endpoint_file "$art/mock-env"
+  for bad in 'DISPLAY=:0' 'XAUTHORITY=/user/auth' 'DBUS_SESSION_BUS_ADDRESS=unix:/user/bus' 'XDG_RUNTIME_DIR=/run/user/1000' 'WAYLAND_DISPLAY=wayland-0' 'SWAYSOCK=/user/ipc'; do
+    cp "$art/mock-env" "$art/mock-bad-env"; printf '%s\0' "$bad" >> "$art/mock-bad-env"
+    if audit_endpoint_file "$art/mock-bad-env"; then echo "Endpoint accepted: ${bad%%=*}" >&2; exit 1; fi
+  done
+  backend=x11; export DISPLAY=:123
+  unset WAYLAND_DISPLAY SWAYSOCK
+  printf 'XDG_RUNTIME_DIR=%s\0DISPLAY=%s\0' "$XDG_RUNTIME_DIR" "$DISPLAY" > "$art/mock-env"
+  audit_endpoint_file "$art/mock-env"
+  printf 'DISPLAY=:0\0' >> "$art/mock-env"
+  if audit_endpoint_file "$art/mock-env"; then exit 1; fi
+)
+mkdir -p "$art/mock-fd"
+ln -s 'socket:[123]' "$art/mock-fd/4"
+printf 'Num RefCount Protocol Flags Type St Inode Path\n000: 2 0 10000 1 01 123 /private/socket\n001: 2 0 10000 1 01 456 /user/socket\n' > "$art/mock-unix"
+socket_inode_match 0 /private/socket "$art/mock-fd" "$art/mock-unix" > "$art/mock-inode-match"
+if socket_inode_match 0 /user/socket "$art/mock-fd" "$art/mock-unix"; then exit 1; fi
+if socket_inode_match 0 /missing/socket "$art/mock-fd" "$art/mock-unix"; then exit 1; fi
+# A matching pathname without an owned socket inode is not proof.
+rm "$art/mock-fd/4"; ln -s /private/socket "$art/mock-fd/4"
+if socket_inode_match 0 /private/socket "$art/mock-fd" "$art/mock-unix"; then exit 1; fi
+(
+  scale=2
+  printf '[{"name":"HEADLESS-1","active":true,"scale":2,"current_mode":{"width":2560,"height":1600}}]\n' > "$art/mock-outputs"
+  fixture_outputs "$art/mock-outputs"
+  for bad in '.[0].name="DP-1"' '.[0].scale=1' '.[0].current_mode.width=1280' '.[0].active=false'; do
+    jq "$bad" "$art/mock-outputs" > "$art/mock-bad-outputs"
+    if fixture_outputs "$art/mock-bad-outputs"; then exit 1; fi
+  done
+)
+(
+  # Never contend with the live GUI lock in non-GUI tests.
+  root=$art/mock-lock-root; mkdir -p "$root/.build"
+  export LISPTERM_GUI_LOCK_HELD=1
+  exec 9>&-
+  if fixture_lock 2>/dev/null; then echo 'Marker-only lock accepted' >&2; exit 1; fi
+  exec 9> "$root/.build/vttest-gui.lock"
+  if fixture_lock; then echo 'Unlocked FD9 accepted' >&2; exit 1; fi
+  unset LISPTERM_GUI_LOCK_HELD
+  fixture_lock
+  (fixture_lock) # Real inherited held FD, no nested flock.
+  LISPTERM_VTTEST_FUNCTIONS_ONLY=1 LISPTERM_GUI_LOCK_HELD=1 bash -c 'source tests/vttest-gate.sh; root=$1; fixture_lock' bash "$root"
+  if flock -n "$root/.build/vttest-gui.lock" true; then echo 'Lock was not held' >&2; exit 1; fi
+)
+printf 'PASS scale validation, endpoint poisoning, socket-inode join, headless outputs, inherited FD9 proof\n' > "$art/isolation-tests.log"
 export LISPTERM_SBCL=${LISPTERM_SBCL:-$root/.build/deps/bin/sbcl}
 export LISPTERM_HARNESS_TEST_ARTIFACTS="$art/fixtures-$(date +%s%N)/"
 export LISPTERM_VTTEST_ARTIFACTS="$LISPTERM_HARNESS_TEST_ARTIFACTS"
 scripts/sbcl --script tests/vttest-protocol-tests.lisp > "$art/protocol-tests.log" 2>&1
 scripts/sbcl --script tests/vttest-recorder-tests.lisp > "$art/recorder-tests.log" 2>&1
-bash -n tests/vttest-gate.sh tests/vttest-harness-tests.sh tests/verify.sh
+bash -n tests/vttest-gate.sh tests/vttest-harness-tests.sh tests/verify.sh tests/wayland-gate.sh
 # Retain a negative-control process; it is ours, but deliberately not in the
 # production cleanup ownership set. No existing process is inspected or signalled.
 bash -c 'trap "" TERM; while :; do sleep 10; done' & fixture_root=$!
@@ -57,5 +113,5 @@ for dir in vttest-x11.soyWA3 vttest-wayland.4pz8fm vttest-wayland.P7So6b; do
   fi
 done
 git diff --check
-cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log"
+cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log" "$art/isolation-tests.log"
 echo 'Offline/static/disposable harness checks passed; no GUI run.'
