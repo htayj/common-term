@@ -66,3 +66,8 @@ evidence. Generated logs, compositor sockets, scratch scripts and caches are
 ignored under =.build/= or test directories in =.git/=. Inspect final images
 for private content before committing them. No credentials, private configs
 or full environment dumps are required by these gates.
+
+The =vttest-x11= and =vttest-wayland= fixtures retain a new run directory and
+print its absolute path on exit. Use that path for the current run's evidence.
+The =vttest-BACKEND-latest= pointer is created only when absent; existing files,
+symlinks and directories are preserved, so a historical pointer may name an older run.

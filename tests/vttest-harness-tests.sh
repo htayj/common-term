@@ -12,6 +12,95 @@ printf 'ARTIFACTS %s\n' "$art"
 export LISPTERM_VTTEST_FUNCTIONS_ONLY=1
 source tests/vttest-gate.sh
 unset LISPTERM_VTTEST_FUNCTIONS_ONLY
+# Production pointer publication must never replace historical evidence.
+(
+  art=$art/pointer-controls; mkdir -p "$art"
+  pointer=$art/latest
+  fixture_latest_pointer "$pointer"
+  [[ $(cat "$pointer") == "$art" ]]
+  printf 'historical\n' > "$art/history"
+  for kind in regular symlink dangling directory; do
+    rm -rf -- "$pointer"
+    case $kind in
+      regular) cp "$art/history" "$pointer";;
+      symlink) ln -s "$art/history" "$pointer";;
+      dangling) ln -s "$art/absent" "$pointer";;
+      directory) mkdir "$pointer";;
+    esac
+    before=$(stat -c '%f|%u|%g|%s|%Y|%Z|%i' "$pointer")
+    fixture_latest_pointer "$pointer"
+    [[ $(stat -c '%f|%u|%g|%s|%Y|%Z|%i' "$pointer") == "$before" ]]
+    [[ $kind != regular ]] || cmp "$pointer" "$art/history"
+    [[ $kind != dangling || ! -e $art/absent ]]
+  done
+  if fixture_latest_pointer "$art/missing-parent/latest"; then exit 1; fi
+)
+printf 'PASS latest create-once and historical regular/symlink/dangling/directory preservation; publication error rejects\n' > "$art/pointer-tests.log"
+# Deterministic non-GUI shutdown windows against the production shell helpers.
+(
+  art=$art/shutdown-controls; mkdir -p "$art"
+  owned=(); audited=()
+  trap 'stop_owned > /dev/null 2>&1' EXIT
+  clear_session_endpoints
+  backend=x11; export DISPLAY=:136 XDG_RUNTIME_DIR=/tmp/lispterm-mock136
+  for status in 0 7; do
+    bash -c 'while [[ ! -f $1 ]]; do sleep .01; done; exit "$2"' bash "$art/release$status" "$status" & client=$!
+    remember "$client"; is_owned "$client"; audit_client_tree
+    # Reproduce exit precisely between the loop condition and the audit call.
+    is_owned "$client"; touch "$art/release$status"
+    wait "$client" || [[ $? == "$status" ]]
+    if audit_client_tree; then echo 'Startup accepted absent root' >&2; exit 1; fi
+    audit_client_tree allow-exit
+    if fixture_wait_client; then actual=0; else actual=$?; fi
+    [[ $actual == "$status" ]]
+  done
+  # No ownership record is not an observed shutdown, even for an absent PID.
+  unset 'owned[$client]'
+  if audit_client_tree allow-exit; then exit 1; fi
+  sleep 60 & client=$!; remember "$client"
+  token=${owned[$client]}; owned[$client]=stale
+  if audit_client_tree allow-exit; then echo 'Stale live root accepted' >&2; exit 1; fi
+  owned[$client]=$token
+  audit_client_tree allow-exit
+  # A live endpoint mismatch still fails, including a previously audited orphan.
+  DBUS_SESSION_BUS_ADDRESS=unix:/invalid/control sleep 60 & poisoned=$!; remember "$poisoned"
+  saved_client=$client; client=$poisoned
+  if audit_client_tree allow-exit; then echo 'Live poisoned root accepted' >&2; exit 1; fi
+  client=$saved_client
+  sleep 60 & descendant=$!; remember "$descendant"
+  ps() { if [[ $* == "-o pid= --ppid $client" ]]; then printf '%s\n' "$descendant"; fi; }
+  audit_client_tree
+  definition=$(declare -f audit_endpoint_file)
+  eval "${definition/audit_endpoint_file/original_audit_endpoint_file}"
+  audit_endpoint_file() {
+    if [[ $1 == /proc/$descendant/environ && ${vanish:-0} == 1 ]]; then
+      kill "$descendant"; wait "$descendant" 2>/dev/null || true
+    fi
+    original_audit_endpoint_file "$1"
+  }
+  vanish=1; audit_client_tree allow-exit
+  vanish=0
+  # Keep an audited descendant live after root exit and force a reader rejection.
+  descendant=$poisoned; audited[$descendant]=${owned[$descendant]}
+  kill "$client"; wait "$client" 2>/dev/null || true
+  if audit_client_tree allow-exit; then echo 'Live orphan endpoint mismatch ignored' >&2; exit 1; fi
+  stop_owned
+  wait "$poisoned" 2>/dev/null || true
+  trap - EXIT
+)
+# Exercise the production ERR reporter in a fresh errexit scope. Do not log command text.
+set +e
+(
+  set -Ee
+  art=$art/shutdown-controls
+  trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' ERR
+  bash -c 'exit 9'
+)
+error_status=$?
+set -e
+[[ $error_status == 9 ]]
+grep -Eq '^status=9 source=[^ ]+ line=[0-9]+ function=main$' "$art/shutdown-controls/shell-errors.log"
+printf 'PASS shutdown root0/7 and wait propagation, strict startup/identity/live endpoints, vanished descendant, live orphan, ERR status/location\n' > "$art/shutdown-tests.log"
 # Pure/mock isolation tests, with a real disposable lock but no GUI processes.
 fixture_scale x11 1; fixture_scale wayland 1; fixture_scale wayland 2
 for spec in 'x11 2' 'wayland 0' 'wayland 3' 'wayland 02' 'wayland 1.0' 'unknown 1'; do
@@ -171,5 +260,5 @@ for dir in vttest-x11.soyWA3 vttest-wayland.4pz8fm vttest-wayland.P7So6b; do
   fi
 done
 git diff --check
-cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log" "$art/isolation-tests.log"
+cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log" "$art/isolation-tests.log" "$art/pointer-tests.log" "$art/shutdown-tests.log"
 echo 'Offline/static/disposable harness checks passed; no GUI run.'

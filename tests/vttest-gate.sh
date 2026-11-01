@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Recorder v3: private fixtures, bounded ownership-based cleanup, explicit verdict mode.
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 # These functions are also sourced by the disposable non-GUI cleanup test.
@@ -128,15 +128,38 @@ audit_endpoint_file() {
   done < "$1"
   [[ $seen_runtime == 1 && $seen_display == 1 ]]
 }
+# Record locations/status only, never command text or environment values.
+fixture_error() {
+  printf 'status=%s source=%s line=%s function=%s\n' "$1" "${2##*/}" "$3" "$4" >> "$art/shell-errors.log"
+}
+fixture_wait_client() {
+  local code=0
+  wait "$client" || code=$?
+  printf 'client-wait pid=%s start=%s status=%s\n' "$client" "${owned[$client]:-unknown}" "$code" >> "$art/client-wait.log"
+  return "$code"
+}
+# Publish once, atomically. An existing file, symlink or directory is historical.
+fixture_latest_pointer() {
+  local pointer=$1
+  printf '%s\n' "$art" > "$art/latest-pointer.txt" || return 1
+  ln -T -- "$art/latest-pointer.txt" "$pointer" 2>/dev/null || [[ -e $pointer || -L $pointer ]]
+}
 audit_client_tree() {
   local pid child
-  is_owned "$client" || return 1
+  if ! is_owned "$client"; then
+    # Only polling after startup may accept a vanished, previously owned root.
+    # A live PID with a different start token is an ownership failure.
+    [[ ${1:-} == allow-exit && -v owned[$client] ]] && ! process_token "$client" > /dev/null 2>&1 || return 1
+  fi
   collect_tree "$client"
   # Audit the client subtree only, not the server or unrelated owned helpers.
-  local -A clients=(); local -a pending=("$client")
+  # Previously audited descendants may still be alive after the root exits.
+  local -A clients=(); local -a pending=("$client" "${!audited[@]}")
   while ((${#pending[@]})); do
     pid=${pending[0]}; pending=("${pending[@]:1}")
     is_owned "$pid" || continue
+    [[ ! -v clients[$pid] ]] || continue
+    collect_tree "$pid"
     clients[$pid]=1
     while read -r child; do [[ -z $child ]] || pending+=("$child"); done < <(ps -o pid= --ppid "$pid")
   done
@@ -185,7 +208,7 @@ export LISPTERM_VTTEST_TITLE="Lispterm-vttest-${art##*.}-$$"
 client='' server='' keyboard_holder='' runtime=''
 cleanup() {
   local code=$? pid token
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM ERR
   set +e
   # The compositor helper was launched by this fixture. Its exact private config
   # is a second identity check when startup failed before its PID was adopted.
@@ -204,16 +227,17 @@ cleanup() {
     if private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
   fi
   if [[ $stopped == 1 && $backend == x11 ]] && private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
+  fixture_latest_pointer "$root/.build/evidence/vttest-${backend}-latest" || code=1
   printf '%s\n' "$code" > "$art/harness.exit"
   # Hash all data and metadata after cleanup, with relative filenames.
   if ! (cd "$art"; find . -type f ! -name provenance.sha256 -print0 | sort -z | xargs -0 sha256sum > provenance.sha256); then
     code=1; printf '%s\n' "$code" > "$art/harness.exit"
   fi
-  printf '%s\n' "$art" > "$root/.build/evidence/vttest-${backend}-latest"
   echo "vttest $mode exit=$code: $art"
   exit "$code"
 }
 trap cleanup EXIT
+trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/verify.sh scripts/deps.nix "$art/"
@@ -307,7 +331,7 @@ end=$((SECONDS + ${LISPTERM_VTTEST_TIMEOUT:-1800}))
 while is_owned "$client"; do
   watchdog_check "$end"
   collect_tree "$client"
-  audit_client_tree || exit 1
+  audit_client_tree allow-exit || { fixture_error 1 "${BASH_SOURCE[0]}" "$LINENO" audit_client_tree; exit 1; }
   if [[ -f $art/capture-request ]]; then
     read -r name expected_width expected_height requested_scale extra < "$art/capture-request"
     [[ $name =~ ^[0-9]+-[a-z0-9_-]+$ && $expected_width =~ ^[0-9]+$ && $expected_height =~ ^[0-9]+$ ]]
@@ -358,7 +382,7 @@ while is_owned "$client"; do
   fi
   sleep .05
 done
-wait "$client"; client=''
+fixture_wait_client; client=''
 [[ -f $art/finished.sexp ]]
 check_mode=measure; [[ $mode != accept ]] || check_mode=accept
 scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$check_mode" "$art" > "$art/offline-check.log"

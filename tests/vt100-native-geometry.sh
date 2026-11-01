@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # C5 disposable native renderer fixture. This does not replace pinned 20-case vttest.
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 # Register each future-view command separately: commas end for_window registration.
@@ -70,7 +70,7 @@ export LISPTERM_NATIVE_TITLE="Lispterm-native-${art##*.}-$$"
 client='' server='' runtime=''
 cleanup() {
  local code=$? pid
- trap - EXIT INT TERM
+ trap - EXIT INT TERM ERR
  set +e
  if [[ -f $art/compositor/compositor.pid && -f $art/compositor/compositor.start ]]; then
   pid=$(cat "$art/compositor/compositor.pid")
@@ -86,12 +86,13 @@ cleanup() {
  exit "$code"
 }
 trap cleanup EXIT
+trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 printf 'backend=%s scale=%s font-size=%s mode=%s timeout=%s\n' "$backend" "$scale" "$font_size" "$mode" "$duration" > "$art/fixture.txt"
 printf 'command=' >> "$art/fixture.txt"; printf '%q ' "$0" "$backend" --scale "$scale" --font-size "$font_size" --mode "$mode" --timeout "$duration" >> "$art/fixture.txt"; echo >> "$art/fixture.txt"
 git rev-parse HEAD > "$art/run-head.txt"
-sha256sum "$LISPTERM_FONT" tests/vt100-native-geometry.* tests/vttest-protocol.lisp > "$art/source.sha256"
+sha256sum "$LISPTERM_FONT" tests/vt100-native-geometry.* tests/vttest-protocol.lisp tests/vttest-gate.sh > "$art/source.sha256"
 clear_session_endpoints
 if [[ $backend == x11 ]]; then
  runtime=$(mktemp -d /tmp/lispterm-x11.XXXXXX); chmod 700 "$runtime"; export XDG_RUNTIME_DIR=$runtime
@@ -162,10 +163,11 @@ capture_native() {
 }
 end=$((SECONDS+duration))
 while is_owned "$client"; do
- watchdog_check "$end"; fixture_isolation >> "$art/isolation-checks.txt"; audit_client_tree
+ watchdog_check "$end"; fixture_isolation >> "$art/isolation-checks.txt"
+ audit_client_tree allow-exit || { fixture_error 1 "${BASH_SOURCE[0]}" "$LINENO" audit_client_tree; exit 1; }
  if [[ -f $art/action-request ]]; then external_action; fi
  if [[ -f $art/capture-request ]]; then capture_native; fi
  sleep .03
 done
-wait "$client"
+fixture_wait_client
 [[ -f $art/completed.sexp ]]
