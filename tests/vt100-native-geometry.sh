@@ -38,7 +38,7 @@ native_action_ipc() {
  printf '%s\n' "$command" > "$prefix.command" || return 1
  timeout 5 "$LISPTERM_SWAYMSG" "$command" > "$prefix.reply.json" || return 1
  jq -es 'length==1 and (.[0]|type=="array" and length==1 and
-  (.[0]|type=="object" and .success==true and
+  (.[0]|type=="object" and .success==true and (has("error")|not) and
    ((has("parse_error")|not) or .parse_error==false)))' "$prefix.reply.json" > /dev/null
 }
 native_action_outputs() {
@@ -62,12 +62,16 @@ native_resize_wayland() {
  native_action_outputs "$prefix.outputs.json" || return 1
  read -r ax ay aw ah < <(jq -er '[.rect.x,.rect.y,.rect.width,.rect.height]|@tsv' <<< "$node") || return 1
  native_action_fit "$prefix.outputs.json" "$ax" "$ay" "$aw" "$ah" || return 1
+ # Preparation may retain the safe anchor from before a mode transition.
+ ax=${4:-$ax}; ay=${5:-$ay}
  native_action_fit "$prefix.outputs.json" "$ax" "$ay" "$w" "$h" || return 1
  is_owned "$client" && is_owned "$server" || return 1
  native_action_ipc "[con_id=$target] resize set width $w px height $h px" "$prefix.resize" || return 1
  window_identity || return 1
  cp "$art/current-tree.json" "$prefix.resized.tree.json" || return 1
  [[ $window == "$target" && $(jq -r .type <<< "$node") == floating_con ]] || return 1
+ native_action_outputs "$prefix.resized.outputs.json" || return 1
+ cmp -s <(jq -Sc . "$prefix.outputs.json") <(jq -Sc . "$prefix.resized.outputs.json") || return 1
  is_owned "$client" && is_owned "$server" || return 1
  native_action_ipc "[con_id=$target] move position $ax $ay" "$prefix.anchor" || return 1
  window_identity || return 1
@@ -78,6 +82,49 @@ native_resize_wayland() {
  [[ $px == "$ax" && $py == "$ay" ]] || return 1
  native_action_outputs "$prefix.after.outputs.json" || return 1
  native_action_fit "$prefix.after.outputs.json" "$px" "$py" "$pw" "$ph" || return 1
+ cmp -s <(jq -Sc . "$prefix.outputs.json") <(jq -Sc . "$prefix.after.outputs.json") || return 1
+ is_owned "$client" && is_owned "$server"
+}
+# Separate scoped operations: validate transport, reply, identity and ownership
+# after each command. An IPC ACK does not establish owner configure dispatch.
+native_mode_wayland() {
+ local prefix=$1 target=$window command index=0
+ shift
+ is_owned "$client" && is_owned "$server" || return 1
+ cp "$art/current-tree.json" "$prefix.before.tree.json" || return 1
+ native_action_outputs "$prefix.outputs.json" || return 1
+ for command in "$@"; do
+  index=$((index+1))
+  is_owned "$client" && is_owned "$server" || return 1
+  native_action_ipc "[con_id=$target] $command" "$prefix.step$index" || return 1
+  window_identity || return 1
+  cp "$art/current-tree.json" "$prefix.step$index.tree.json" || return 1
+  [[ $window == "$target" ]] || return 1
+  case $command in
+   'floating enable'|'border none'|'move position 0 0') [[ $(jq -r .type <<< "$node") == floating_con ]] || return 1;;
+   'floating disable'|'fullscreen enable') [[ $(jq -r .type <<< "$node") == con ]] || return 1;;
+  esac
+  is_owned "$client" && is_owned "$server" || return 1
+  native_action_outputs "$prefix.step$index.outputs.json" || return 1
+  cmp -s <(jq -Sc . "$prefix.outputs.json") <(jq -Sc . "$prefix.step$index.outputs.json") || return 1
+ done
+ is_owned "$client" && is_owned "$server"
+}
+native_prepare_retry() {
+ local w=$1 h=$2 prefix=$3 target=$window ax ay aw ah
+ is_owned "$client" && is_owned "$server" || return 1
+ cp "$art/current-tree.json" "$prefix.failed.tree.json" || return 1
+ native_action_outputs "$prefix.failed.outputs.json" || return 1
+ read -r ax ay aw ah < <(jq -er '[.rect.x,.rect.y,.rect.width,.rect.height]|@tsv' <<< "$node") || return 1
+ native_action_fit "$prefix.failed.outputs.json" "$ax" "$ay" "$aw" "$ah" || return 1
+ native_action_fit "$prefix.failed.outputs.json" "$ax" "$ay" "$w" "$h" || return 1
+ native_mode_wayland "$prefix.floating" 'fullscreen disable' 'floating enable' 'border none' || return 1
+ [[ $window == "$target" ]] || return 1
+ cmp -s <(jq -Sc . "$prefix.failed.outputs.json") <(jq -Sc . "$prefix.floating.outputs.json") || return 1
+ cmp -s <(jq -Sc . "$prefix.failed.outputs.json") <(jq -Sc . "$prefix.floating.step3.outputs.json") || return 1
+ native_resize_wayland "$w" "$h" "$prefix.restore" "$ax" "$ay" || return 1
+ cmp -s <(jq -Sc . "$prefix.failed.outputs.json") <(jq -Sc . "$prefix.restore.outputs.json") || return 1
+ cmp -s <(jq -Sc . "$prefix.failed.outputs.json") <(jq -Sc . "$prefix.restore.after.outputs.json") || return 1
  is_owned "$client" && is_owned "$server"
 }
 external_action() {
@@ -91,10 +138,13 @@ external_action() {
    [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]] || return 1
    if [[ $backend == x11 ]]; then timeout 5 xdotool windowsize --sync "$window" "$w" "$h" > "$prefix.json" || return 1
    else native_resize_wayland "$w" "$h" "$prefix" || return 1; fi;;
-  tiled) [[ $backend == wayland ]] || return 1
-   timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] floating disable, fullscreen enable" > "$prefix.json" || return 1;;
-  floating) [[ $backend == wayland ]] || return 1
-   timeout 5 "$LISPTERM_SWAYMSG" "[con_id=$window] fullscreen disable, floating enable, border none, move position 0 0" > "$prefix.json" || return 1;;
+  tiled) [[ $backend == wayland && -z $w && -z $h ]] || return 1
+   native_mode_wayland "$prefix" 'floating disable' 'fullscreen enable' || return 1;;
+  floating) [[ $backend == wayland && -z $w && -z $h ]] || return 1
+   native_mode_wayland "$prefix" 'fullscreen disable' 'floating enable' 'border none' 'move position 0 0' || return 1;;
+  prepare-retry)
+   [[ $backend == wayland && $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]] || return 1
+   native_prepare_retry "$w" "$h" "$prefix" || return 1;;
   *) return 1;;
  esac
  rm "$art/action-request" || return 1
@@ -114,7 +164,9 @@ font selector chooses the actual Terminus OTB strike; runtime dimensions use its
 reported metrics. Run each backend, Wayland scales1/2, and a second font strike.
 Refusal: private Wayland only, tiled/maximized request132 must reach :refused or
 :timed-out within15s with owner alive. That checkpoint is expected-refusal, NEVER
-ordinary success. Then floating retry (new epoch), tiled failure/cancel-adopt,
+ordinary success. Restore saved target while floating, await an owner-observed
+unconstrained configure/engine/PTY barrier, then retry once (same id/new epoch).
+External preparation is not recovery. Tiled failure/cancel-adopt,
 ordinary resize recovery and new DECCOLM are checked. Any other outcome fails.
 Single inherited FD9 requires exact held-lock proof. Endpoint failure has no
 fallback. Only remembered PID/start-token processes and private runtime dirs are

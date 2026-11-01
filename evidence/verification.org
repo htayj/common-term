@@ -86,3 +86,27 @@ action; both independent strict capture containment checks apply.
 The offline harness exercises these production helpers with a stateful
 center-preserving resize model, font-derived logical sizes and scales 1/2.
 These controls establish fixture behavior, not native compositor acceptance.
+
+* Native refusal retry preparation
+Freeze the live terminal failure's request id, epoch, grid and actual font
+metrics before leaving fullscreen. Use the explicit =prepare-retry= fixture
+action to disable fullscreen, enable floating, restore the saved target's
+metric-derived logical dimensions and retain the pre-action capture-safe
+anchor. Validate every separately scoped IPC transport and single successful
+reply, the exact owned con_id/title/PID/type/start tokens, and unchanged private
+output identity. Retain each command/reply and tree/output observation.
+
+After the shell ACK, await owner status with a newer configure generation and
+serial, unconstrained toplevel states, matching actual dimensions and engine/PTY
+target grid, and the same live terminal failure id/epoch/engine generation.
+External target preparation does not satisfy recovery readiness. Public retry
+requests the current engine grid; invoke it once after this barrier and require
+the original id, higher epoch, exact target, normal settlement and a new
+frame/commit before the recovery capture. The terminal and retry deadlines
+are each 15 seconds. Share the setup action's existing 15-second budget with
+its owner-observation barrier. Continue ordinary-failure, cancellation and adoption checks.
+
+The offline controls exercise ordering in both directions, old-floating-size
+adoption, terminal-phase target restoration, stale or constrained observations,
+strict IPC and ownership rejection, and genuine same-id/new-attempt settlement.
+Native compositor execution and primary PNG inspection establish native coverage.

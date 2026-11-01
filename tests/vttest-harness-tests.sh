@@ -71,6 +71,14 @@ fi
 printf '%s\n' "$*" >> "$base/operations"
 read -ra words <<< "$1"
 case ${words[1]:-} in
+  fullscreen)
+    kind=fullscreen-${words[2]}; cp "$state" "$state.tmp";;
+  floating)
+    kind=floating-${words[2]}
+    if [[ ${words[2]} == enable ]]; then
+      jq '.type="floating_con" | .rect={x:0,y:0,width:640,height:384}' "$state" > "$state.tmp"
+    else jq '.type="con"' "$state" > "$state.tmp"; fi;;
+  border) kind=border; cp "$state" "$state.tmp";;
   resize)
     kind=resize; w=${words[4]}; h=${words[7]}
     jq --argjson w "$w" --argjson h "$h" '
@@ -82,6 +90,16 @@ case ${words[1]:-} in
   *) exit 90;;
 esac
 mv "$state.tmp" "$state"
+if [[ $fault == title-$kind ]]; then
+  jq '.name="foreign"' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == type-$kind ]]; then
+  jq '.type="workspace"' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
+fi
+if [[ $fault == shrink-$kind || $fault == output-$kind ]]; then
+  jq --arg f "$fault" '.[] |= (if ($f|startswith("shrink")) then .rect.width=100 else .name="changed" end)' "$base/outputs.json" > "$base/outputs.tmp"
+  mv "$base/outputs.tmp" "$base/outputs.json"
+fi
 if [[ $fault == stale-$kind ]]; then
   jq '.id+=1' "$state" > "$state.tmp"; mv "$state.tmp" "$state"
 fi
@@ -100,6 +118,8 @@ fi
 case $fault in
   transport-$kind) exit 7;;
   false-$kind) echo '[{"success":false}]';;
+  error-$kind) echo '[{"success":true,"error":"rejected"}]';;
+  null-$kind) echo '[{"success":null}]';;
   parse-$kind) echo '[{"success":true,"parse_error":true}]';;
   malformed-$kind) echo '{';;
   empty-$kind) :;;
@@ -181,6 +201,68 @@ MOCK
   if native_action_fit "$art/outputs.json" 0 0 9999 416; then exit 1; fi
   if native_action_ipc '[con_id=5] move position 0 0' "$art/missing-parent/action"; then exit 1; fi
   printf 'PASS six metric/scale combinations, exact resize/anchor ordering, saved139 shift, nonzero anchor; 46 dispatcher rejection controls, IPC write failure; no ACK on failure\n' > "$art/tests.log"
+  # The floating model restores80x24; setup must explicitly recover saved target.
+  prep_reset() {
+    placement_reset "${1:-none}"
+    jq '.type="con" | .rect={x:0,y:0,width:1280,height:800}' "$art/state.json" > "$art/state.tmp"
+    mv "$art/state.tmp" "$art/state.json"
+    printf 'prepare-retry %s %s\n' "$((132*cw))" "$(((800/ch)*ch))" > "$art/action-request"
+  }
+  for scale in 1 2; do
+    for metrics in '7 14' '8 16' '9 18'; do
+      read -r cw ch <<< "$metrics"; prep_reset
+      external_action
+      [[ $(cat "$art/action-ack") == 'prepare-retry 5' ]]
+      printf '[con_id=5] fullscreen disable\n[con_id=5] floating enable\n[con_id=5] border none\n[con_id=5] resize set width %s px height %s px\n[con_id=5] move position 0 0\n' "$((132*cw))" "$(((800/ch)*ch))" > "$art/prep-expected-operations"
+      cmp "$art/operations" "$art/prep-expected-operations"
+      jq -e --argjson w "$((132*cw))" --argjson h "$(((800/ch)*ch))" '.id==5 and .type=="floating_con" and .rect=={x:0,y:0,width:$w,height:$h}' "$art/state.json" > /dev/null
+    done
+  done
+  scale=1; cw=8; ch=16; prep_checks=0
+  for step in fullscreen-disable floating-enable border resize anchor; do
+    for problem in transport false error null parse malformed empty arrayempty mixed two parsetype multiple object stale wrong title type duplicate shrink output; do
+      fault=$problem-$step; prep_reset "$fault"
+      if external_action; then echo "Accepted preparation fault: $fault" >&2; exit 1; fi
+      [[ ! -e $art/action-ack && -e $art/action-request ]]
+      cp "$art/operations" "$art/prep-fault-$fault.operations"
+      ((prep_checks+=1))
+    done
+  done
+  for fault in unsafe-anchor oversized-request stale-owner missing-owner write-failure; do
+    prep_reset
+    case $fault in
+      unsafe-anchor) jq '.rect.y=-16' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
+      oversized-request) printf 'prepare-retry 9999 800\n' > "$art/action-request";;
+      stale-owner) owned[$client]=stale;;
+      missing-owner) unset 'owned[$client]';;
+      write-failure) mkdir "$art/action-ack.tmp";;
+    esac
+    if external_action; then echo "Accepted preparation fault: $fault" >&2; exit 1; fi
+    [[ ! -e $art/action-ack ]]
+    if [[ $fault != write-failure ]]; then [[ ! -s $art/operations ]]; fi
+    rm -rf -- "$art/action-ack.tmp"; remember "$client"
+    ((prep_checks+=1))
+  done
+  prep_reset
+  jq '.rect.x=32 | .rect.width=1200' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json"
+  external_action
+  jq -e '.rect.x==32 and .rect.y==0 and .rect.width==1056 and .rect.height==800' "$art/state.json" > /dev/null
+  mkdir "$art/reply-write.reply.json"
+  before_write=$(wc -l < "$art/operations")
+  if native_action_ipc '[con_id=5] move position 0 0' "$art/reply-write"; then exit 1; fi
+  [[ $(wc -l < "$art/operations") == "$before_write" ]]
+  for mode in tiled floating; do
+    for problem in transport false mixed two multiple; do
+      if [[ $mode == tiled ]]; then step=floating-disable; else step=fullscreen-disable; fi
+      prep_reset "$problem-$step"; printf '%s\n' "$mode" > "$art/action-request"
+      if external_action; then exit 1; fi
+      [[ ! -e $art/action-ack && $(wc -l < "$art/operations") == 1 ]]
+      ((prep_checks+=1))
+    done
+  done
+  prep_reset; printf 'floating\n' > "$art/action-request"; external_action
+  prep_reset; printf 'tiled\n' > "$art/action-request"; external_action
+  printf 'PASS 6 preparation metric/scale combinations and %s failclosed dispatcher controls; target restore after modeled80x24; each scoped IPC validated, no ACK on failure\n' "$prep_checks" > "$art/preparation-tests.log"
 )
 # Deterministic non-GUI shutdown windows against the production shell helpers.
 (
