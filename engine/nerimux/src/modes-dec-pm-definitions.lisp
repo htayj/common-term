@@ -24,7 +24,23 @@
                 `(,(car s) ,@(caddr s)))
               specs))))))
 
+(defun set-column-mode (screen wide-p)
+  "DECCOLM executes synchronously, even when the requested width is unchanged."
+  (let ((columns (if wide-p 132 80)))
+    (screen-resize screen columns (screen-height screen))
+    (setf (screen-cells screen) (%make-blank-cells (* columns (screen-height screen)))
+          (screen-column-mode screen) wide-p
+          (screen-geometry-columns screen) columns
+          (screen-scroll-top screen) 0
+          (screen-scroll-bottom screen) (1- (screen-height screen))
+          (screen-cursor-x screen) 0 (screen-cursor-y screen) 0
+          (screen-pending-wrap screen) nil (screen-dirty-p screen) t)
+    (clrhash (screen-line-sizes screen))
+    (nerimux/terminal/types::%clear-all-line-wrapped screen)
+    (incf (screen-geometry-generation screen))))
+
 (define-dec-pm-rules
+  (3 ((set-column-mode screen t)) ((set-column-mode screen nil)))
   (2
    ((values)) ; DECANM can only be set with ESC < while in VT52 mode.
    ((setf (screen-vt52-mode screen) t

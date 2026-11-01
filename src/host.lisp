@@ -94,6 +94,10 @@
          (sb-thread:with-mutex ((session-lock session))
            (list :rows (lispterm.engine:rows (session-screen session))
                  :columns (lispterm.engine:columns (session-screen session))
+                 :engine-geometry-generation
+                 (nerimux/terminal/types:screen-geometry-generation (session-screen session))
+                 :pty-rows (session-pty-rows session) :pty-columns (session-pty-columns session)
+                 :geometry (copy-tree (session-geometry-status session))
                  :frames (session-frames session)
                 :blink-phase (session-blink-phase session)
                 :blink-visible (session-blink-visible session) :bytes-received (session-bytes-received session)
@@ -170,3 +174,11 @@
   (setf *hosts-lock* (sb-thread:make-mutex :name "saved lispterm registry"))
   (remhash (host-id host) *hosts*)
   host)
+
+(defun retry-geometry (host)
+  "Retry the current engine grid intent on the owner without replacing the PTY."
+  (call-host host :geometry-retry) host)
+(defun cancel-geometry (host)
+  "Release a geometry request and adopt the actual display grid, preserving content."
+  (call-host host :geometry-cancel) host)
+(export '(retry-geometry cancel-geometry))

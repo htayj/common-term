@@ -20,6 +20,7 @@ case $gate in
   scripts/sbcl --script tests/run-host-tests.lisp
   scripts/sbcl --script tests/run-vt100-input-tests.lisp
   scripts/sbcl --script tests/run-vt100-rendition-tests.lisp
+  scripts/sbcl --script tests/run-vt100-geometry-tests.lisp
   exec scripts/sbcl --script tests/run-host-input-tests.lisp ;;
  pty)
   scripts/sbcl --script tests/run-pty-tests.lisp
@@ -29,6 +30,7 @@ case $gate in
   scripts/sbcl --script tests/run-xkb-tests.lisp
   exec scripts/sbcl --script tests/run-x11-close-tests.lisp ;;
  host) exec scripts/sbcl --script tests/run-host-tests.lisp ;;
+ geometry) exec scripts/sbcl --script tests/run-vt100-geometry-tests.lisp ;;
  pty-spike)
   log=$(mktemp)
   trap 'rm -f "$log"' EXIT

@@ -30,11 +30,9 @@
   "RIS, ESC c: hard terminal reset.
    Clears the entire cell grid, homes the cursor, resets all SGR attributes,
    cursor visibility, and restores the scroll region to the full screen height."
-  (erase-region screen
-                0
-                0
-                (1- (screen-width screen))
-                (1- (screen-height screen)))
+  ;; RIS supersedes any pending DECCOLM request and restores the 80-column grid.
+  (set-column-mode screen nil)
+  (setf (screen-alt-cells screen) nil)
   (set-cursor screen 0 0)
   (reset-sgr-pen screen)
   (reset-terminal-modes screen))

@@ -15,6 +15,7 @@
 
 (defstruct (session (:constructor %make-session))
   pty screen
+  (geometry-generation 0) geometry-intent geometry-status pty-rows pty-columns
   (lock (sb-thread:make-mutex :name "lispterm screen"))
   (transport-state :open) process-state
   (bytes-received 0) (frames 0) (force-frame t) last-cursor last-title
@@ -24,7 +25,10 @@
   input-head input-tail (input-offset 0) (input-pending 0))
 
 (defun make-session (pty rows columns)
-  (%make-session :pty pty :screen (lispterm.engine:make-screen :rows rows :columns columns)))
+  (multiple-value-bind (pty-rows pty-columns)
+      (when pty (lispterm.pty:pty-window-size pty))
+    (%make-session :pty pty :screen (lispterm.engine:make-screen :rows rows :columns columns)
+                   :pty-rows pty-rows :pty-columns pty-columns)))
 
 (defun utf8 (text)
   (babel:string-to-octets text :encoding :utf-8))
@@ -83,6 +87,20 @@
         (setf (nerimux/terminal:screen-response-queue screen) nil)))
     t))
 
+(defun session-observe-geometry (session)
+  ;; Called with SESSION-LOCK after a complete engine feed. No second resize:
+  ;; characters following DECCOLM have already used the new stride.
+  (let* ((screen (session-screen session))
+         (generation (nerimux/terminal/types:screen-geometry-generation screen)))
+    (unless (= generation (session-geometry-generation session))
+      (let ((rows (lispterm.engine:rows screen))
+            (columns (lispterm.engine:columns screen)))
+        (lispterm.pty:pty-resize (session-pty session) rows columns)
+        (setf (session-pty-rows session) rows (session-pty-columns session) columns
+              (session-geometry-generation session) generation
+              (session-geometry-intent session) (list generation rows columns)
+              (session-force-frame session) t)))))
+
 (defun session-read-output (session)
   "Drain one input chunk and read one output chunk per scheduler iteration."
   (session-flush-input session)
@@ -100,6 +118,7 @@
              (setf (session-transport-state session) :open)
              (incf (session-bytes-received session) (length bytes))
              (lispterm.engine:feed (session-screen session) bytes)
+             (session-observe-geometry session)
              (setf (nerimux/terminal:screen-passthrough-queue (session-screen session)) nil
                    (nerimux/terminal:screen-clipboard-queue (session-screen session)) nil
                    (nerimux/terminal:screen-notification-queue (session-screen session)) nil))))
@@ -113,6 +132,7 @@
   (sb-thread:with-mutex ((session-lock session))
     (lispterm.pty:pty-resize (session-pty session) rows columns)
     (lispterm.engine:resize (session-screen session) rows columns)
+    (setf (session-pty-rows session) rows (session-pty-columns session) columns)
     (setf (session-force-frame session) t)))
 
 (defun session-event (session event)

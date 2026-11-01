@@ -82,17 +82,34 @@ per size generation. Busy old buffers survive resize until compositor release."
       (dotimes (x bw)
         (setf (cffi:mem-aref (shm-buffer-pointer buffer) :uint32 (+ x (* y bw)))
               (aref pixels (+ (floor x scale) (* (floor y scale) width))))))
-    (let ((callback (wire-id wire :callback
+    (let* ((geometry-request (wayland-state-geometry-request state))
+           (callback (wire-id wire :callback
                      (lambda (id opcode payload)
                        (declare (ignore opcode payload))
                        (remhash id (wire-handlers wire))
-                       (setf (wayland-state-frame-pending-p state) nil)))))
+                       (setf (wayland-state-frame-pending-p state) nil)
+                       (incf (wayland-state-frame-generation state))
+                       (setf (wayland-state-frame-request-id state)
+                             (and geometry-request (lispterm.display:geometry-request-id geometry-request))
+                             (wayland-state-frame-epoch state)
+                             (and geometry-request (lispterm.display::geometry-request-epoch geometry-request)))
+                       (protocol-geometry-frame state geometry-request width height)))))
       (wire-send wire (wayland-state-surface state) 3 callback)
       (wire-send wire (wayland-state-surface state) 8 scale)
+      (wire-send wire (wayland-state-xdg-surface state) 3 0 0 width height)
       (wire-send wire (wayland-state-surface state) 1 (shm-buffer-id buffer) 0 0)
       (wire-send wire (wayland-state-surface state) 2 0 0 width height)
       (setf (shm-buffer-busy-p buffer) t)
       (wire-send wire (wayland-state-surface state) 6)
+      (incf (wayland-state-commit-generation state))
+      (setf (wayland-state-committed-width state) width
+            (wayland-state-committed-height state) height
+            (wayland-state-committed-buffer-width state) bw
+            (wayland-state-committed-buffer-height state) bh
+            (wayland-state-committed-request-id state)
+            (and geometry-request (lispterm.display:geometry-request-id geometry-request))
+            (wayland-state-committed-epoch state)
+            (and geometry-request (lispterm.display::geometry-request-epoch geometry-request)))
       (setf (wayland-state-frame-pending-p state) t
             (wayland-state-redraw-p state) nil)) t))
 (defun protocol-close (state)

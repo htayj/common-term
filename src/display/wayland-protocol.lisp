@@ -4,6 +4,12 @@
   wire registry compositor shm wm seat keyboard surface xdg-surface toplevel
   (outputs (make-hash-table)) (entered-outputs nil) (scale 1)
   (width 800) (height 480) pending-width pending-height
+  pending-states states configure-serial (configure-generation 0)
+  committed-width committed-height committed-buffer-width committed-buffer-height
+  committed-request-id committed-epoch frame-request-id frame-epoch
+  (commit-generation 0) (frame-generation 0)
+  geometry-request geometry-next geometry-phase geometry-display
+  (normal-min-width 0) (normal-min-height 0) (normal-max-width 0) (normal-max-height 0)
   (configured-p nil) (closed-p nil) (frame-pending-p nil)
   (buffers nil) (generation 0) (event-sink (constantly nil))
   (resize-sink (constantly nil)) (redraw-p t) xkb
@@ -123,16 +129,8 @@
                 (wire-id wire :xdg-surface
                   (lambda (id opcode payload)
                     (when (= opcode 0)
-                      (wire-send wire id 4 (bytes-u32 payload 0)) ; ack_configure before attach
-                      (let ((w (wayland-state-pending-width state))
-                            (h (wayland-state-pending-height state)))
-                        (when (and w h (or (/= w (wayland-state-width state))
-                                          (/= h (wayland-state-height state))))
-                          (setf (wayland-state-width state) w (wayland-state-height state) h)
-                          (incf (wayland-state-generation state))
-                          (funcall resize-sink w h (wayland-state-scale state))))
-                      (setf (wayland-state-configured-p state) t
-                            (wayland-state-redraw-p state) t)))))
+                      (wire-send wire id 4 (bytes-u32 payload 0)) ; ACK before attach
+                      (protocol-configure state (bytes-u32 payload 0))))))
           (wire-send wire (wayland-state-wm state) 2 (wayland-state-xdg-surface state)
                      (wayland-state-surface state))
           (setf (wayland-state-toplevel state)
@@ -142,13 +140,18 @@
                     (case opcode
                       (0 (let ((w (signed32 (bytes-u32 payload 0)))
                                (h (signed32 (bytes-u32 payload 4))))
-                           (when (or (> w 16384) (> h 16384) (> (* (max 1 w) (max 1 h)) 67108864))
+                           (when (or (minusp w) (minusp h) (> w 16384) (> h 16384)
+                                     (> (* (max 1 w) (max 1 h)) 67108864))
                              (wire-error "unsafe configure dimensions" nil))
-                           ;; Zero means the client chooses its size, not a zero-sized allocation.
-                           (setf (wayland-state-pending-width state)
-                                 (if (plusp w) w (wayland-state-width state))
-                                 (wayland-state-pending-height state)
-                                 (if (plusp h) h (wayland-state-height state)))))
+                           ;; Keep zero dimensions until the terminating serial.
+                           (let ((length (bytes-u32 payload 8)))
+                             (unless (and (zerop (mod length 4)) (= (+ 12 length) (length payload)))
+                               (wire-error "invalid toplevel state array" nil))
+                             (setf (wayland-state-pending-states state)
+                                   (loop for offset from 12 below (+ 12 length) by 4
+                                         collect (bytes-u32 payload offset))))
+                           (setf (wayland-state-pending-width state) w
+                                 (wayland-state-pending-height state) h)))
                       (1 (setf (wayland-state-closed-p state) t)
                          (protocol-emit state :close))))))
           (wire-send wire (wayland-state-xdg-surface state) 1 (wayland-state-toplevel state))
@@ -162,3 +165,107 @@
             (protocol-pump state .05))
           (protocol-roundtrip state) state)
       (error (c) (protocol-close state) (error c)))))
+
+(defun protocol-size (state width height)
+  (unless (and (= width (wayland-state-width state)) (= height (wayland-state-height state)))
+    (setf (wayland-state-width state) width (wayland-state-height state) height)
+    (incf (wayland-state-generation state)))
+  (setf (wayland-state-redraw-p state) t)
+  (funcall (wayland-state-resize-sink state) width height (wayland-state-scale state)))
+(defun protocol-configure (state serial)
+  (let* ((r (or (wayland-state-geometry-next state) (wayland-state-geometry-request state)))
+         (w (wayland-state-pending-width state)) (h (wayland-state-pending-height state))
+         (states (copy-list (wayland-state-pending-states state))))
+    (setf (wayland-state-configure-serial state) serial
+          (wayland-state-states state) states
+          (wayland-state-configured-p state) t)
+    (incf (wayland-state-configure-generation state))
+    (protocol-size state
+                   (if (and w (plusp w)) w
+                       (if r (lispterm.display:geometry-request-width r) (wayland-state-width state)))
+                   (if (and h (plusp h)) h
+                       (if r (lispterm.display:geometry-request-height r) (wayland-state-height state))))
+    (protocol-emit state :resize
+                   :width (wayland-state-width state) :height (wayland-state-height state)
+                   :serial serial :states states :scale (wayland-state-scale state)
+                   :interactive-p (not (null (member 3 states))))
+    (when (and (wayland-state-geometry-request state) (intersection states '(1 2 3)))
+      (let ((display (wayland-state-geometry-display state)))
+        (lispterm.display:cancel-size-request display
+          (if (member 3 states) :cancelled :refused))))))
+
+(defun protocol-geometry-hints (state min-w min-h max-w max-h)
+  ;; Clear the old pair before installing conflicting dimensions: min <= max
+  ;; must hold for every intermediate request, not only the final commit.
+  (let ((wire (wayland-state-wire state)) (top (wayland-state-toplevel state)))
+    (wire-send wire top 8 0 0)
+    (wire-send wire top 7 0 0)
+    (wire-send wire top 7 max-w max-h)
+    (wire-send wire top 8 min-w min-h)))
+(defun protocol-geometry-close (state &optional settled-p)
+  "Release constraints on every exit and close the transaction behind a sync fence."
+  (when (and (wayland-state-geometry-request state)
+             (not (eq :closing (wayland-state-geometry-phase state))))
+    (let* ((r (wayland-state-geometry-request state))
+           (display (wayland-state-geometry-display state))
+           (wire (wayland-state-wire state)))
+      (setf (wayland-state-geometry-phase state) :closing)
+      (protocol-geometry-hints state
+        (wayland-state-normal-min-width state) (wayland-state-normal-min-height state)
+        (wayland-state-normal-max-width state) (wayland-state-normal-max-height state))
+      (wire-send wire (wayland-state-surface state) 6)
+      (let ((callback (wire-id wire :callback
+                        (lambda (id opcode payload)
+                          (declare (ignore opcode payload))
+                          (remhash id (wire-handlers wire))
+                          (when (eq r (wayland-state-geometry-request state))
+                            (setf (wayland-state-geometry-request state) nil
+                                  (wayland-state-geometry-phase state) nil)
+                            (when (and settled-p (lispterm.display:geometry-active-p display))
+                              (let ((compatible
+                                      (and (= (wayland-state-width state)
+                                              (lispterm.display:geometry-request-width r))
+                                           (= (wayland-state-height state)
+                                              (lispterm.display:geometry-request-height r))
+                                           (not (intersection (wayland-state-states state) '(1 2 3))))))
+                                (lispterm.display:geometry-result display r
+                                  (if compatible :settled :refused)
+                                  (if compatible :surface-compatible :configure-after-frame))))
+                            (protocol-geometry-start state))))))
+        (wire-send wire 1 0 callback)))))
+(defun protocol-geometry-start (state)
+  (when (and (not (wayland-state-geometry-request state))
+             (wayland-state-geometry-next state))
+    (let* ((r (wayland-state-geometry-next state))
+           (display (wayland-state-geometry-display state)))
+      (setf (wayland-state-geometry-next state) nil)
+      (if (intersection (wayland-state-states state) '(1 2 3))
+          (lispterm.display:geometry-result display r
+                                           :refused :constrained-toplevel)
+          (let ((w (lispterm.display:geometry-request-width r))
+                (h (lispterm.display:geometry-request-height r)))
+            (setf (wayland-state-geometry-request state) r
+                  (wayland-state-geometry-phase state) :await-frame)
+            (protocol-geometry-hints state w h w h)
+            ;; A floating client may choose a new surface size without waiting
+            ;; for a configure that the compositor is not required to send.
+            (protocol-size state w h)
+            (wire-send (wayland-state-wire state) (wayland-state-xdg-surface state) 3 0 0 w h)
+            (wire-send (wayland-state-wire state) (wayland-state-surface state) 6)
+            (lispterm.display:geometry-result display r
+                                             :surface-ready))))))
+(defun protocol-geometry-frame (state request width height)
+  (when (and request
+             (lispterm.display:geometry-current-p (wayland-state-geometry-display state) request)
+             (eq request (wayland-state-geometry-request state))
+             (eq :await-frame (wayland-state-geometry-phase state)))
+    (let* ((display (wayland-state-geometry-display state))
+           (compatible (and (= width (lispterm.display:geometry-request-width request))
+                            (= height (lispterm.display:geometry-request-height request))
+                            (= width (wayland-state-width state))
+                            (= height (wayland-state-height state))
+                            (not (intersection (wayland-state-states state) '(1 2 3))))))
+      (when compatible
+        (incf (lispterm.display:display-presentation-generation display))
+        (lispterm.display:geometry-result display request :closing))
+      (protocol-geometry-close state compatible))))

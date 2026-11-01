@@ -9,7 +9,11 @@
 
 (defstruct text-event text)
 
-(defstruct resize-event columns rows width height)
+(defstruct resize-event
+  (columns nil :read-only t) (rows nil :read-only t)
+  (width nil :read-only t) (height nil :read-only t)
+  (serial nil :read-only t) (states nil :read-only t)
+  (scale 1 :read-only t) (interactive-p nil :read-only t))
 
 (defstruct close-event)
 

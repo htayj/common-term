@@ -12,8 +12,7 @@
    overlapping top-left rectangle of content.  Resets the scroll region to
    the full new height and clamps the cursor into bounds.
 
-   Alt-cells geometry is not resized; callers that need alt-screen consistency
-   should exit alt-screen mode before resizing.
+   Saved alternate cells use the same stride and are resized with the active grid.
 
    Callers that share the screen with a reader thread must hold SCREEN's
    lock; this function does no locking of its own."
@@ -23,6 +22,15 @@
   (let* ((old-width  (screen-width  screen))
          (old-height (screen-height screen))
          (old-cells  (screen-cells  screen)))
+    (when (screen-alt-cells screen)
+      (let ((saved (%make-blank-cells (* new-width new-height))))
+        (dotimes (y (min old-height new-height))
+          (dotimes (x (min old-width new-width))
+            (setf (aref saved (+ (* y new-width) x))
+                  (aref (screen-alt-cells screen) (+ (* y old-width) x)))))
+        (setf (screen-alt-cells screen) saved
+              (screen-alt-cursor-x screen) (min (screen-alt-cursor-x screen) (1- new-width))
+              (screen-alt-cursor-y screen) (min (screen-alt-cursor-y screen) (1- new-height)))))
     (setf (screen-cells  screen) (%make-blank-cells (* new-width new-height))
           (screen-width  screen) new-width
           (screen-height screen) new-height)

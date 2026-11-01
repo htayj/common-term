@@ -1,0 +1,5 @@
+(load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
+(asdf:load-system "lispterm")
+(load (merge-pathnames "wayland-buffer-lifecycle-tests.lisp" *load-truename*))
+(load (merge-pathnames "vt100-geometry-tests.lisp" *load-truename*))
+(lispterm.geometry.tests:run-tests)

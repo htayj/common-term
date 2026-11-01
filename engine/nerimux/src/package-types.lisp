@@ -9,6 +9,9 @@
     pure grid access.  Owns no behaviour beyond allocation and slot access; every
     mutation lives in nerimux/terminal/actions.")
   (:export
+   #:screen-geometry-generation
+   #:screen-geometry-columns
+   #:screen-column-mode
    #:+attr-bold+
    #:+attr-dim+
    #:+attr-reverse+

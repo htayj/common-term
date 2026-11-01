@@ -2,6 +2,10 @@
 
 (defstruct (screen (:constructor %make-screen))
   "Virtual terminal screen: cursor, cell grid, and CPS parser continuation."
+  ;; Monotonic intent, independent of actual user-resized grid dimensions.
+  (geometry-generation 0 :type integer)
+  (geometry-columns nil :type (or null fixnum))
+  (column-mode nil :type boolean)
   (width    +default-screen-width+  :type fixnum)
   (height   +default-screen-height+ :type fixnum)
   (cells    #() :type simple-vector)

@@ -3,6 +3,7 @@
 
 (defstruct (host (:constructor %make-host))
   id session configuration thread display effective-backend
+  geometry-sent-generation
   (lock (sb-thread:make-mutex :name "lispterm host"))
   (control-lock (sb-thread:make-mutex :name "lispterm lifecycle"))
   (state :detached) commands (error-ring nil) (generation 0) (stop-p nil))
@@ -38,7 +39,11 @@
       (error (condition)
         (set-host-state host :detached)
         (error condition)))
-    (setf (host-display host) nil))
+    (let ((session (host-session host)))
+      (sb-thread:with-mutex ((session-lock session))
+        (setf (session-geometry-status session)
+              (ltd:geometry-status (host-display host)))))
+    (setf (host-display host) nil (host-geometry-sent-generation host) nil))
   (set-host-state host :detached))
 
 (defun window-open (host)
@@ -70,11 +75,18 @@
     (when (and display (eq (host-state-value host) :attached))
       (restart-case
           (progn
+            (window-geometry-intent host display)
             (dolist (event (ltd:poll-events display :timeout 0))
-              (if (typep event 'ltd:close-event) (window-close host)
-                  (session-event (host-session host) event)))
+              (cond ((typep event 'ltd:close-event) (window-close host))
+                    ((typep event 'ltd:resize-event)
+                     (window-geometry-event host display event))
+                    (t (session-event (host-session host) event))))
             (when (eq (host-state-value host) :attached)
-              (render-session (host-session host) display)))
+              (ltd:geometry-tick display)
+              (render-session (host-session host) display)
+              (sb-thread:with-mutex ((session-lock (host-session host)))
+                (setf (session-geometry-status (host-session host))
+                      (append (ltd:geometry-status display) (ltd:display-metrics display))))))
         (reopen () :report "Replace the display and keep the PTY session." (window-open host))
         (detach () :report "Close the window, retaining the terminal session." (window-close host))
         (abort () :report "Stop this display iteration." nil)))))
@@ -85,6 +97,17 @@
     (:detach (window-close host))
     (:input (session-write (host-session host) (host-command-argument command)))
     (:event (session-event (host-session host) (host-command-argument command)))
+    (:geometry-retry
+     (let* ((session (host-session host)) (display (host-display host)))
+       (sb-thread:with-mutex ((session-lock session))
+         (ltd:request-grid-size display (lispterm.engine:columns (session-screen session))
+                                (lispterm.engine:rows (session-screen session))
+                                (session-geometry-generation session))
+         (setf (session-force-frame session) t))))
+    (:geometry-cancel
+     (let ((display (host-display host)))
+       (ltd:cancel-size-request display)
+       (session-resize (host-session host) (ltd:display-rows display) (ltd:display-columns display))))
     (:invalidate
      (sb-thread:with-mutex ((session-lock (host-session host)))
        (setf (session-force-frame (host-session host)) t)))
@@ -165,3 +188,31 @@
         (error 'host-timeout :operation operation :detail "Owner did not finish within the bounded wait")))
     (when (host-command-error command) (error (host-command-error command)))
     (host-command-result command)))
+
+(defun window-geometry-intent (host display)
+  (let* ((session (host-session host))
+         (intent (sb-thread:with-mutex ((session-lock session))
+                   (list (session-geometry-generation session)
+                         (lispterm.engine:rows (session-screen session))
+                         (lispterm.engine:columns (session-screen session))))))
+    (unless (eql (first intent) (host-geometry-sent-generation host))
+      (destructuring-bind (generation rows columns) intent
+        ;; A fresh native open already requested the initial dimensions.
+        (unless (and (zerop generation)
+                     (= columns (ltd:display-columns display)) (= rows (ltd:display-rows display)))
+          (ltd:request-grid-size display columns rows generation))
+        (setf (host-geometry-sent-generation host) generation)))))
+
+(defun window-geometry-event (host display event)
+  (sb-thread:with-mutex ((session-lock (host-session host)))
+    (setf (session-force-frame (host-session host)) t))
+  (cond ((ltd:resize-event-interactive-p event)
+         (ltd:cancel-size-request display)
+         (session-event (host-session host) event))
+        ;; While a transaction is active, dimensions do not prove configure
+        ;; causality, so the engine and PTY keep the requested grid. Terminal
+        ;; phases (:refused, :timed-out) are over: later configures report the
+        ;; actual window and resize the grid, preserving content. The failed
+        ;; request keeps its phase, so its late settlement is still ignored.
+        ((ltd:geometry-active-p display) nil)
+        (t (session-event (host-session host) event))))
