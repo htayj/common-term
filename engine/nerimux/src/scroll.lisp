@@ -155,11 +155,13 @@
 
 (defun decstbm (screen top bottom)
   "DECSTBM, set the vertical scroll region.
-   TOP and BOTTOM are 0-based inclusive row indices.  The cursor is homed
-   to (0,0) after a valid set."
+   TOP and BOTTOM are 0-based inclusive row indices.  After a valid set,
+   home to column 0 and the top margin in origin mode, otherwise row 0."
   (let ((clamped-top (max 0 top))
         (clamped-bottom (min (1- (screen-height screen)) bottom)))
     (when (< clamped-top clamped-bottom)
       (setf (screen-scroll-top screen) clamped-top
             (screen-scroll-bottom screen) clamped-bottom)
-      (set-cursor screen 0 0))))
+      (set-cursor screen 0 (if (screen-origin-mode screen)
+                               (screen-scroll-top screen)
+                               0)))))

@@ -71,3 +71,65 @@
                   (:check-row 1 "DD")
                   (:row-blank 2)
                   (:row-blank 3)))))
+
+
+(describe "terminal-suite/decstbm-origin-home"
+
+  (it "homes-to-new-top-margin-in-origin-mode"
+    (with-screen (s 10 8)
+      (feed s (esc "[2;7r"))
+      (feed s (esc "[?6h"))
+      (feed s (esc "[3;5H"))
+      (check-cursor s 4 3)
+      (feed s (esc "[4;8r"))
+      (expect (nerimux/terminal/types:screen-origin-mode s))
+      (expect (= 3 (nerimux/terminal/types:screen-scroll-top s)))
+      (expect (= 7 (nerimux/terminal/types:screen-scroll-bottom s)))
+      (check-cursor s 0 3)))
+
+  (it "homes-to-screen-top-in-absolute-mode"
+    (with-screen (s 10 8)
+      (feed s (esc "[2;7r"))
+      (feed s (esc "[?6h"))
+      (feed s (esc "[?6l"))
+      (feed s (esc "[3;5H"))
+      (check-cursor s 4 2)
+      (feed s (esc "[4;8r"))
+      (expect (not (nerimux/terminal/types:screen-origin-mode s)))
+      (expect (= 3 (nerimux/terminal/types:screen-scroll-top s)))
+      (expect (= 7 (nerimux/terminal/types:screen-scroll-bottom s)))
+      (check-cursor s 0 0)))
+
+  (it "direct-action-homes-to-new-top-margin-in-origin-mode"
+    (with-screen (s 10 8)
+      (nerimux/terminal/actions:decstbm s 1 6)
+      (setf (nerimux/terminal/types:screen-origin-mode s) t)
+      (nerimux/terminal/actions:set-cursor s 4 5)
+      (nerimux/terminal/actions:decstbm s 3 7)
+      (expect (= 3 (nerimux/terminal/types:screen-scroll-top s)))
+      (expect (= 7 (nerimux/terminal/types:screen-scroll-bottom s)))
+      (check-cursor s 0 3)))
+
+  (it "places-vttest-relative-origin-sentences-on-bottom-two-rows"
+    ;; vttest main.c do_scrolling: DECOM is active before clear/DECSTBM/LF.
+    (with-screen (s 80 24)
+      (let ((bottom "Origin mode test. This line should be at the bottom of the screen.")
+            (above "This line should be the one above the bottom of the screen. Push <RETURN>"))
+        (feed s (esc "[?6h"))
+        (feed s (esc "[2J"))
+        (feed s (esc "[23;24r"))
+        (expect (nerimux/terminal/types:screen-origin-mode s))
+        (expect (= 22 (nerimux/terminal/types:screen-scroll-top s)))
+        (expect (= 23 (nerimux/terminal/types:screen-scroll-bottom s)))
+        (check-cursor s 0 22)
+        (feed s (string #\Linefeed))
+        (check-cursor s 0 23)
+        (feed s bottom)
+        (check-cursor s (length bottom) 23)
+        (feed s (esc "[1;1H"))
+        (check-cursor s 0 22)
+        (feed s above)
+        (check-cursor s (length above) 22)
+        ;; Include all 80 cells, including the untouched trailing blanks.
+        (check-row s 23 (format nil "~80A" bottom))
+        (check-row s 22 (format nil "~80A" above))))))
