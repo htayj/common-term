@@ -37,7 +37,13 @@
            (cursor (list (lispterm.engine:cursor-row screen)
                          (lispterm.engine:cursor-column screen)
                          (nerimux/terminal:screen-cursor-visible screen)))
-           (dirty (or (session-force-frame session) (lispterm.engine:dirty-p screen)))
+           ;; A matching geometry reply may arrive after engine damage was
+           ;; drawn, without a resize event. Submit its frame before closing.
+           (request (ltd:display-geometry-request display))
+           (geometry-ready (and request (ltd:geometry-current-p display request)
+                                (eq :surface-ready (ltd::geometry-request-phase request))))
+           (dirty (or (session-force-frame session) (lispterm.engine:dirty-p screen)
+                      geometry-ready))
            (cursor-changed (not (equal cursor (session-last-cursor session))))
            (title (nerimux/terminal:screen-title screen))
            (phase (session-blink-phase session))
