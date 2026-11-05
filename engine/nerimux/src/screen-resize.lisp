@@ -36,14 +36,12 @@
           (screen-height screen) new-height)
     (%copy-overlapping-cells screen old-cells old-width
                              (min old-width new-width) (min old-height new-height))
-    ;; Retain only visible row designations, and discard characters beyond a
-    ;; doubled row's new logical margin so growing again cannot resurrect them.
+    ;; Keep the physical overlap, including hidden cells on doubled rows.
+    ;; Row designations outside the new height have no surviving content.
     (maphash (lambda (row size)
                (declare (ignore size))
-               (if (>= row new-height)
-                   (remhash row (screen-line-sizes screen))
-                   (loop for col from (max 1 (floor new-width 2)) below new-width
-                         do (setf (screen-cell screen col row) (blank-cell)))))
+               (when (>= row new-height)
+                 (remhash row (screen-line-sizes screen))))
              (screen-line-sizes screen))
     (setf (screen-scroll-top    screen) 0
           (screen-scroll-bottom screen) (1- new-height)

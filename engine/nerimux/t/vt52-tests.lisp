@@ -260,7 +260,7 @@
       (feed s (esc "#6"))
       (check-cursor s 5 0)
       (expect (char= #\6 (gethash 0 (nerimux/terminal/types:screen-line-sizes s))))
-      (expect (string= "abcdef      " (row-string s 0)))
+      (expect (string= "abcdefghijkl" (row-string s 0)))
       (feed s (csi "3;1" #\H))
       (feed s (esc "8"))
       (check-cursor s 5 0)
@@ -269,7 +269,7 @@
       (expect (char= #\£ (char-at s 5 0)))
       (feed s (esc "#5"))
       (expect (null (gethash 0 (nerimux/terminal/types:screen-line-sizes s))))
-      (expect (string= "      " (row-string s 0 :start 6)))))
+      (expect (string= "abcde£ghijkl" (row-string s 0)))))
 
   (it "clamps DECRC to resized destination rows and retains the saved charset"
     (with-screen (s 12 4)

@@ -11,13 +11,9 @@
         (min (screen-cursor-x screen) (1- (row-columns screen)))))
 
 (defun designate-line-size (screen size)
-  "Designate the current row; discard the right half on single-to-double changes."
-  (let* ((row (screen-cursor-y screen)) (sizes (screen-line-sizes screen))
-         (previous (gethash row sizes)))
+  "Designate the current row, retaining physical cells hidden by double width."
+  (let* ((row (screen-cursor-y screen)) (sizes (screen-line-sizes screen)))
     (if size (setf (gethash row sizes) size) (remhash row sizes))
-    (when (and size (null previous))
-      (loop for col from (row-columns screen row) below (screen-width screen)
-            do (setf (screen-cell screen col row) (blank-cell))))
     (clamp-row-cursor screen)
     (setf (screen-pending-wrap screen) nil (screen-dirty-p screen) t)))
 (defun %copy-row (screen dst-row src-row)
