@@ -1,0 +1,32 @@
+[0c[?1l[?3l[?4l[?5l[?6l[?7h[?8l[?40h[?45l[r[0m[2J[3;10HVT100 test program, version 2.7 (20251205)[4;10HLine speed 38400bd [5;10HChoose test type:
+[6;1H[0J
+          0. Exit
+          1. Test of cursor movements
+          2. Test of screen features
+          3. Test of character sets
+          4. Test of double-sized characters
+          5. Test of keyboard
+          6. Test of terminal reports
+          7. Test of VT52 mode
+          8. Test of VT102 features (Insert/Delete Char/Line)
+          9. Test of known bugs
+          10. Test of reset and self-test
+          11. Test non-VT100 (e.g., VT220, XTERM) terminals
+          12. Modify test-parameters
+
+          Enter choice number (0 - 12): 5
+[2J[2J[3;10HMenu 5: Keyboard Tests[5;10HChoose test type:
+[6;1H[0J
+          0. Exit
+          1. LED Lights
+          2. Auto Repeat
+          3. Keyboard Layout
+          4. Cursor Keys
+          5. Numeric Keypad
+          6. Editing Keypad
+          7. Function Keys
+          8. AnswerBack
+          9. Control Keys
+
+          Enter choice number (0 - 9): 5
+[2J[2J[3;1H[7mESC[m[3;7H[7m1[m[3;8H[7m![m[3;12H[7m2[m[3;13H[7m@[m[3;17H[7m3[m[3;18H[7m#[m[3;22H[7m4[m[3;23H[7m$[m[3;27H[7m5[m[3;28H[7m%[m[3;32H[7m6[m[3;33H[7m^[m[3;37H[7m7[m[3;38H[7m&[m[3;42H[7m8[m[3;43H[7m*[m[3;47H[7m9[m[3;48H[7m([m[3;52H[7m0[m[3;53H[7m)[m[3;57H[7m-[m[3;58H[7m_[m[3;62H[7m=[m[3;63H[7m+[m[3;67H[7m`[m[3;68H[7m~[m[3;71H[7mBS[m[5;1H[7m TAB [m[5;9H[7mq[m[5;10H[7mQ[m[5;14H[7mw[m[5;15H[7mW[m[5;19H[7me[m[5;20H[7mE[m[5;24H[7mr[m[5;25H[7mR[m[5;29H[7mt[m[5;30H[7mT[m[5;34H[7my[m[5;35H[7mY[m[5;39H[7mu[m[5;40H[7mU[m[5;44H[7mi[m[5;45H[7mI[m[5;49H[7mo[m[5;50H[7mO[m[5;54H[7mp[m[5;55H[7mP[m[5;59H[7m[[m[5;60H[7m{[m[5;64H[7m][m[5;65H[7m}[m[5;72H[7mDEL[m[7;11H[7ma[m[7;12H[7mA[m[7;16H[7ms[m[7;17H[7mS[m[7;21H[7md[m[7;22H[7mD[m[7;26H[7mf[m[7;27H[7mF[m[7;31H[7mg[m[7;32H[7mG[m[7;36H[7mh[m[7;37H[7mH[m[7;41H[7mj[m[7;42H[7mJ[m[7;46H[7mk[m[7;47H[7mK[m[7;51H[7ml[m[7;52H[7mL[m[7;56H[7m;[m[7;57H[7m:[m[7;61H[7m'[m[7;62H[7m"[m[7;66H[7mRETN[m[7;72H[7m\[m[7;73H[7m|[m[9;13H[7mz[m[9;14H[7mZ[m[9;18H[7mx[m[9;19H[7mX[m[9;23H[7mc[m[9;24H[7mC[m[9;28H[7mv[m[9;29H[7mV[m[9;33H[7mb[m[9;34H[7mB[m[9;38H[7mn[m[9;39H[7mN[m[9;43H[7mm[m[9;44H[7mM[m[9;48H[7m,[m[9;49H[7m<[m[9;53H[7m.[m[9;54H[7m>[m[9;58H[7m/[m[9;59H[7m?[m[9;70H[7mLF[m[11;14H[7m                SPACE BAR                [m[1;57HUP[1;62HDN[1;67HLT[1;72HRT[22;1H[13;60H[7mPF1[m[13;64H[7mPF2[m[13;68H[7mPF3[m[13;72H[7mPF4[m[15;60H[7m 7 [m[15;64H[7m 8 [m[15;68H[7m 9 [m[15;72H[7m - [m[17;60H[7m 4 [m[17;64H[7m 5 [m[17;68H[7m 6 [m[17;72H[7m , [m[19;60H[7m 1 [m[19;64H[7m 2 [m[19;68H[7m 3 [m[21;60H[7m   0   [m[21;68H[7m . [m[21;72H[7mENT[m[21;1H<ANSI Numeric mode>                    [22;1H[0K[22;1HPress each function key. Finish with TAB.[23;1H>[23;1H[0K[23;1H[7m 1 [m[7m (Numeric 1 key) [m[19;60H 1 [23;1H>[23;1H[0K[23;1H[7m 2 [m[7m (Numeric 2 key) [m[19;64H 2 [23;1H>[23;1H[0K[23;1H[7m <13> [m[7m (ENTER key) [m[21;72HENT[23;1H>[23;1H[0K[23;1H[7m <9> [m[13;60H[7mPF1[m[13;64H[7mPF2[m[13;68H[7mPF3[m[13;72H[7mPF4[m[15;60H[7m 7 [m[15;64H[7m 8 [m[15;68H[7m 9 [m[15;72H[7m - [m[17;60H[7m 4 [m[17;64H[7m 5 [m[17;68H[7m 6 [m[17;72H[7m , [m[19;60H[7m 1 [m[19;64H[7m 2 [m[19;68H[7m 3 [m[21;60H[7m   0   [m[21;68H[7m . [m[21;72H[7mENT[m[21;1H<ANSI Application mode>                    [22;1H[0K[22;1HPress each function key. Finish with TAB.[23;1H=[23;1H[0K[23;1H[7m <27> O q [m[7m (Numeric 1 key) [m[19;60H 1 [23;1H=[23;1H[0K[23;1H[7m <27> O r [m[7m (Numeric 2 key) [m[19;64H 2 [23;1H=[23;1H[0K[23;1H[7m <27> O M [m[7m (ENTER key) [m[21;72HENT[23;1H=[23;1H[0K[23;1H[7m <9> [m[13;60H[7mPF1[m[13;64H[7mPF2[m[13;68H[7mPF3[m[13;72H[7mPF4[m[15;60H[7m 7 [m[15;64H[7m 8 [m[15;68H[7m 9 [m[15;72H[7m - [m[17;60H[7m 4 [m[17;64H[7m 5 [m[17;68H[7m 6 [m[17;72H[7m , [m[19;60H[7m 1 [m[19;64H[7m 2 [m[19;68H[7m 3 [m[21;60H[7m   0   [m[21;68H[7m . [m[21;72H[7mENT[m[21;1H<VT52 Numeric mode>                    [22;1H[0K[22;1HPress each function key. Finish with TAB.[23;1H[?2l><[23;1H[0K[23;1H[7m 1 [m[7m (Numeric 1 key) [m[19;60H 1 [23;1H[?2l><[23;1H[0K[23;1H[7m 2 [m[7m (Numeric 2 key) [m[19;64H 2 [23;1H[?2l><[23;1H[0K[23;1H[7m <13> [m[7m (ENTER key) [m[21;72HENT[23;1H[?2l><[23;1H[0K[23;1H[7m <9> [m[13;60H[7mPF1[m[13;64H[7mPF2[m[13;68H[7mPF3[m[13;72H[7mPF4[m[15;60H[7m 7 [m[15;64H[7m 8 [m[15;68H[7m 9 [m[15;72H[7m - [m[17;60H[7m 4 [m[17;64H[7m 5 [m[17;68H[7m 6 [m[17;72H[7m , [m[19;60H[7m 1 [m[19;64H[7m 2 [m[19;68H[7m 3 [m[21;60H[7m   0   [m[21;68H[7m . [m[21;72H[7mENT[m[21;1H<VT52 Application mode>                    [22;1H[0K[22;1HPress each function key. Finish with TAB.[23;1H[?2l=<[23;1H[0K[23;1H[7m <27> ? q [m[7m (Numeric 1 key) [m[19;60H 1 [23;1H[?2l=<[23;1H[0K[23;1H[7m <27> ? r [m[7m (Numeric 2 key) [m[19;64H 2 [23;1H[?2l=<[23;1H[0K[23;1H[7m <27> ? M [m[7m (ENTER key) [m[21;72HENT[23;1H[?2l=<[23;1H[0K[23;1H[7m <9> [m>[23;1H[0KPush <RETURN>
