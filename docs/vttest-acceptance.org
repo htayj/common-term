@@ -1,0 +1,132 @@
+#+title: Minimal vttest acceptance records, version 1
+
+* Scope and files
+
+Use =tests/vttest-acceptance.lisp= independently of the application. It requires
+ASDF/UIOP and =sha256sum=. It reads data, validates supplied claims and hashes,
+and writes records. It does not run tests, inspect pixels, infer outcomes, or
+verify mission completion. Commit the source separately from generated evidence.
+
+Canonical files are =.build/evidence/vttest/ACCEPTANCE.sexp= and
+=.build/evidence/vttest/FINAL-REVIEW.sexp=. Keep fresh immutable attempt candidates
+elsewhere under =.build/evidence/=. Retain prior attempts, including failures.
+All evidence paths are absolute existing file paths; SHA-256 covers actual bytes.
+Files are single keyword property lists, UTF-8, readable deterministic printing.
+Read with =*read-eval*=NIL, a standard readtable, and exactly one form.
+
+* Schema
+
+All fields below are required unless called optional. Unknown properties,
+duplicate keys/IDs, malformed structures and unknown results are errors.
+
+Both kinds contain:
+- =:schema-version= 1, =:kind= =:acceptance= or =:final-review=.
+- Nonempty strings =:mission-id= and =:attempt-id=.
+- =:source-commit= and =:source-tree=: 40 hexadecimal characters each.
+  Supply the tested source identity, not a generated-evidence commit identity.
+- =:checks=: nonempty list of check plists described below.
+- =:required-checks=: nonempty, unique list of check ID strings, all present.
+  For acceptance, include required mechanical and static-visual coverage for
+  each of =:x11= and =:wayland=. For final review, include a required
+  =:independent-review= check with NIL backend. Declare every acceptance criterion
+  needed for the attempt in this list, including unresolved ones. The validator
+  enforces these minimum scope/backend slots, not the completeness of an external
+  test inventory; the independent reviewer checks that inventory explicitly.
+- =:open-defects=: list (possibly NIL) of plists with =:id= string,
+  =:blocking= T/NIL, =:status= =:open= or =:deferred=, =:description= string.
+  Keep explicitly nonblocking deferred diagnostics visible here.
+- =:result=: =:fail= if any required check fails or any open defect blocks;
+  otherwise =:unverified= if any required check is unverified/deferred;
+  otherwise =:pass=. Nonrequired diagnostics do not add blockers. A declared
+  result inconsistent with this aggregation is invalid.
+
+Each check contains:
+- =:id= nonempty string; =:scope= =:mechanical=, =:static-visual= or
+  =:independent-review=; =:backend= =:x11=, =:wayland= or NIL.
+- =:result= =:pass=, =:fail=, =:unverified= or =:deferred=.
+- =:method= plist with =:kind= and nonempty =:description=.
+  Mechanical kinds are =:mechanical= or =:text-review=. Independent review uses
+  =:independent-review=. Static visual checks use =:child-delegated-visual=,
+  with additional required =:child-id= string, =:result-reference= evidence
+  reference, and =:delegation= string disclosing child inspection. Include that
+  result reference among the check evidence. This records attribution, not a
+  tool-call audit. Mechanical/text review is never pixel inspection.
+  For a check not run, use =:kind :not-run= with description, no evidence, and
+  an unverified/deferred result; do not fabricate a child or hash.
+- =:evidence= list of references, each exactly =(:path absolute-string
+  :sha256 hex-string-of-length-64)=. Include actual PNGs and child observations
+  for pixel criteria, raw gate outputs for mechanical criteria, and review
+  reports for review criteria. The writer recomputes every hash.
+- =:unavailable= NIL when evidence exists. Without evidence, supply a nonempty
+  reason and use unverified/deferred, never PASS/FAIL.
+- =:limits= list of nonempty strings, possibly NIL. Record static/temporal,
+  glyph, reset, or other qualifications explicitly. Use separate IDs for
+  separate criteria: one image can have a qualified static PASS and another
+  UNVERIFIED criterion without promoting the latter.
+
+Acceptance additionally contains =:prior-attempts=: list of evidence references
+for prior acceptance records or retained attempt reports. No reference to final
+review is stored in acceptance, so there is no hash cycle.
+
+Final review additionally contains =:acceptance=: reference to the exact immutable
+candidate acceptance bytes, =:reviewer= independent identity string,
+=:findings= list of strings, and =:disposition= exactly the acceptance result.
+The mission/attempt/source identities must match acceptance. Its own =:result=
+is the independent review process result: a successful review may have PASS while
+its =:disposition= is FAIL or UNVERIFIED. Findings must disclose that distinction.
+
+* Writing and publication
+
+From the repository root, load the API in SBCL, with UTF-8 files:
+#+begin_src lisp
+(load "tests/vttest-acceptance.lisp")
+(in-package :vttest-acceptance)
+;; Hash an existing file. Never supply a placeholder hash.
+(evidence #p"tests/vttest-acceptance.lisp")
+;; Input files are caller-authored records following the schema above.
+;; Each output attempt directory must be new. Do not use source directories.
+(let ((candidate (write-candidate #p".build/evidence/vttest-attempt-NEW/"
+                                  (read-record #p".build/evidence/acceptance-input.sexp"))))
+  (format t "Candidate: ~a~%" candidate))
+;; After independent review, author review-input.sexp with :acceptance referencing
+;; the printed candidate path and its actual (evidence candidate) hash.
+(publish-review #p".build/evidence/vttest-attempt-NEW/ACCEPTANCE.sexp"
+                (read-record #p".build/evidence/review-input.sexp")
+                #p".build/evidence/vttest/")
+(pair-status #p".build/evidence/vttest/") ; :COMPLETE or :INCOMPLETE, not PASS
+#+end_src
+
+=write-candidate= validates before writing and reads back after exclusive creation.
+Keep candidate evidence files stable. After independent review, =publish-review=
+creates the attempt's =FINAL-REVIEW.sexp= exclusively. It copies both exact files
+into same-directory temporary files, validates readback/hashes, then atomically
+renames ACCEPTANCE first and FINAL-REVIEW last. There is no two-file atomicity
+claim. Missing review, invalid evidence or an acceptance-byte mismatch means
+INCOMPLETE, not apparently valid acceptance. Consumers must call =pair-status=
+and then inspect both results and the disposition. COMPLETE can mean FAIL.
+Use a single publisher; concurrent publication is outside this small API.
+
+Existing canonical files cause an error by default. To replace explicitly, pass
+=:replace-existing t :preserve-directory #p".build/evidence/vttest-prior-NEW/"=.
+The preservation directory must be fresh. Existing canonical files, including
+an incomplete pair, are copied there byte-for-byte before replacement. Original
+immutable attempts are retained as well. Never edit a published attempt to retry;
+use a new attempt directory. A partially failed publication is incomplete and
+requires explicit preservation before retry. Do not treat an API write success
+or fixture PASS as native visual acceptance or a mission verification.
+
+* Offline fixtures
+
+Create the dedicated root once, only if absent, then run from repository root:
+#+begin_src sh
+mkdir .build/evidence/canonical-acceptance-implementation-20261105-a
+PATH="$PWD/.build/test-tools/bin:$PATH" \
+LISPTERM_SBCL="$PWD/.build/deps/bin/sbcl" \
+  scripts/sbcl --script tests/vttest-acceptance-tests.lisp
+#+end_src
+
+Each invocation creates a fresh fixture subdirectory there. Fixtures exercise
+conservative aggregation, explicit unavailable evidence, malformed records,
+read-time evaluation/trailing-form rejection, hashes, roundtrips, prior FAIL
+history, separate review disposition, collisions, preservation and incomplete
+pairs. They do not access the actual canonical files or run GUI/vttest gates.
