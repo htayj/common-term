@@ -534,12 +534,36 @@ Return readiness and a diagnostic keyword. No display or recorder is loaded."
         (bad "Wrong per-pause capture phase inventory"))
       (nreverse errors))))
 
+(defun capture-name-owned-p (name label)
+  "Recognize a capture basename without its extension, owned by LABEL."
+  (when (and (stringp name) (stringp label))
+    (let* ((hyphen (position #\- name))
+           (label-start (and hyphen (1+ hyphen)))
+           (label-end (and label-start (+ label-start (length label)))))
+      (and hyphen (plusp hyphen)
+           (every (lambda (c) (digit-char-p c 10)) (subseq name 0 hyphen))
+           (< label-end (1- (length name)))
+           (string= label name :start2 label-start :end2 label-end)
+           (char= #\- (char name label-end))))))
+
+(defun owned-capture-names (label physical-names)
+  (remove-if-not (lambda (name) (capture-name-owned-p name label)) physical-names))
+
+(defun capture-inventory-p (label physical-names event-names)
+  "Require distinct event names and exactly the physical captures owned by LABEL."
+  (let ((owned (owned-capture-names label physical-names)))
+    (and (every (lambda (name) (capture-name-owned-p name label)) event-names)
+         (= (length event-names) (length (remove-duplicates event-names :test #'equal)))
+         (= (length owned) (length event-names))
+         (null (set-exclusive-or owned event-names :test #'equal)))))
+
 (defun check-directory (directory &key (mode :measure))
   (unless (uiop:directory-exists-p directory) (error "Missing artifact directory ~a" directory))
   (let* ((dir (uiop:ensure-directory-pathname directory))
          (manifest (read-value (merge-pathnames "inventory.sexp" dir)))
          (expected (getf manifest :expected))
          (results (sort (directory (merge-pathnames "*.result.sexp" dir)) #'string< :key #'namestring))
+         (physical-names (mapcar #'pathname-name (directory (merge-pathnames "*.png" dir))))
          (errors nil) (cases nil))
     ;; Read labels independently of file counts: duplicate evidence cannot stand
     ;; in for a different expected case.
@@ -582,7 +606,8 @@ Return readiness and a diagnostic keyword. No display or recorder is loaded."
             (let* ((captures (remove-if-not (lambda (e) (eq :capture (getf e :kind))) events))
                    (wanted (getf r :expected-captures)))
               (unless (and (typep wanted '(integer 1)) (= wanted (or (getf r :captures) -1) (length captures))
-                           (= wanted (length (directory (merge-pathnames (cat "*-" label "-*.png") dir)))))
+                           (capture-inventory-p label physical-names
+                                                (mapcar (lambda (e) (getf e :name)) captures)))
                 (bad "~a: capture inventory mismatch" label))
               (dolist (e captures)
                 (let ((name (getf e :name)))
