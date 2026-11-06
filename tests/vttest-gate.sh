@@ -205,6 +205,8 @@ fixture_lock || { echo "Invalid inherited GUI lock" >&2; exit 1; }
 art=$(mktemp -d "$root/.build/evidence/vttest-${backend}-scale${scale}-v3.XXXXXX")
 export LISPTERM_VTTEST_ARTIFACTS="$art/" LISPTERM_VTTEST_BACKEND=$backend LISPTERM_VTTEST_BASH=$BASH
 export LISPTERM_VTTEST_TITLE="Lispterm-vttest-${art##*.}-$$"
+# The ordinary root is always the actual mktemp result, never the caller hint.
+if [[ ${LISPTERM_VTTEST_ON_PHASE:-0} == 1 ]]; then mkdir "$art/on-phase"; fi
 client='' server='' keyboard_holder='' runtime=''
 cleanup() {
   local code=$? pid token
@@ -241,9 +243,13 @@ trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' E
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/verify.sh scripts/deps.nix "$art/"
+if [[ ${LISPTERM_VTTEST_ON_PHASE:-0} == 1 ]]; then
+  cp tests/vttest-on-phase.lisp tests/vttest-on-phase-tests.lisp "$art/on-phase/"
+fi
 {
   printf 'recorder-version=3\nmode=%s\nfilter=%s\nbackend=%s\ntitle=%s\n' "$mode" "${LISPTERM_VTTEST_FILTER:-all}" "$backend" "$LISPTERM_VTTEST_TITLE"
   printf 'fixture-scale=%s\n' "$scale"
+  printf 'on-phase-supplements=%s\n' "${LISPTERM_VTTEST_ON_PHASE:-0}"
   printf 'pinned-binary=%s\noverride=%s\n' "$(realpath "$pinned")" "$([[ $(realpath "$VTTEST") == "$(realpath "$pinned")" ]] && echo false || echo true)"
   printf 'binary=%s\nsbcl=%s\nfont=%s\n' "$(realpath "$VTTEST")" "$(realpath "$LISPTERM_SBCL")" "$LISPTERM_FONT"
   printf 'command='; printf '%q ' "$root/scripts/sbcl" --script tests/vttest-gate.lisp; printf '\n'
@@ -327,11 +333,87 @@ window_identity() {
     window=$(jq -r '.id' <<< "$node")
   fi
 }
+# Separate optional exposure channel. Ordinary requests, images and counters are
+# untouched. Every attempt has unique retained files, including failed images.
+supplement_capture() {
+  local dest=$art/on-phase name ew eh requested_scale extra window owner node
+  local width height x y start finish rc=0 before_window before_geometry output
+  read -r name ew eh requested_scale extra < "$dest/capture-request"
+  [[ $name =~ ^(x11-screen-pause14|wayland-screen-pause14|x11-bug-d-choice0)-attempt0[1-6]$ ]]
+  [[ $name == "$backend-"* && $requested_scale == "$scale" && -z $extra ]]
+  [[ $ew =~ ^[0-9]+$ && $eh =~ ^[0-9]+$ ]]
+  [[ ! -e $dest/$name.png && ! -e $dest/$name.external.sexp && ! -e $dest/$name.ack ]]
+  fixture_isolation > "$dest/$name.isolation-before.txt"
+  window_identity
+  before_window=$window
+  if [[ $backend == x11 ]]; then
+    timeout 5 xdotool getwindowgeometry --shell "$window" > "$dest/$name.geometry-before.txt"
+    width=$(sed -n 's/^WIDTH=//p' "$dest/$name.geometry-before.txt")
+    height=$(sed -n 's/^HEIGHT=//p' "$dest/$name.geometry-before.txt")
+    local ow oh
+    x=$(sed -n 's/^X=//p' "$dest/$name.geometry-before.txt")
+    y=$(sed -n 's/^Y=//p' "$dest/$name.geometry-before.txt")
+    timeout 5 xdotool getdisplaygeometry > "$dest/$name.output-before.txt"
+    read -r ow oh < "$dest/$name.output-before.txt"
+    [[ $x -ge 0 && $y -ge 0 && $((x + width)) -le $ow && $((y + height)) -le $oh ]]
+    output="x11-$DISPLAY"
+  else
+    cp "$art/current-tree.json" "$dest/$name.tree-before.json"
+    timeout 5 "$LISPTERM_SWAYMSG" -t get_outputs > "$dest/$name.outputs-before.json"
+    # A single private output supplies an unambiguous bridge from the protocol's
+    # entered/sync_output object to the external compositor output name.
+    jq -e 'length == 1 and .[0].active == true' "$dest/$name.outputs-before.json" > /dev/null
+    output=$(jq -r '.[0].name' "$dest/$name.outputs-before.json")
+    [[ $output =~ ^HEADLESS-[0-9]+$ ]]
+    read -r x y width height < <(jq -r '[.rect.x,.rect.y,.rect.width,.rect.height] | @tsv' <<< "$node")
+    jq -e --argjson x "$x" --argjson y "$y" --argjson w "$width" --argjson h "$height" \
+      '.[0] | $x >= .rect.x and $y >= .rect.y and ($x+$w) <= (.rect.x+.rect.width) and ($y+$h) <= (.rect.y+.rect.height)' "$dest/$name.outputs-before.json" > /dev/null
+  fi
+  [[ $width == "$ew" && $height == "$eh" ]]
+  read -r start _ < /proc/uptime
+  if [[ $backend == x11 ]]; then
+    timeout 10 import -display "$DISPLAY" -window "$window" "$dest/$name.png" > "$dest/$name.capture.log" 2>&1 || rc=$?
+  else
+    timeout 10 "$LISPTERM_GRIM" -g "$x,$y ${width}x$height" "$dest/$name.png" > "$dest/$name.capture.log" 2>&1 || rc=$?
+  fi
+  read -r finish _ < /proc/uptime
+  local png=nil stable=t iw=0 ih=0
+  if [[ -f $dest/$name.png ]]; then
+    if timeout 5 identify -format '%w %h\n' "$dest/$name.png" > "$dest/$name.image-size.txt" 2> "$dest/$name.identify.log"; then
+      read -r iw ih < "$dest/$name.image-size.txt"
+      if [[ $iw == "$((scale * width))" && $ih == "$((scale * height))" ]]; then png=t; fi
+    fi
+  fi
+  window_identity
+  [[ $window == "$before_window" ]] || stable=nil
+  if [[ $backend == x11 ]]; then
+    timeout 5 xdotool getwindowgeometry --shell "$window" > "$dest/$name.geometry-after.txt"
+    cmp -s "$dest/$name.geometry-before.txt" "$dest/$name.geometry-after.txt" || stable=nil
+    timeout 5 xdotool getdisplaygeometry > "$dest/$name.output-after.txt"
+    cmp -s "$dest/$name.output-before.txt" "$dest/$name.output-after.txt" || stable=nil
+  else
+    cp "$art/current-tree.json" "$dest/$name.tree-after.json"
+    # Full tree includes unrelated compositor state; compare the owned node rect.
+    before_geometry=$(jq -c --argjson id "$before_window" '.. | objects | select(.id? == $id) | {id,pid,name,rect}' "$dest/$name.tree-before.json")
+    [[ $before_geometry == "$(jq -c '{id,pid,name,rect}' <<< "$node")" ]] || stable=nil
+    timeout 5 "$LISPTERM_SWAYMSG" -t get_outputs > "$dest/$name.outputs-after.json"
+    cmp -s "$dest/$name.outputs-before.json" "$dest/$name.outputs-after.json" || stable=nil
+  fi
+  fixture_isolation > "$dest/$name.isolation-after.txt"
+  # /proc/uptime has two fractional digits. Ratios retain its exact 10ms ticks.
+  printf '(:start %s/100 :end %s/100 :exit %s :png %s :identity-stable %s :client %s :window %s :output "%s" :width %s :height %s :scale %s :pixel-width %s :pixel-height %s :clock :linux-proc-uptime :resolution 1/100 :identity-basis :unique-owned-window-of-single-host)\n' \
+    "${start/./}" "${finish/./}" "$rc" "$png" "$stable" "$client" "$window" "$output" "$width" "$height" "$scale" "$iw" "$ih" > "$dest/$name.external.sexp"
+  mv "$dest/capture-request" "$dest/$name.request.txt"
+  touch "$dest/$name.ack"
+}
 end=$((SECONDS + ${LISPTERM_VTTEST_TIMEOUT:-1800}))
 while is_owned "$client"; do
   watchdog_check "$end"
   collect_tree "$client"
   audit_client_tree allow-exit || { fixture_error 1 "${BASH_SOURCE[0]}" "$LINENO" audit_client_tree; exit 1; }
+  if [[ ${LISPTERM_VTTEST_ON_PHASE:-0} == 1 && -f $art/on-phase/capture-request ]]; then
+    supplement_capture
+  fi
   if [[ -f $art/capture-request ]]; then
     read -r name expected_width expected_height requested_scale extra < "$art/capture-request"
     [[ $name =~ ^[0-9]+-[a-z0-9_-]+$ && $expected_width =~ ^[0-9]+$ && $expected_height =~ ^[0-9]+$ ]]

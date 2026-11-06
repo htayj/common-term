@@ -199,6 +199,14 @@
           when (expired-p end) do (error "Geometry/render barrier expired in ~a: ~a" *phase*
                                         (nth-value 1 (vttest-check:geometry-capture-ready-p status *desired-scale*)))
           do (sleep .02))))
+;; Opt-in supplements never contribute to the ordinary capture count/inventory.
+(defparameter *on-phase-supplements*
+  (string= "1" (uiop:getenv "LISPTERM_VTTEST_ON_PHASE")))
+(when *on-phase-supplements*
+  (load (merge-pathnames "vttest-on-phase.lisp" *load-truename*))
+  (funcall (find-symbol "INSTALL" "VTTEST-ON-PHASE")
+           (merge-pathnames "on-phase/" *art*) #'vttest-check:write-value
+           (lambda () *output-count*) #'check-host *desired-scale*))
 (defun capture (host suffix)
   (let* ((barrier (frame-barrier host))
          (name (format nil "~3,'0d-~a-~a" (incf *capture-number*) *label* suffix))
@@ -226,6 +234,10 @@
                      (vttest-check::png-size (artifact (concatenate 'string name ".png")))))
         (error "Geometry/output changed or external capture proof failed")))
     (event :capture :name name :barrier barrier)
+    (when (and *on-phase-supplements*
+               (funcall (find-symbol "ELIGIBLE-P" "VTTEST-ON-PHASE")
+                        (getf status :backend) *label* suffix))
+      (funcall (find-symbol "CAPTURE" "VTTEST-ON-PHASE") host *label* suffix))
     name))
 (defun send (host text)
   (event :driver :bytes text)
