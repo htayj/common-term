@@ -2,6 +2,9 @@
 (load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
 (asdf:load-system "lispterm")
 (load (merge-pathnames "vttest-protocol.lisp" *load-truename*))
+;; The shell preflights and pins this private snapshot before native startup.
+(load (merge-pathnames "vttest-selection.lisp"
+        (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_VTTEST_ARTIFACTS"))))
 (defparameter *art* (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_VTTEST_ARTIFACTS")))
 (defparameter *desired-scale* (parse-integer (or (uiop:getenv "LISPTERM_VTTEST_SCALE") "1")))
 (defparameter *accept* (string= "accept" (uiop:getenv "LISPTERM_VTTEST_MODE")))
@@ -22,6 +25,11 @@
 ;; Counts are from the pinned source's holdit/MENU_HOLD paths, not inferred
 ;; from a partially successful recorder run. Keys are separately inventoried.
 (defparameter *cases* vttest-check:*case-specs*)
+;; Validate before installing recorder instrumentation or opening any host.
+(defparameter *selected-cases*
+  (vttest-selection:select-cases *cases*
+    :exact-labels (uiop:getenv "LISPTERM_VTTEST_EXACT_LABELS")
+    :filter (uiop:getenv "LISPTERM_VTTEST_FILTER")))
 (defun artifact (name) (merge-pathnames name *art*))
 (defun record-value (name value) (vttest-check:write-value (artifact name) value))
 (defun event-unlocked (kind &rest properties)
@@ -364,7 +372,7 @@
       (when ok (setf *completed* (append *completed* (list label)))) (inventory))))
 (let* ((backend (if (string= (uiop:getenv "LISPTERM_VTTEST_BACKEND") "wayland") :wayland :x11))
        (filter (uiop:getenv "LISPTERM_VTTEST_FILTER"))
-       (selected (remove-if-not (lambda (test) (or (null filter) (search filter (first test)))) *cases*)))
+       (selected *selected-cases*))
   (when (eq backend :wayland) (assert (null (uiop:getenv "DISPLAY"))))
   (setf *expected* (mapcar #'first selected)) (inventory)
   (unless selected (error "Empty vttest selection for filter ~s" filter))

@@ -49,6 +49,8 @@ case $gate in
   exec tests/checkpoint-gate.sh "$@" ;;
  fastfetch-x11) exec tests/fastfetch-gate.sh x11 ;;
  fastfetch-wayland) exec tests/fastfetch-gate.sh wayland ;;
+ vttest-area) export LISPTERM_VTTEST_AREA_CLI=1; exec scripts/sbcl --script tests/vttest-area.lisp "$@" ;;
+ vttest-area-controls) exec scripts/sbcl --script tests/run-vttest-area-tests.lisp "$@" ;;
  vttest-x11) exec tests/vttest-gate.sh x11 ;;
  vttest-wayland) exec tests/vttest-gate.sh wayland ;;
  vttest-check) exec scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$@" ;;

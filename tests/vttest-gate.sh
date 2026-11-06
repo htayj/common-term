@@ -187,6 +187,12 @@ mode=${LISPTERM_VTTEST_MODE:-record}
 export LISPTERM_VTTEST_MODE=$mode
 export PATH="$root/.build/test-tools/bin:$PATH"
 export LISPTERM_SBCL=${LISPTERM_SBCL:-$root/.build/deps/bin/sbcl}
+# Validate the actual catalog/helper before fixtures, upstream or native startup.
+# This dependency-free process never loads bootstrap.lisp or the application.
+"$root/scripts/sbcl" --non-interactive --load tests/vttest-protocol.lisp \
+  --load tests/vttest-selection.lisp \
+  --eval '(handler-case (vttest-selection:select-cases vttest-check:*case-specs* :exact-labels (sb-ext:posix-getenv "LISPTERM_VTTEST_EXACT_LABELS") :filter (sb-ext:posix-getenv "LISPTERM_VTTEST_FILTER")) (vttest-selection:invalid-selection (c) (format *error-output* "~a~%" c) (sb-ext:exit :code 2)))'
+selector_sha=$(sha256sum tests/vttest-selection.lisp | cut -d' ' -f1)
 pinned="$root/.build/test-tools/bin/vttest"
 export VTTEST=${VTTEST:-$pinned}
 [[ -x $VTTEST ]]
@@ -242,12 +248,22 @@ trap cleanup EXIT
 trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/verify.sh scripts/deps.nix "$art/"
+cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/vttest-selection.lisp tests/verify.sh scripts/deps.nix "$art/"
+# Optional area-driver receipt binds this new mktemp capture to its sole launch.
+if [[ -n ${LISPTERM_VTTEST_AREA_REQUEST:-} ]]; then
+  [[ $LISPTERM_VTTEST_AREA_REQUEST == /* && -f $LISPTERM_VTTEST_AREA_REQUEST && ! -L $LISPTERM_VTTEST_AREA_REQUEST ]]
+  [[ ${LISPTERM_VTTEST_AREA_RECEIPT:-} == /* && ! -e $LISPTERM_VTTEST_AREA_RECEIPT ]]
+  cp "$LISPTERM_VTTEST_AREA_REQUEST" "$art/area-request.sexp"
+  (set -o noclobber; printf '%s\n' "$art" > "$LISPTERM_VTTEST_AREA_RECEIPT")
+  cp tests/vttest-area.lisp tests/vttest-cursor-driver.lisp tests/vttest-cursor-oracle.lisp "$art/"
+fi
+[[ $(sha256sum "$art/vttest-selection.lisp" | cut -d' ' -f1) == "$selector_sha" ]] || { echo 'Selector changed after preflight' >&2; exit 1; }
 if [[ ${LISPTERM_VTTEST_ON_PHASE:-0} == 1 ]]; then
   cp tests/vttest-on-phase.lisp tests/vttest-on-phase-tests.lisp "$art/on-phase/"
 fi
 {
   printf 'recorder-version=3\nmode=%s\nfilter=%s\nbackend=%s\ntitle=%s\n' "$mode" "${LISPTERM_VTTEST_FILTER:-all}" "$backend" "$LISPTERM_VTTEST_TITLE"
+  printf 'exact-labels=%s\nselector-sha256=%s\nselector-snapshot=%s\n' "${LISPTERM_VTTEST_EXACT_LABELS:-}" "$selector_sha" "$art/vttest-selection.lisp"
   printf 'fixture-scale=%s\n' "$scale"
   printf 'on-phase-supplements=%s\n' "${LISPTERM_VTTEST_ON_PHASE:-0}"
   printf 'pinned-binary=%s\noverride=%s\n' "$(realpath "$pinned")" "$([[ $(realpath "$VTTEST") == "$(realpath "$pinned")" ]] && echo false || echo true)"
@@ -274,9 +290,11 @@ sha256sum "$VTTEST" "$LISPTERM_FONT" > "$art/binary-font.sha256"
 git rev-parse HEAD > "$art/run-head.txt"
 printf '%s\n' 5b3336f91735ad042ea426ba40a3cfe51f7657e8 > "$art/historical-baseline-head.txt"
 git status --porcelain=v1 > "$art/git-status.txt"
-git diff --binary HEAD > "$art/working-tree.diff"
+# Protected transaction sources are stat/hash-only, never copied into diffs.
+git diff --binary HEAD -- . ':!tests/capture-transaction.lisp' ':!tests/capture-transaction-tests.lisp' ':!tests/vt100-native-geometry.lisp' ':!tests/vt100-native-geometry.sh' > "$art/working-tree.diff"
 # Include all actual source files, including untracked task files, not just HEAD.
-find src engine tests scripts -type f -print0 | sort -z | xargs -0 sha256sum > "$art/source.sha256"
+find src engine tests scripts -type f ! -path 'tests/vt100-native-geometry.lisp' ! -path 'tests/vt100-native-geometry.sh' ! -path 'tests/capture-transaction.lisp' ! -path 'tests/capture-transaction-tests.lisp' -print0 | sort -z | xargs -0 sha256sum > "$art/source.sha256"
+printf '%s\n' 'Unrelated native-geometry and protected transaction sources excluded from diff and source inputs.' > "$art/source-exclusions.txt"
 for tool in Xvfb xdotool import sway swaymsg wtype grim jq timeout ps; do
   command -v "$tool" >> "$art/dependencies.txt" 2>/dev/null || true
 done
