@@ -1,7 +1,8 @@
 (in-package #:nerimux/test/terminal)
 
-;; VT100 UG 3.3.5; DEC STD 070 behavior as implemented by xterm charproc.c
-;; and charsets.h map_DEC_Spec_Graphic_VT52. Fixtures require no .build data.
+;; VT100 User Guide 3.3.5 and Table 3-9 specify the VT100 repertoire in
+;; VT52-compatible mode. The literal expected glyphs below are the manual
+;; oracle, not derived from the mapper. Fixtures require no .build data.
 (defun vt52-feed (screen bytes)
   (map nil (lambda (byte)
              (screen-process-bytes screen
@@ -108,35 +109,68 @@
       (feed s (esc "I"))
       (check-cursor s 3 1)))
 
-  (it "uses the separate full VT52 graphics repertoire and ASCII ESC G"
+  (it "uses all 32 VT100 Table 3-9 graphics in VT52 ESC F and ASCII in ESC G"
     (with-screen (s 40 3)
       (vt52-enter s)
       (feed s (esc "F"))
+      (expect (nerimux/terminal/types:screen-vt52-graphics s))
+      ;; Octal 137..176 (hex 5f..7e), in ascending code order. Control
+      ;; pictures are printable glyphs, not executed HT/FF/CR/LF/NL/VT.
       (feed s "_`abcdefghijklmnopqrstuvwxyz{|}~")
-      (expect (string= "   ▮⅟   °±→…÷↓⎺⎺⎻⎻⎼⎼⎽⎽₀₁₂₃₄₅₆₇₈₉"
+      (expect (string= " ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"
                        (row-string s 0 :end 32)))
+      (check-cursor s 32 0)
       (feed s (esc "G"))
-      (feed s "q#")
-      (expect (char= #\q (char-at s 32 0)))
-      (expect (char= #\# (char-at s 33 0)))))
+      (expect (null (nerimux/terminal/types:screen-vt52-graphics s)))
+      (vt52-position s 0 1)
+      (feed s "_`abcdefghijklmnopqrstuvwxyz{|}~")
+      (expect (string= "_`abcdefghijklmnopqrstuvwxyz{|}~"
+                       (row-string s 1 :end 32)))))
+
+  (it "leaves codes outside the graphics range unchanged and ignores DEL on input"
+    ;; DEL is a parser control, so also check the mapper boundary directly.
+    (dolist (code '(#x5e #x7f))
+      (expect (char= (code-char code)
+                     (nerimux/terminal/actions::%vt52-graphics-char (code-char code)))))
+    (with-screen (s 10 3)
+      (vt52-enter s)
+      (feed s (esc "F"))
+      (vt52-feed s #(#x5e #x7f #x71))
+      (expect (string= "^─" (row-string s 0 :end 2)))
+      (check-cursor s 2 0)))
 
   (it "preserves ANSI British and DEC G0/G1 and a pending single shift"
-    (with-screen (s 30 4)
-      (feed s (esc "(A"))
-      (feed s (esc ")0"))
-      (feed s (esc "*A"))
-      (feed s (esc "N"))
-      (vt52-enter s)
-      (feed s (esc "G"))
-      (feed s "#") ; VT52 ASCII, independent of the saved ANSI British charset.
-      (feed s (esc "F"))
-      (feed s "b")
-      (feed s (esc "<"))
-      (feed s "#") ; saved SS2 => British
-      (feed s "#") ; G0 British
-      (vt52-feed s #(14))
-      (feed s "q") ; G1 DEC
-      (expect (string= "#▮££─" (row-string s 0 :end 5)))))
+    (dolist (british-g0 '(t nil))
+      (with-screen (s 30 4)
+        (feed s (esc "(~A" (if british-g0 "A" "0")))
+        (feed s (esc ")~A" (if british-g0 "0" "A")))
+        (feed s (esc "*A"))
+        (feed s (esc "N"))
+        (vt52-enter s)
+        (feed s (esc "G"))
+        (feed s "#") ; VT52 ASCII, independent of saved ANSI designations.
+        (feed s (esc "F"))
+        (feed s "b")
+        (expect (eq :g2 (nerimux/terminal/types:screen-single-shift s)))
+        (feed s (esc "<"))
+        (expect (null (nerimux/terminal:screen-vt52-mode s)))
+        (expect (eq (if british-g0 :british :dec-graphics)
+                    (nerimux/terminal/types:screen-g0-charset s)))
+        (expect (eq (if british-g0 :dec-graphics :british)
+                    (nerimux/terminal/types:screen-g1-charset s)))
+        (expect (eq :g0 (nerimux/terminal/types:screen-active-g s)))
+        (expect (eq :g2 (nerimux/terminal/types:screen-single-shift s)))
+        (feed s "#") ; saved SS2 => British, consumed only now.
+        (expect (null (nerimux/terminal/types:screen-single-shift s)))
+        (feed s "#q") ; G0
+        (vt52-feed s #(14))
+        (expect (eq :g1 (nerimux/terminal/types:screen-active-g s)))
+        (feed s "#q") ; G1
+        (vt52-feed s #(15))
+        (expect (eq :g0 (nerimux/terminal/types:screen-active-g s)))
+        (feed s "#q")
+        (expect (string= (if british-g0 "#␉££q#─£q" "#␉£#─£q#─")
+                         (row-string s 0 :end 9))))))
 
   (it "overwrites the last column without wrapping in VT52 then restores ANSI wrap"
     (with-screen (s 4 3)

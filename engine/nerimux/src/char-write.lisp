@@ -1,13 +1,9 @@
 (in-package #:nerimux/terminal/actions)
 
-;; xterm charsets.h map_DEC_Spec_Graphic_VT52, DEC STD 070 VT52 repertoire.
-;; The odd fraction numerators 3/, 5/, 7/ have no Unicode characters; use
-;; the same blank fallback as xterm. This is deliberately not DEC special 0.
+;; VT100 User Guide 3.3.5 (ESC F): VT52-compatible mode uses the VT100
+;; special graphics repertoire in Table 3-9, not the original VT52 ROM.
 (defun %vt52-graphics-char (ch)
-  (let ((code (char-code ch)))
-    (if (<= #x5f code #x7e)
-        (char "   ▮⅟   °±→…÷↓⎺⎺⎻⎻⎼⎼⎽⎽₀₁₂₃₄₅₆₇₈₉" (- code #x5f))
-        ch)))
+  (%dec-graphics-char ch))
 
 (defun %remap-charset-char (screen ch)
   "Map CH through VT52 graphics or the ANSI invoked charset/single shift."
