@@ -284,14 +284,14 @@
 (load (merge-pathnames "vttest-cursor-driver.lisp" *load-truename*))
 (defvar *run-context* nil)
 (defun run-selected (manifest readiness)
-  "Only the built-in cursor X11 driver can produce live observations."
+  "Only the closed built-in cursor drivers can produce live observations."
   (declare (ignore readiness))
   (preflight-selection
    (format nil "~{~A~^,~}" (remove-duplicates
                            (mapcar (lambda (s) (getf s :recorder-label))
                                    (getf manifest :scenarios)) :test #'equal))
    (sb-ext:posix-getenv "LISPTERM_VTTEST_FILTER"))
-  (unless (equal (getf manifest :native-driver) "cursor-x11-v1")
+  (unless (member (getf manifest :native-driver) '("cursor-x11-v1" "cursor-wayland-v1") :test #'equal)
     (refuse :driver-not-integrated 3))
   (let ((labels (sb-ext:posix-getenv "LISPTERM_VTTEST_EXACT_LABELS")))
     (when (and labels (not (equal labels "cursor"))) (refuse :invalid-recorder-selection)))

@@ -249,6 +249,8 @@ trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' E
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/vttest-selection.lisp tests/verify.sh scripts/deps.nix "$art/"
+# Hashing in cleanup covers this actual launch dependency as well as its copy.
+if [[ $backend == wayland ]]; then cp tests/wayland-gate.sh "$art/"; fi
 # Optional area-driver receipt binds this new mktemp capture to its sole launch.
 if [[ -n ${LISPTERM_VTTEST_AREA_REQUEST:-} ]]; then
   [[ $LISPTERM_VTTEST_AREA_REQUEST == /* && -f $LISPTERM_VTTEST_AREA_REQUEST && ! -L $LISPTERM_VTTEST_AREA_REQUEST ]]
