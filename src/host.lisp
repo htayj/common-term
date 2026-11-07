@@ -5,12 +5,22 @@
 (defvar *hosts-lock* (sb-thread:make-mutex :name "lispterm hosts"))
 (defvar *next-host-id* 0)
 
-(defun stop-window-worker (host)
-  (when (and (host-thread host) (sb-thread:thread-alive-p (host-thread host)))
-    (call-host host :stop)
+(defun stop-window-worker (host &optional startup-command)
+  ;; Startup failure/cancellation exits the owner directly. Do not enqueue a
+  ;; stop behind initialization, or close its PTY before that owner has joined.
+  (when startup-command
+    (sb-thread:with-mutex ((host-lock host))
+      (unless (eq (host-command-state startup-command) :done)
+        (setf (host-command-state startup-command) :cancelled))
+      (setf (host-stop-p host) t)))
+  (when (host-thread host)
+    (when (and (not startup-command) (sb-thread:thread-alive-p (host-thread host)))
+      (call-host host :stop))
     (unless (sb-thread:join-thread (host-thread host) :timeout 5 :default nil)
       (when (sb-thread:thread-alive-p (host-thread host))
         (error 'host-timeout :operation :join :detail "Window owner did not stop"))))
+  (when (host-display host)
+    (error 'host-error :operation :join :host host :detail "Native display cleanup is pending"))
   (sb-thread:with-mutex ((host-lock host)) (setf (host-thread host) nil)))
 
 (defun open (&key argv pty (backend :auto) display-name (title "Lispterm") (rows 24) (columns 80))
@@ -29,17 +39,19 @@
          (pty (or pty (lispterm.pty:open-pty :rows rows :columns columns)))
          (host (%make-host :id (sb-thread:with-mutex (*hosts-lock*) (incf *next-host-id*))
                           :session (make-session pty rows columns)
-                          :configuration (list :backend backend :display-name display-name :title title))))
+                          :configuration (list :backend backend :display-name display-name :title title)))
+         (startup (make-host-command
+                   :operation :startup
+                   :argument (when created-p
+                               (or argv (list (or (uiop:getenv "SHELL") "/bin/sh")))))))
     (handler-case
         (progn
-          (when created-p
-            (lispterm.pty:spawn-on-pty pty (or argv (list (or (uiop:getenv "SHELL") "/bin/sh")))))
-          (start-window-worker host)
-          (call-host host :reopen)
+          (start-window-worker host startup)
+          (wait-host-command host startup 5)
           (sb-thread:with-mutex (*hosts-lock*) (setf (gethash (host-id host) *hosts*) host))
           host)
       (error (condition)
-        (handler-case (stop-window-worker host)
+        (handler-case (stop-window-worker host startup)
           (error (cleanup-error)
             ;; Retain a recovery handle if native cleanup is still pending.
             ;; Closing the PTY under a live owner would orphan the session.

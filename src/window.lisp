@@ -93,6 +93,17 @@
 
 (defun dispatch-host-command (host command)
   (case (host-command-operation command)
+    (:startup
+     (window-open host)
+     ;; Claim the irreversible spawn under the cancellation lock, but never
+     ;; hold that lock over PTY operations. A timeout after this claim still
+     ;; cancels startup: OPEN must join this owner before releasing its PTY.
+     (when (sb-thread:with-mutex ((host-lock host))
+             (unless (eq (host-command-state command) :cancelled)
+               (setf (host-command-state command) :spawning)))
+       (when (host-command-argument command)
+         (lispterm.pty:spawn-on-pty (session-pty (host-session host))
+                                    (host-command-argument command)))))
     (:reopen (window-open host))
     (:detach (window-close host))
     (:input (session-write (host-session host) (host-command-argument command)))
@@ -124,54 +135,76 @@
     (otherwise (error 'host-error :operation :command :detail "Unknown operation")))
   host)
 
+(defun run-host-command (host command)
+  "Execute one claimed command; return true only for uncancelled success."
+  (when (sb-thread:with-mutex ((host-lock host))
+          (when (eq (host-command-state command) :queued)
+            (setf (host-command-state command) :running)))
+    (handler-case
+        (setf (host-command-result command) (dispatch-host-command host command))
+      (error (condition)
+        (setf (host-command-error command) condition)
+        (host-record-error host (host-command-operation command) condition)))
+    (let ((success
+            (sb-thread:with-mutex ((host-lock host))
+              (unless (eq (host-command-state command) :cancelled)
+                (setf (host-command-state command) :done)
+                (null (host-command-error command))))))
+      (sb-thread:signal-semaphore (host-command-done command))
+      success)))
+
 (defun run-host-commands (host)
   (let ((commands (sb-thread:with-mutex ((host-lock host))
                     (prog1 (host-commands host) (setf (host-commands host) nil)))))
-    (dolist (command commands)
-      (when (sb-thread:with-mutex ((host-lock host))
-              (when (eq (host-command-state command) :queued)
-                (setf (host-command-state command) :running)))
-        (handler-case
-            (setf (host-command-result command) (dispatch-host-command host command))
-          (error (condition)
-            (setf (host-command-error command) condition)
-            (host-record-error host (host-command-operation command) condition)))
-        (sb-thread:with-mutex ((host-lock host)) (setf (host-command-state command) :done))
-        (sb-thread:signal-semaphore (host-command-done command))))))
+    (dolist (command commands) (run-host-command host command))))
 
-(defun window-worker (host)
+(defun window-worker (host &optional startup-command)
   (let ((next-frame 0) (io-backoff 0))
     (unwind-protect
-         (loop until (host-stop-p host) do
-           (run-host-commands host)
-           (unless (host-stop-p host)
-             (let ((now (get-internal-real-time)))
-               (when (>= now io-backoff)
-                 (handler-case
-                     (when (eq (session-read-output (host-session host)) :eof)
-                       (setf io-backoff (+ now (* 1/10 internal-time-units-per-second))))
-                   (error (condition)
-                     (host-record-error host :pty condition)
-                     (setf io-backoff (+ now internal-time-units-per-second)))))
-               (when (>= now next-frame)
-                 (setf next-frame (+ now (ceiling internal-time-units-per-second 60)))
-                 (handler-case (display-step host)
-                   (error (condition)
-                     (host-record-error host :display condition)
-                     (set-host-state host :detached)
-                     (handler-case (window-close host)
-                       (error (close-error) (host-record-error host :display-close close-error)))))))
-             ;; Bound idle CPU use, even when poll returns immediately on EOF.
-             (sleep 0.005)))
+         (progn
+           (when (and startup-command (not (run-host-command host startup-command)))
+             (return-from window-worker nil))
+           (loop until (host-stop-p host) do
+             (run-host-commands host)
+             (unless (host-stop-p host)
+               (let ((now (get-internal-real-time)))
+                 (when (>= now io-backoff)
+                   (handler-case
+                       (when (eq (session-read-output (host-session host)) :eof)
+                         (setf io-backoff (+ now (* 1/10 internal-time-units-per-second))))
+                     (error (condition)
+                       (host-record-error host :pty condition)
+                       (setf io-backoff (+ now internal-time-units-per-second)))))
+                 (when (>= now next-frame)
+                   (setf next-frame (+ now (ceiling internal-time-units-per-second 60)))
+                   (handler-case (display-step host)
+                     (error (condition)
+                       (host-record-error host :display condition)
+                       (set-host-state host :detached)
+                       (handler-case (window-close host)
+                         (error (close-error) (host-record-error host :display-close close-error)))))))
+               ;; Bound idle CPU use, even when poll returns immediately on EOF.
+               (sleep 0.005))))
       (handler-case (window-close host)
         (error (condition) (host-record-error host :worker-cleanup condition)))
       (set-host-state host :quiesced))))
 
-(defun start-window-worker (host)
+(defun start-window-worker (host &optional startup-command)
   (sb-thread:with-mutex ((host-lock host))
     (setf (host-stop-p host) nil
-          (host-thread host) (sb-thread:make-thread (lambda () (window-worker host))
-                                                  :name "lispterm session/display"))))
+          (host-thread host) (sb-thread:make-thread
+                              (lambda () (window-worker host startup-command))
+                              :name "lispterm session/display"))))
+
+(defun wait-host-command (host command timeout)
+  (unless (sb-thread:wait-on-semaphore (host-command-done command) :timeout timeout)
+    (unless (sb-thread:with-mutex ((host-lock host))
+              (if (member (host-command-state command) '(:done :committed)) t
+                  (progn (setf (host-command-state command) :cancelled) nil)))
+      (error 'host-timeout :operation (host-command-operation command)
+             :detail "Owner did not finish within the bounded wait")))
+  (when (host-command-error command) (error (host-command-error command)))
+  (host-command-result command))
 
 (defun call-host (host operation &optional argument (timeout 5))
   (let ((command (make-host-command :operation operation :argument argument)))
@@ -181,13 +214,7 @@
       (when (>= (length (host-commands host)) 128)
         (error 'host-error :operation operation :detail "Host command queue is full"))
       (setf (host-commands host) (nconc (host-commands host) (list command))))
-    (unless (sb-thread:wait-on-semaphore (host-command-done command) :timeout timeout)
-      (unless (sb-thread:with-mutex ((host-lock host))
-                (if (member (host-command-state command) '(:done :committed)) t
-                    (progn (setf (host-command-state command) :cancelled) nil)))
-        (error 'host-timeout :operation operation :detail "Owner did not finish within the bounded wait")))
-    (when (host-command-error command) (error (host-command-error command)))
-    (host-command-result command)))
+    (wait-host-command host command timeout)))
 
 (defun window-geometry-intent (host display)
   (let* ((session (host-session host))
