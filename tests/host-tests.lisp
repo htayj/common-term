@@ -108,9 +108,34 @@
              (check :failed-open-cleanup-pending
                     (ltd:display-cleanup-pending-p (lispterm::host-display retained-host)))
              (check :failed-open-owner-still-supervised
-                    (getf (lispterm:status retained-host) :worker-alive-p))))
+                    (getf (lispterm:status retained-host) :worker-alive-p))
+             (check :cleanup-pending-rejects-input
+                    (raises 'lispterm:host-cleanup-pending
+                            (lambda () (lispterm:send-input retained-host "x"))))
+             (check :cleanup-pending-rejects-reopen
+                    (raises 'lispterm:host-cleanup-pending
+                            (lambda () (lispterm:reopen retained-host))))
+             (dotimes (attempt 2)
+               (check :failed-close-signals-cleanup-pending
+                      (raises 'lispterm:host-cleanup-pending
+                              (lambda () (lispterm:close retained-host))))
+               (check :failed-close-keeps-owner
+                      (getf (lispterm:status retained-host) :worker-alive-p))
+               (check :failed-close-keeps-display
+                      (lispterm::host-display retained-host))
+               (check :failed-close-keeps-pty (lispterm.pty:pty-open-p pty)))
+             (setf *fail-close* nil)
+             (lispterm:close retained-host)
+             (check :cleanup-retry-joins-owner
+                    (and (null (lispterm::host-thread retained-host))
+                         (null (lispterm::host-display retained-host))))
+             (check :cleanup-retry-closes-host
+                    (eq :closed (getf (lispterm:status retained-host) :state)))
+             (check :cleanup-retry-unregisters (null (lispterm:status)))
+             (setf retained-host nil)))
       (setf *fail-open* nil *fail-close* nil)
-      (if retained-host (lispterm:close retained-host) (lispterm.pty:close-pty pty)))))
+      (cond (retained-host (lispterm:close retained-host))
+            ((lispterm.pty:pty-open-p pty) (lispterm.pty:close-pty pty))))))
 
 (defun run-tests ()
   (setf *checks* 0 *native-calls* nil *events* nil *fail-poll* nil *fail-close* nil)

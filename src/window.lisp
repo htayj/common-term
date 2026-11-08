@@ -6,10 +6,15 @@
   geometry-sent-generation
   (lock (sb-thread:make-mutex :name "lispterm host"))
   (control-lock (sb-thread:make-mutex :name "lispterm lifecycle"))
-  (state :detached) commands (error-ring nil) (generation 0) (stop-p nil))
+  (state :detached) commands (error-ring nil) (generation 0) (stop-p nil)
+  (cleanup-pending-p nil))
 (defstruct host-command operation argument (state :queued) result error
   (done (sb-thread:make-semaphore :name "lispterm command")))
 (defstruct lifecycle-token host generation attached-p (used-p nil))
+
+(define-condition host-cleanup-pending (host-error) ()
+  (:documentation "A retained native display must close before the host accepts other work."))
+(export 'host-cleanup-pending)
 
 (defun host-record-error (host operation condition)
   (let* ((text (princ-to-string condition))
@@ -158,11 +163,43 @@
                     (prog1 (host-commands host) (setf (host-commands host) nil)))))
     (dolist (command commands) (run-host-command host command))))
 
+(defun reject-host-command (host command)
+  "Complete COMMAND with HOST-CLEANUP-PENDING without executing it."
+  (let ((condition (make-condition 'host-cleanup-pending
+                                   :operation (host-command-operation command) :host host
+                                   :detail "Native display cleanup is pending")))
+    (host-record-error host (host-command-operation command) condition)
+    (sb-thread:with-mutex ((host-lock host))
+      (setf (host-command-error command) condition)
+      (unless (eq (host-command-state command) :cancelled)
+        (setf (host-command-state command) :done)))
+    (sb-thread:signal-semaphore (host-command-done command))))
+
+(defun supervise-display-cleanup (host)
+  "Own a display retained by failed startup until a queued :STOP closes it.
+Other commands are rejected; the PTY session and renderer are never touched."
+  (sb-thread:with-mutex ((host-lock host)) (setf (host-cleanup-pending-p host) t))
+  (loop while (host-display host) do
+    (dolist (command (sb-thread:with-mutex ((host-lock host))
+                       (prog1 (host-commands host) (setf (host-commands host) nil))))
+      (if (eq (host-command-operation command) :stop)
+          (run-host-command host command)
+          (reject-host-command host command)))
+    (sleep 0.005)))
+
 (defun window-worker (host &optional startup-command)
   (let ((next-frame 0) (io-backoff 0))
     (unwind-protect
          (progn
            (when (and startup-command (not (run-host-command host startup-command)))
+             ;; Cancelled startup has no caller left to send :STOP, so try the
+             ;; close here. A completed failure is stopped by its caller.
+             (when (sb-thread:with-mutex ((host-lock host))
+                     (eq (host-command-state startup-command) :cancelled))
+               (handler-case (window-close host)
+                 (error (condition) (host-record-error host :worker-cleanup condition))))
+             (when (host-display host)
+               (supervise-display-cleanup host))
              (return-from window-worker nil))
            (loop until (host-stop-p host) do
              (run-host-commands host)
@@ -192,6 +229,7 @@
 (defun start-window-worker (host &optional startup-command)
   (sb-thread:with-mutex ((host-lock host))
     (setf (host-stop-p host) nil
+          (host-cleanup-pending-p host) nil
           (host-thread host) (sb-thread:make-thread
                               (lambda () (window-worker host startup-command))
                               :name "lispterm session/display"))))

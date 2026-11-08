@@ -5,23 +5,53 @@
 (defvar *hosts-lock* (sb-thread:make-mutex :name "lispterm hosts"))
 (defvar *next-host-id* 0)
 
+(defun signal-cleanup-pending (host operation cause)
+  (error 'host-cleanup-pending :operation operation :host host
+                               :detail (format nil "Native display cleanup is pending (~A)" cause)))
+
+(defun stop-supervised-owner (host)
+  "Ask the owner to close its display with a bounded :STOP.
+A failed close keeps the owner and its PTY, and signals HOST-CLEANUP-PENDING
+when the owner is supervising a display retained by failed startup."
+  (handler-case (call-host host :stop)
+    (host-cleanup-pending (condition) (error condition))
+    (error (condition)
+      (if (sb-thread:with-mutex ((host-lock host)) (host-cleanup-pending-p host))
+          (signal-cleanup-pending host :stop condition)
+          (error condition)))))
+
 (defun stop-window-worker (host &optional startup-command)
-  ;; Startup failure/cancellation exits the owner directly. Do not enqueue a
-  ;; stop behind initialization, or close its PTY before that owner has joined.
-  (when startup-command
-    (sb-thread:with-mutex ((host-lock host))
-      (unless (eq (host-command-state startup-command) :done)
-        (setf (host-command-state startup-command) :cancelled))
-      (setf (host-stop-p host) t)))
-  (when (host-thread host)
-    (when (and (not startup-command) (sb-thread:thread-alive-p (host-thread host)))
-      (call-host host :stop))
-    (unless (sb-thread:join-thread (host-thread host) :timeout 5 :default nil)
-      (when (sb-thread:thread-alive-p (host-thread host))
-        (error 'host-timeout :operation :join :detail "Window owner did not stop"))))
-  (when (host-display host)
-    (error 'host-error :operation :join :host host :detail "Native display cleanup is pending"))
-  (sb-thread:with-mutex ((host-lock host)) (setf (host-thread host) nil)))
+  ;; In-flight startup is cancelled and the owner exits on its own; never
+  ;; enqueue a stop behind initialization. A completed failed startup that
+  ;; retained its display is supervised by the owner and needs a real :STOP.
+  ;; Never close the PTY before the owner has joined.
+  (let ((completed-failure-p nil))
+    (when startup-command
+      (sb-thread:with-mutex ((host-lock host))
+        (if (and (eq (host-command-state startup-command) :done)
+                 (host-command-error startup-command))
+            (setf completed-failure-p t)
+            (progn
+              (unless (eq (host-command-state startup-command) :done)
+                (setf (host-command-state startup-command) :cancelled))
+              (setf (host-stop-p host) t)))))
+    (when (host-thread host)
+      (when (and (or completed-failure-p (not startup-command))
+                 (sb-thread:thread-alive-p (host-thread host))
+                 ;; A completed failure without a display leaves the owner exiting.
+                 (or (not completed-failure-p) (host-display host)))
+        (if completed-failure-p
+            (handler-case (call-host host :stop)
+              (error (condition) (signal-cleanup-pending host :open-cleanup condition)))
+            (stop-supervised-owner host)))
+      (unless (sb-thread:join-thread (host-thread host) :timeout 5 :default nil)
+        (when (sb-thread:thread-alive-p (host-thread host))
+          (if (and startup-command (host-display host))
+              (signal-cleanup-pending host :join "owner retains the display")
+              (error 'host-timeout :operation :join :detail "Window owner did not stop")))))
+    (when (host-display host)
+      (error 'host-error :operation :join :host host :detail "Native display cleanup is pending"))
+    (sb-thread:with-mutex ((host-lock host)) (setf (host-thread host) nil))))
 
 (defun open (&key argv pty (backend :auto) display-name (title "Lispterm") (rows 24) (columns 80))
   "Open a graphical PTY host. Supplying PTY adopts it without spawning a child."
