@@ -334,7 +334,7 @@ MOCK
     cp "$art/operations" "$art/fault-$fault.operations"
   done
   for fault in wrong-title wrong-pid duplicate unsafe-anchor oversized-request stale-owner missing-owner write-failure; do
-    placement_reset
+    placement_reset; owner_token=${owned[$client]}
     case $fault in
       wrong-title) jq '.name="other"' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
       wrong-pid) jq '.pid+=1' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
@@ -347,7 +347,7 @@ MOCK
     esac
     if external_action; then echo "Accepted placement fault: $fault" >&2; exit 1; fi
     [[ ! -e $art/action-ack ]]
-    remember "$client"
+    owned[$client]=$owner_token; unset 'identity_conflicts[$client]'
     # Keep the write-failure directory for action_reset's evidence archive.
   done
   # Positive nonzero anchor is retained; negative geometry and oversize fail fit.
@@ -386,7 +386,7 @@ MOCK
     done
   done
   for fault in unsafe-anchor oversized-request stale-owner missing-owner write-failure; do
-    prep_reset
+    prep_reset; owner_token=${owned[$client]}
     case $fault in
       unsafe-anchor) jq '.rect.y=-16' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
       oversized-request) stage_request 'prepare-retry 9999 800\n';;
@@ -397,7 +397,7 @@ MOCK
     if external_action; then echo "Accepted preparation fault: $fault" >&2; exit 1; fi
     [[ ! -e $art/action-ack ]]
     if [[ $fault != write-failure ]]; then [[ ! -s $art/operations ]]; fi
-    remember "$client" # action_reset archives the write-failure directory too.
+    owned[$client]=$owner_token; unset 'identity_conflicts[$client]' # action_reset archives the write-failure directory too.
     ((prep_checks+=1))
   done
   prep_reset
@@ -486,6 +486,276 @@ set -e
 [[ $error_status == 9 ]]
 grep -Eq '^status=9 source=[^ ]+ line=[0-9]+ function=main$' "$art/shutdown-controls/shell-errors.log"
 printf 'PASS shutdown root0/7 and wait propagation, strict startup/identity/live endpoints, vanished descendant, live orphan, ERR status/location\n' > "$art/shutdown-tests.log"
+# Area-adapter destination and post-close receipt against the production helpers.
+# Only children launched here are signalled; descendant enumeration is mocked.
+(
+  harness_art=$art ctl=$art/adapter-controls; mkdir -m 700 "$ctl"
+  request=$ctl/area-request.sexp; printf '(:area :keyboard)\n' > "$request"
+  request_sha=$(sha256sum "$request" | cut -d' ' -f1)
+  reject() {
+    local code=0
+    fixture_artifact_root "$1" "$2" > /dev/null 2>> "$ctl/reject.stderr" || code=$?
+    [[ $code == 2 ]] || { echo "Artifact root accepted: $1 ($code)" >&2; return 1; }
+  }
+  mkdir -m 700 "$ctl"/{run1,run2,run3,run4,run5,plain,group,world,normal}
+  chmod 770 "$ctl/group"; chmod 703 "$ctl/world"
+  ln -s plain "$ctl/link"; ln -s "$request" "$ctl/request-link"
+  run1=$(fixture_artifact_root "$ctl/run1/recorder" "$request")
+  [[ $run1 == "$ctl/run1/recorder" && -d $run1 && ! -L $run1 && $(stat -c %a "$run1") == 700 ]]
+  reject "$run1" "$request"
+  reject run1/recorder "$request"
+  for bad in "$ctl/plain/../plain/recorder" "$ctl/plain/./recorder" "$ctl//plain/recorder" "$ctl/plain/recorder/" "$ctl/plain/other" \
+             "$ctl/link/recorder" "$ctl/group/recorder" "$ctl/world/recorder" "$ctl/missing/recorder"; do
+    reject "$bad" "$request"
+  done
+  for bad_request in '' area-request.sexp "$ctl/request-link" "$ctl/absent.sexp" "$ctl"; do
+    reject "$ctl/plain/recorder" "$bad_request"
+  done
+  code=0; LISPTERM_VTTEST_ARTIFACT_ROOT=$ctl/plain/recorder LISPTERM_VTTEST_AREA_REQUEST='' fixture_artifact_dir "$ctl/normal" x11 1 > /dev/null 2>&1 || code=$?
+  [[ $code == 2 ]]
+  [[ ! -e $ctl/plain/recorder && ! -e $ctl/group/recorder && ! -e $ctl/world/recorder && ! -e $ctl/missing && -z $(ls -A "$ctl/normal") ]]
+  [[ $(LISPTERM_VTTEST_ARTIFACT_ROOT=$ctl/plain/recorder LISPTERM_VTTEST_AREA_REQUEST=$request fixture_artifact_dir "$ctl/normal" x11 1) == "$ctl/plain/recorder" ]]
+  # Normal runs: a fresh mktemp directory per call, with the original name pattern.
+  unset LISPTERM_VTTEST_ARTIFACT_ROOT
+  normal1=$(fixture_artifact_dir "$ctl/normal" x11 1); normal2=$(fixture_artifact_dir "$ctl/normal" wayland 2)
+  [[ -d $normal1 && -d $normal2 && ${normal1%.*} == "$ctl/normal/vttest-x11-scale1-v3" && ${normal2%.*} == "$ctl/normal/vttest-wayland-scale2-v3" ]]
+  suffix=${normal1##*.}
+  [[ ${#suffix} == 6 && $(ls -A "$ctl/normal" | wc -l) == 2 ]]
+  token1=$(fixture_title_token); token2=$(fixture_title_token)
+  [[ $token1 =~ ^[[:xdigit:]]{16}$ && $token2 =~ ^[[:xdigit:]]{16}$ && $token1 != "$token2" ]]
+  # Receipt fixtures. Launch identity values mirror the gate's adapter mode.
+  owned=(); audited=(); roles=(); direct_children=(); reaped=(); adoption_failures=(); identity_conflicts=(); identity_failures=()
+  cp "$request" "$run1/area-request.sexp"
+  trap 'stop_owned > /dev/null 2>&1' EXIT
+  gate_pid=$BASHPID gate_start=$(process_token "$BASHPID") area_request_sha=$request_sha runtime=''
+  export LISPTERM_VTTEST_TITLE=Lispterm-vttest-$token1-$BASHPID
+  await_file() { local i; for ((i=0;i<300;i++)); do [[ -s $1 ]] && return 0; sleep .01; done; return 1; }
+  fresh_run() { art=$(fixture_artifact_root "$ctl/$1/recorder" "$request"); cp "$request" "$art/area-request.sexp"; owned=(); roles=(); direct_children=(); reaped=(); adoption_failures=(); identity_conflicts=(); identity_failures=(); }
+  art=$run1 backend=wayland
+  bash -c 'sleep 60 & echo "$!" > "$1"; wait' bash "$ctl/server-child" & server=$!
+  bash -c 'trap "" TERM; sleep 60 & echo "$!" > "$1"; while :; do sleep .05; done' bash "$ctl/client-child" & client=$!
+  sleep 60 & holder=$!
+  remember_role server "$server" direct; remember_role client "$client" direct; remember_role keyboard-holder "$holder" direct
+  await_file "$ctl/server-child"; await_file "$ctl/client-child"
+  server_child=$(< "$ctl/server-child"); client_child=$(< "$ctl/client-child")
+  ps() {
+    if [[ $* == "-o pid= --ppid $server" ]]; then printf '%s\n' "$server_child"
+    elif [[ $* == "-o pid= --ppid $client" ]]; then printf '%s\n' "$client_child"; fi
+  }
+  # The holder exits and is reaped before close; its adopted identity is kept.
+  kill "$holder"; code=0; wait_direct_child "$holder" 2>/dev/null || code=$?
+  [[ $code == 143 && ${reaped[$holder]} == 143 ]]
+  [[ -v owned[$holder] && ${roles[$holder]} == keyboard-holder && $(owned_state "$holder") == absent ]]
+  stop_status=0; stop_owned || stop_status=1
+  [[ $stop_status == 0 && ${roles[$server_child]} == descendant && ${roles[$client_child]} == descendant ]]
+  grep -Fxq "KILL $client ${owned[$client]}" "$art/cleanup.log"
+  grep -Fxq "KILL $client_child ${owned[$client_child]}" "$art/cleanup.log"
+  fixture_cleanup_receipt "$stop_status"
+  [[ -v reaped[$server] && ${reaped[$client]} == 137 && ${reaped[$holder]} == 143 ]]
+  receipt_sha=$(sha256sum "$art/cleanup-receipt.sexp" | cut -d' ' -f1)
+  # Exclusive: a second write fails and leaves the first receipt intact.
+  code=0; fixture_cleanup_receipt "$stop_status" || code=$?
+  [[ $code == 2 && $(sha256sum "$art/cleanup-receipt.sexp" | cut -d' ' -f1) == "$receipt_sha" ]]
+  fixture_provenance
+  grep -Eq "^$receipt_sha  \./cleanup-receipt\.sexp\$" "$art/provenance.sha256"
+  (cd "$art"; sha256sum --quiet -c provenance.sha256)
+  unset -f ps
+  # A survivor that no signal reaches: entry and overall failed, nonzero result.
+  fresh_run run2; run2=$art
+  sleep 60 & survivor=$!; remember_role server "$survivor" direct
+  sleep 60 & holder=$!; remember_role keyboard-holder "$holder" direct
+  kill() { [[ $* == *" $survivor" ]] && return 0; builtin kill "$@"; }
+  stop_status=0; stop_owned || stop_status=1
+  unset -f kill
+  code=0; fixture_cleanup_receipt "$stop_status" || code=$?
+  [[ $stop_status == 1 && $code == 1 && $(owned_state "$survivor") == live ]]
+  grep -Fxq "SURVIVED $survivor" "$art/cleanup.log"
+  kill "$survivor"; wait "$survivor" 2>/dev/null || true
+  # An unreadable probe is unknown even though is_owned and stop_owned see nothing.
+  fresh_run run3; run3=$art
+  sleep 60 & probe=$!; remember_role server "$probe" direct
+  sleep 60 & holder=$!; remember_role keyboard-holder "$holder" direct
+  cat() { [[ $* != *"/proc/$probe/stat"* ]] || return 1; command cat "$@"; }
+  stop_status=0; stop_owned || stop_status=1
+  code=0; fixture_cleanup_receipt "$stop_status" || code=$?
+  unset -f cat
+  [[ $stop_status == 0 && $code == 1 && ! -v reaped[$probe] && $(owned_state "$probe") == live ]]
+  kill "$probe"; wait "$probe" 2>/dev/null || true
+  # A required Wayland holder that was never adopted is incomplete, not stopped.
+  fresh_run run4; run4=$art
+  sleep 60 & server=$!; remember_role compositor "$server"
+  stop_status=0; stop_owned || stop_status=1
+  code=0; fixture_cleanup_receipt "$stop_status" || code=$?
+  [[ $stop_status == 0 && $code == 1 ]]
+  wait "$server" 2>/dev/null || true
+  # X11 has no keyboard holder.
+  fresh_run run5; run5=$art; backend=x11
+  sleep 60 & server=$!; remember_role server "$server" direct
+  stop_status=0; stop_owned || stop_status=1
+  fixture_cleanup_receipt "$stop_status"
+  # Fail closed with no owned processes, including failures before request copy.
+  new_control() { mkdir -m 700 "$ctl/$1"; fresh_run "$1"; }
+  expect_unknown() {
+    local result=0
+    fixture_cleanup_receipt 0 || result=$?
+    [[ $result == 1 ]]
+    grep -q '^ :state :unknown ' "$art/cleanup-receipt.sexp"
+  }
+  saved_pid=$gate_pid saved_start=$gate_start saved_title=$LISPTERM_VTTEST_TITLE
+  for binding in gate_pid gate_start LISPTERM_VTTEST_TITLE area_request_sha; do
+    new_control "missing-$binding"
+    printf -v "$binding" '%s' ''
+    expect_unknown
+    grep -q ':launch-valid nil ' "$art/cleanup-receipt.sexp"
+    gate_pid=$saved_pid gate_start=$saved_start LISPTERM_VTTEST_TITLE=$saved_title area_request_sha=$request_sha
+  done
+  new_control mismatch-digest
+  printf 'changed request\n' >> "$art/area-request.sexp"
+  expect_unknown
+  new_control missing-request
+  mv "$art/area-request.sexp" "$art/retained-request.sexp"
+  expect_unknown
+  new_control nonnormalized-path
+  art=$art/.
+  expect_unknown
+  new_control early-x11
+  early_art=$art
+  # Exercise the actual production EXIT cleanup, with publication helpers stubbed.
+  eval "$(sed -n '/^cleanup() {$/,/^}$/p' tests/vttest-gate.sh)"
+  code=0
+  (
+    artifact_root=$art area_request_sha='' runtime='' mode=record
+    fixture_latest_pointer() { :; }
+    fixture_provenance() { :; }
+    trap cleanup EXIT
+    exit 9
+  ) > "$art/early.stdout" 2> "$art/early.stderr" || code=$?
+  printf '%s\n' "$code" > "$art/early.status"
+  [[ $code == 1 && $(< "$art/harness.exit") == 1 ]]
+  grep -q '^ :state :unknown ' "$art/cleanup-receipt.sexp"
+  # A previously waited client retains its first ordinary nonzero exit status.
+  new_control waited-client
+  bash -c 'while [[ ! -f $1 ]]; do sleep .01; done; exit 7' bash "$art/release" & client=$!
+  remember_role client "$client" direct
+  touch "$art/release"
+  code=0; fixture_wait_client || code=$?
+  [[ $code == 7 && ${reaped[$client]} == 7 ]]
+  code=0; wait_direct_child "$client" || code=$?
+  [[ $code == 7 && ${reaped[$client]} == 7 ]]
+  fixture_cleanup_receipt 0
+  grep -q ':wait-status 7)' "$art/cleanup-receipt.sexp"
+  # An absent identity without any wait evidence cannot prove direct-child reap.
+  new_control unrecorded-wait
+  bash -c 'while [[ ! -f $1 ]]; do sleep .01; done' bash "$art/release" & client=$!
+  remember_role client "$client" direct
+  touch "$art/release"; wait "$client"
+  [[ ! -v reaped[$client] ]]
+  code=0; write_cleanup_receipt 0 none || code=$?
+  [[ $code == 1 ]]
+  grep -q ':state :unknown :observed :absent :direct t :wait-status nil)' "$art/cleanup-receipt.sexp"
+  # A failed wait cannot be upgraded by another wait, even on an absent identity.
+  new_control wait127
+  bash -c 'while [[ ! -f $1 ]]; do sleep .01; done' bash "$art/release" & client=$!
+  remember_role client "$client" direct
+  touch "$art/release"; wait "$client"
+  wait() { return 127; }
+  expect_unknown
+  unset -f wait
+  code=0; wait_direct_child "$client" || code=$?
+  [[ $code == 127 && ${reaped[$client]} == 127 ]]
+  grep -q ':wait-status 127)' "$art/cleanup-receipt.sexp"
+  # Token-read failure is explicit; no unowned PID is signalled or probed later.
+  new_control adoption-failure
+  bash -c 'while [[ ! -f $1 ]]; do sleep .01; done; exit 7' bash "$art/release" & unadopted=$!
+  cat() { [[ $* != "/proc/$unadopted/stat" ]] || return 1; command cat "$@"; }
+  remember_role client "$unadopted" direct
+  unset -f cat
+  [[ ! -v owned[$unadopted] && ${#adoption_failures[@]} == 1 && ${adoption_failures[0]} == *':role "client"'* ]]
+  touch "$art/release"; code=0; wait "$unadopted" || code=$?
+  [[ $code == 7 ]]
+  expect_unknown
+  grep -q ":pid $unadopted :reason :initial-token-unreadable)" "$art/cleanup-receipt.sexp"
+  grep -q ':launch-valid t ' "$art/cleanup-receipt.sexp"
+  # Synthetic PID/start identities: no OS process lookup, enumeration or signals.
+  (
+    mock_pid=424242 mock_start=101
+    process_token() { [[ -n $mock_start ]] || return 1; printf '%s\n' "$mock_start"; }
+    owned_state() { echo absent; }
+    wait() { printf '%s\n' "$1" >> "$ctl/mock-waits"; return 7; }
+    kill() { echo 'unexpected mock signal' >&2; return 1; }
+    ps() { echo 'unexpected mock enumeration' >&2; return 1; }
+    new_control repeated-identity
+    remember_role client "$mock_pid" direct
+    remember "$mock_pid"
+    remember_role client "$mock_pid" direct
+    [[ ${owned[$mock_pid]} == 101 && ${roles[$mock_pid]} == client && -v direct_children[$mock_pid] && ${#identity_failures[@]} == 0 ]]
+    code=0; wait_direct_child "$mock_pid" || code=$?
+    [[ $code == 7 && ${reaped[$mock_pid]} == 7 ]]
+    remember "$mock_pid"; remember_role client "$mock_pid" direct
+    code=0; wait_direct_child "$mock_pid" || code=$?
+    [[ $code == 7 && $(wc -l < "$ctl/mock-waits") == 1 ]]
+    fixture_cleanup_receipt 0
+    grep -q ':start "101" :state :stopped :observed :absent :direct t :wait-status 7)' "$art/cleanup-receipt.sexp"
+    # A reused descendant PID cannot inherit the saved direct-client wait.
+    new_control reused-identity
+    remember_role client "$mock_pid" direct
+    code=0; wait_direct_child "$mock_pid" || code=$?
+    [[ $code == 7 ]]
+    mock_start=202
+    remember "$mock_pid"
+    remember_role keyboard-holder "$mock_pid" direct
+    [[ ${owned[$mock_pid]} == 101 && ${roles[$mock_pid]} == client && ${reaped[$mock_pid]} == 7 && -v identity_conflicts[$mock_pid] ]]
+    code=0; wait_direct_child "$mock_pid" || code=$?
+    [[ $code == 127 && ${reaped[$mock_pid]} == 7 && $(wc -l < "$ctl/mock-waits") == 2 ]]
+    if is_owned "$mock_pid"; then echo 'reused PID treated as owned' >&2; exit 1; fi
+    stop_owned
+    expect_unknown
+    grep -q ':start "101" :state :unknown :observed :absent :direct t :wait-status 7)' "$art/cleanup-receipt.sexp"
+    grep -q ':pid 424242 :start "101" :observed-start "202" :reason :pid-reused)' "$art/cleanup-receipt.sexp"
+    # Each failed initial adoption is retained even after that PID was recorded.
+    new_control seen-adoption-failure
+    mock_start=101; remember_role client "$mock_pid" direct
+    mock_start=''
+    remember_role keyboard-holder "$mock_pid" direct
+    remember_role server "$mock_pid" direct
+    [[ ${#adoption_failures[@]} == 2 && ${owned[$mock_pid]} == 101 && ${roles[$mock_pid]} == client && ! -v reaped[$mock_pid] ]]
+    expect_unknown
+    grep -q ':role "keyboard-holder" :pid 424242 :reason :initial-token-unreadable)' "$art/cleanup-receipt.sexp"
+    grep -q ':role "server" :pid 424242 :reason :initial-token-unreadable)' "$art/cleanup-receipt.sexp"
+    printf 'PASS same PID/start repeated tracking and one saved wait; reused PID preserves original identity/role/wait, blocks ownership and wait transfer, cleanup unknown; every seen-PID adoption failure retained\n' > "$ctl/identity-controls.log"
+  )
+  printf 'PASS missing bindings/request, digest mismatch, normalized path, actual early X11 EXIT cleanup nonzero, first client7/holder143 retained, absent unrecorded wait, wait127 rejected, explicit adoption failure\n' > "$ctl/blocking-controls.log"
+  trap - EXIT
+  # Read each receipt as data and compare its structure, not its formatting.
+  RECEIPTS=$run1:$run2:$run3:$run4:$run5 scripts/sbcl --script /dev/stdin > "$ctl/receipts.txt" <<'LISP'
+(defun split-receipts (string)
+  (loop with start = 0 for pos = (position #\: string :start start)
+        collect (subseq string start pos) while pos do (setf start (1+ pos))))
+(let ((*read-eval* nil) (*package* (find-package "CL-USER")))
+  (dolist (dir (split-receipts (sb-ext:posix-getenv "RECEIPTS")))
+    (with-open-file (in (concatenate 'string dir "/cleanup-receipt.sexp"))
+      (let* ((form (read in)) (launch (getf form :launch)))
+        (assert (eq (read in nil :eof) :eof))
+        (assert (and (eq (getf form :kind) :vttest-gate-cleanup) (eql (getf form :version) 1)
+                     (eq (getf form :phase) :post-close) (integerp (getf launch :gate-pid))
+                     (stringp (getf launch :gate-start)) (stringp (getf launch :title))))
+        (dolist (entry (getf form :owned))
+          (assert (and (integerp (getf entry :pid)) (stringp (getf entry :start)))))
+        (format t "RECEIPT ~a ~a ~(~a ~a~)~{ ~a~}~%" (getf launch :artifacts) (getf launch :area-request-sha256)
+                (getf form :state) (getf form :wayland-holder)
+                (sort (mapcar (lambda (entry) (format nil "~a=~(~a~)" (getf entry :role) (getf entry :state)))
+                              (getf form :owned))
+                      #'string<))))))
+LISP
+  receipts=$ctl/receipts.txt
+  grep -Fxq "RECEIPT $run1 $request_sha stopped stopped client=stopped descendant=stopped descendant=stopped keyboard-holder=stopped server=stopped" "$receipts"
+  grep -Fxq "RECEIPT $run2 $request_sha failed stopped keyboard-holder=stopped server=failed" "$receipts"
+  grep -Fxq "RECEIPT $run3 $request_sha unknown stopped keyboard-holder=stopped server=unknown" "$receipts"
+  grep -Fxq "RECEIPT $run4 $request_sha incomplete missing compositor=stopped" "$receipts"
+  grep -Fxq "RECEIPT $run5 $request_sha stopped not-applicable server=stopped" "$receipts"
+  [[ $(grep -c '^RECEIPT ' "$receipts") == 5 ]]
+  printf 'PASS exclusive RUN/recorder destination, %s rejected destinations/requests, normal mktemp path; receipts: roles+descendants stopped, reaped holder143 retained, TERM-ignoring KILL137, survivor failed, unknown probe, missing holder incomplete, X11 not-applicable, exclusive write, provenance; blocking launch/wait/adoption controls\n' "$(grep -c . "$ctl/reject.stderr")" > "$harness_art/adapter-tests.log"
+)
 # Pure/mock isolation tests, with a real disposable lock but no GUI processes.
 fixture_scale x11 1; fixture_scale wayland 1; fixture_scale wayland 2
 for spec in 'x11 2' 'wayland 0' 'wayland 3' 'wayland 02' 'wayland 1.0' 'unknown 1'; do
@@ -647,5 +917,5 @@ for dir in vttest-x11.soyWA3 vttest-wayland.4pz8fm vttest-wayland.P7So6b; do
   fi
 done
 git diff --check
-cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log" "$art/isolation-tests.log" "$art/pointer-tests.log" "$art/shutdown-tests.log"
+cat "$art/protocol-tests.log" "$art/recorder-tests.log" "$art/cleanup-tests.log" "$art/isolation-tests.log" "$art/pointer-tests.log" "$art/shutdown-tests.log" "$art/adapter-tests.log"
 echo 'Offline/static/disposable harness checks passed; no GUI run.'

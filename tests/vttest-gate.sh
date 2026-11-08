@@ -4,23 +4,37 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 # These functions are also sourced by the disposable non-GUI cleanup test.
-declare -A owned=() audited=()
+declare -A owned=() audited=() roles=() direct_children=() reaped=() identity_conflicts=()
+declare -a adoption_failures=() identity_failures=()
 process_token() {
   local stat rest
+  local -a fields
   [[ $1 =~ ^[0-9]+$ && -r /proc/$1/stat ]] || return 1
   stat=$(cat "/proc/$1/stat") || return 1
   rest=${stat##*) }; read -ra fields <<< "$rest"
-  [[ ${fields[0]} != Z ]] || return 1
+  [[ ${fields[0]:-} != Z && ${fields[19]:-} =~ ^[1-9][0-9]*$ ]] || return 1
   printf '%s\n' "${fields[19]}"
 }
-remember() { local token; token=$(process_token "$1") || return 0; owned[$1]=$token; }
-is_owned() { [[ -v owned[$1] ]] && [[ $(process_token "$1" 2>/dev/null) == "${owned[$1]}" ]]; }
+# Keep the first identity and its evidence. A reused PID is never adopted or signalled.
+remember() {
+  local token=${2:-}
+  [[ -n $token ]] || token=$(process_token "$1") || return 0
+  if [[ -v owned[$1] && ${owned[$1]} != "$token" ]]; then
+    identity_conflicts[$1]=1
+    identity_failures+=("$(printf '(:pid %s :start %s :observed-start %s :reason :pid-reused)' \
+      "$1" "$(sexp_string "${owned[$1]}")" "$(sexp_string "$token")")")
+    return 0
+  fi
+  [[ -v owned[$1] ]] || owned[$1]=$token
+}
+is_owned() { [[ -v owned[$1] && ! -v identity_conflicts[$1] ]] && [[ $(process_token "$1" 2>/dev/null) == "${owned[$1]}" ]]; }
 collect_tree() {
   local pid=$1 child
   is_owned "$pid" || return 0
   while read -r child; do
     [[ -n $child ]] || continue
-    remember "$child"; collect_tree "$child"
+    remember "$child"; [[ ! -v owned[$child] || -v roles[$child] ]] || roles[$child]=descendant
+    collect_tree "$child"
   done < <(ps -o pid= --ppid "$pid" 2>/dev/null)
 }
 stop_owned() {
@@ -49,6 +63,129 @@ stop_owned() {
     if is_owned "$pid"; then printf 'SURVIVED %s\n' "$pid" >> "$art/cleanup.log"; return 1; fi
   done
   printf 'all-owned-stopped\n' >> "$art/cleanup.log"
+}
+# Keep failed root adoption visible without asserting ownership or signalling it.
+remember_role() {
+  local token
+  if ! token=$(process_token "$2"); then
+    adoption_failures+=("$(printf '(:role %s :pid %s :reason :initial-token-unreadable)' "$(sexp_string "$1")" "$2")")
+    return 0
+  fi
+  remember "$2" "$token"
+  [[ ! -v identity_conflicts[$2] ]] || return 0
+  [[ -v roles[$2] ]] || roles[$2]=$1
+  [[ ${3:-} != direct ]] || direct_children[$2]=1
+}
+# Post-close observation of one adopted PID: live, zombie, absent, replaced or
+# unknown. Only absent, replaced and zombie are verified exits; a failed or
+# unreadable probe is unknown, never stopped.
+owned_state() {
+  local stat rest state token
+  local -a fields
+  [[ -v owned[$1] && $1 =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
+  if ! stat=$(cat "/proc/$1/stat" 2>/dev/null); then
+    if [[ -d /proc/self && ! -e /proc/$1 ]]; then echo absent; else echo unknown; fi
+    return 0
+  fi
+  rest=${stat##*) }; read -ra fields <<< "$rest"
+  state=${fields[0]:-} token=${fields[19]:-}
+  if [[ -z $state || -z $token ]]; then echo unknown
+  elif [[ $token != "${owned[$1]}" ]]; then echo replaced
+  elif [[ $state == Z ]]; then echo zombie
+  else echo live
+  fi
+}
+# Save the first wait at every production wait site, including nonzero exits.
+# 127 is ambiguous (not a child or exit 127), so it cannot prove a reap.
+wait_direct_child() {
+  local pid=$1 status=0
+  [[ ! -v identity_conflicts[$pid] ]] || return 127
+  if [[ -v reaped[$pid] ]]; then return "${reaped[$pid]}"; fi
+  wait "$pid" || status=$?
+  [[ ! -v direct_children[$pid] ]] || reaped[$pid]=$status
+  return "$status"
+}
+# Only wait after exit; live/unknown identities are left alone.
+reap_direct_children() {
+  local pid
+  for pid in "${!direct_children[@]}"; do
+    [[ -v owned[$pid] && ! -v reaped[$pid] && ! -v identity_conflicts[$pid] ]] || continue
+    case $(owned_state "$pid") in live|unknown) continue;; esac
+    wait_direct_child "$pid" 2>/dev/null || true
+  done
+}
+sexp_string() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
+sexp_string_or_nil() { if [[ -n $1 ]]; then sexp_string "$1"; else printf nil; fi; }
+# Runtime directory left after close: none, removed or retained.
+runtime_cleanup_state() {
+  local path=${runtime:-}
+  [[ -n $path || ! -f $art/compositor/runtime-path ]] || path=$(cat "$art/compositor/runtime-path")
+  if [[ -z $path ]]; then echo none
+  elif [[ -e $path || -L $path ]]; then echo retained
+  else echo removed
+  fi
+}
+# A complete receipt requires the actual copied request and all launch bindings.
+receipt_launch_valid() {
+  [[ ${gate_pid:-} =~ ^[1-9][0-9]*$ && ${gate_start:-} =~ ^[1-9][0-9]*$ &&
+     -n ${LISPTERM_VTTEST_TITLE:-} && ${area_request_sha:-} =~ ^[[:xdigit:]]{64}$ &&
+     $art =~ ^(/[^/]+)+$ && ${art##*/} == recorder && $art/ != */./* && $art/ != */../* &&
+     -d $art && ! -L $art && $(realpath -e -- "$art") == "$art" &&
+     -f $art/area-request.sexp && ! -L $art/area-request.sexp ]] || return 1
+  local digest
+  digest=$(sha256sum "$art/area-request.sexp") || return 1
+  [[ ${digest%% *} == "$area_request_sha" ]]
+}
+# Exclusive post-close receipt bound to this launch. Returns 0 only when every
+# adopted PID is verified stopped, the Wayland holder is accounted for and the
+# runtime is gone; 1 for a written non-stopped receipt; 2 when it was not written.
+write_cleanup_receipt() {
+  local stop_status=$1 runtime_state=$2 pid observed state entries='' receipt
+  local overall=stopped holder=missing failed=0 unknown=0
+  [[ $backend != x11 ]] || holder=not-applicable
+  for pid in $(printf '%s\n' "${!owned[@]}" | sort -n); do
+    observed=$(owned_state "$pid")
+    case $observed in
+      absent|replaced) state=stopped;;
+      zombie) if [[ -v direct_children[$pid] ]]; then state=failed; else state=stopped; fi;;
+      live) state=failed;;
+      *) observed=unknown state=unknown;;
+    esac
+    if [[ $state == stopped && -v direct_children[$pid] ]]; then
+      [[ -v reaped[$pid] && ${reaped[$pid]} != 127 ]] || state=unknown
+    fi
+    [[ ! -v identity_conflicts[$pid] ]] || state=unknown
+    [[ $state != failed ]] || failed=1
+    [[ $state != unknown ]] || unknown=1
+    [[ ${roles[$pid]:-} != keyboard-holder || $backend != wayland ]] || holder=$state
+    entries+=$(printf '\n  (:role %s :pid %s :start %s :state :%s :observed :%s :direct %s :wait-status %s)' \
+      "$(sexp_string "${roles[$pid]:-unlabeled}")" "$pid" "$(sexp_string "${owned[$pid]}")" "$state" "$observed" \
+      "$([[ -v direct_children[$pid] ]] && echo t || echo nil)" "${reaped[$pid]:-nil}")
+  done
+  local launch_valid=t adoption_entries='' identity_entries='' entry
+  receipt_launch_valid || { launch_valid=nil; unknown=1; }
+  for entry in "${adoption_failures[@]}"; do
+    unknown=1; adoption_entries+=$'\n  '"$entry"
+  done
+  for entry in "${identity_failures[@]}"; do
+    unknown=1; identity_entries+=$'\n  '"$entry"
+  done
+  [[ $stop_status == 0 ]] || failed=1
+  [[ $runtime_state != retained ]] || failed=1
+  if ((failed)); then overall=failed
+  elif ((unknown)); then overall=unknown
+  elif [[ $holder == missing ]]; then overall=incomplete
+  fi
+  receipt=$(printf '(:kind :vttest-gate-cleanup :version 1 :phase :post-close\n :launch (:gate-pid %s :gate-start %s :title %s :artifacts %s :area-request-sha256 %s)\n :state :%s :stop-owned :%s :runtime :%s\n :owned (%s)\n :wayland-holder :%s\n :launch-valid %s :adoption-failures (%s) :identity-failures (%s))' \
+    "$(if [[ ${gate_pid:-} =~ ^[0-9]+$ ]]; then printf '%s' "$gate_pid"; else printf nil; fi)" "$(sexp_string_or_nil "${gate_start:-}")" "$(sexp_string_or_nil "${LISPTERM_VTTEST_TITLE:-}")" \
+    "$(sexp_string "$art")" "$(sexp_string_or_nil "${area_request_sha:-}")" \
+    "$overall" "$([[ $stop_status == 0 ]] && echo all-stopped || echo survived)" "$runtime_state" "$entries" "$holder" "$launch_valid" "$adoption_entries" "$identity_entries")
+  (set -o noclobber; printf '%s\n' "$receipt" > "$art/cleanup-receipt.sexp") 2>/dev/null || return 2
+  [[ $overall == stopped ]]
+}
+fixture_cleanup_receipt() {
+  reap_direct_children
+  write_cleanup_receipt "$1" "$(runtime_cleanup_state)"
 }
 watchdog_check() { ((SECONDS < $1)) || { echo "vttest total watchdog expired" >&2; return 124; }; }
 # Shared shell interface for the later native fixture: source with FUNCTIONS_ONLY.
@@ -134,7 +271,7 @@ fixture_error() {
 }
 fixture_wait_client() {
   local code=0
-  wait "$client" || code=$?
+  wait_direct_child "$client" || code=$?
   printf 'client-wait pid=%s start=%s status=%s\n' "$client" "${owned[$client]:-unknown}" "$code" >> "$art/client-wait.log"
   return "$code"
 }
@@ -143,6 +280,41 @@ fixture_latest_pointer() {
   local pointer=$1
   printf '%s\n' "$art" > "$art/latest-pointer.txt" || return 1
   ln -T -- "$art/latest-pointer.txt" "$pointer" 2>/dev/null || [[ -e $pointer || -L $pointer ]]
+}
+# Area-adapter destination: validated RUN/recorder, created exclusively. Only
+# accepted with an area request. Exit status 2 means nothing was created.
+fixture_artifact_root() {
+  local target=$1 request=$2 parent perm
+  [[ -n $request && $request == /* && -f $request && ! -L $request ]] ||
+    { echo 'Artifact root requires an absolute regular area request' >&2; return 2; }
+  [[ $target =~ ^(/[^/]+)+$ && ${target##*/} == recorder && $target/ != */./* && $target/ != */../* ]] ||
+    { echo 'Artifact root must be an absolute normalized RUN/recorder path' >&2; return 2; }
+  parent=${target%/*}
+  [[ -d $parent && ! -L $parent && -O $parent && $(realpath -e -- "$parent") == "$parent" ]] ||
+    { echo 'Artifact root parent must be an owned real directory' >&2; return 2; }
+  perm=$(stat -c %a -- "$parent") && (( (8#$perm & 8#022) == 0 )) ||
+    { echo 'Artifact root parent must not be group or world writable' >&2; return 2; }
+  [[ ! -e $target && ! -L $target ]] || { echo 'Artifact root already exists' >&2; return 2; }
+  mkdir -m 700 -- "$target" || return 2
+  printf '%s\n' "$target"
+}
+# Normal runs keep the original mktemp directory.
+fixture_artifact_dir() {
+  if [[ -n ${LISPTERM_VTTEST_ARTIFACT_ROOT:-} ]]; then
+    fixture_artifact_root "$LISPTERM_VTTEST_ARTIFACT_ROOT" "${LISPTERM_VTTEST_AREA_REQUEST:-}"
+  else
+    mktemp -d "$1/vttest-$2-scale$3-v3.XXXXXX"
+  fi
+}
+# A fixed recorder path has no mktemp suffix, so the title needs its own token.
+fixture_title_token() {
+  local token
+  token=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+  [[ $token =~ ^[[:xdigit:]]{16}$ ]] && printf '%s\n' "$token"
+}
+# Hash all data and metadata, with relative filenames.
+fixture_provenance() {
+  (cd "$art"; find . -type f ! -name provenance.sha256 -print0 | sort -z | xargs -0 sha256sum > provenance.sha256)
 }
 audit_client_tree() {
   local pid child
@@ -208,9 +380,15 @@ if [[ ! -f ${LISPTERM_FONT:-} ]]; then
 fi
 mkdir -p "$root/.build/evidence"
 fixture_lock || { echo "Invalid inherited GUI lock" >&2; exit 1; }
-art=$(mktemp -d "$root/.build/evidence/vttest-${backend}-scale${scale}-v3.XXXXXX")
+title_token=''
+if [[ -n ${LISPTERM_VTTEST_ARTIFACT_ROOT:-} ]]; then title_token=$(fixture_title_token); fi
+art=$(fixture_artifact_dir "$root/.build/evidence" "$backend" "$scale")
+# Launch binding for the area-adapter cleanup receipt; empty in normal runs.
+artifact_root='' gate_pid=$$ gate_start='' area_request_sha=''
+if [[ -n ${LISPTERM_VTTEST_ARTIFACT_ROOT:-} ]]; then artifact_root=$art; gate_start=$(process_token $$ || true); fi
+[[ -n $title_token ]] || title_token=${art##*.}
 export LISPTERM_VTTEST_ARTIFACTS="$art/" LISPTERM_VTTEST_BACKEND=$backend LISPTERM_VTTEST_BASH=$BASH
-export LISPTERM_VTTEST_TITLE="Lispterm-vttest-${art##*.}-$$"
+export LISPTERM_VTTEST_TITLE="Lispterm-vttest-${title_token}-$$"
 # The ordinary root is always the actual mktemp result, never the caller hint.
 if [[ ${LISPTERM_VTTEST_ON_PHASE:-0} == 1 ]]; then mkdir "$art/on-phase"; fi
 client='' server='' keyboard_holder='' runtime=''
@@ -222,23 +400,27 @@ cleanup() {
   # is a second identity check when startup failed before its PID was adopted.
   if [[ -f $art/compositor/compositor.pid ]]; then
     pid=$(cat "$art/compositor/compositor.pid")
-    if [[ $pid =~ ^[0-9]+$ && -r $art/compositor/compositor.start && $(process_token "$pid") == "$(cat "$art/compositor/compositor.start")" ]] && grep -zFxq -- "$art/compositor/sway.conf" "/proc/$pid/cmdline"; then remember "$pid"; fi
+    if [[ $pid =~ ^[0-9]+$ && -r $art/compositor/compositor.start && $(process_token "$pid") == "$(cat "$art/compositor/compositor.start")" ]] && grep -zFxq -- "$art/compositor/sway.conf" "/proc/$pid/cmdline"; then remember_role compositor "$pid"; fi
   fi
   : > "$art/process-tree-final.txt"
   for pid in "${!owned[@]}"; do
     is_owned "$pid" && ps -p "$pid" -o pid,ppid,pgid,sid,lstart,args >> "$art/process-tree-final.txt"
   done
-  local stopped=1
-  stop_owned || { code=1; stopped=0; }
+  local stopped=1 stop_status=0
+  stop_owned || { code=1; stopped=0; stop_status=1; }
   if [[ $stopped == 1 && -f $art/compositor/runtime-path ]]; then
     runtime=$(cat "$art/compositor/runtime-path")
     if private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
   fi
   if [[ $stopped == 1 && $backend == x11 ]] && private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
+  # Adapter mode only: after close, reaping and runtime cleanup, before hashing.
+  if [[ -n $artifact_root ]] && ! fixture_cleanup_receipt "$stop_status"; then
+    code=1; echo 'Cleanup receipt not written or cleanup not verified' >&2
+  fi
   fixture_latest_pointer "$root/.build/evidence/vttest-${backend}-latest" || code=1
   printf '%s\n' "$code" > "$art/harness.exit"
   # Hash all data and metadata after cleanup, with relative filenames.
-  if ! (cd "$art"; find . -type f ! -name provenance.sha256 -print0 | sort -z | xargs -0 sha256sum > provenance.sha256); then
+  if ! fixture_provenance; then
     code=1; printf '%s\n' "$code" > "$art/harness.exit"
   fi
   echo "vttest $mode exit=$code: $art"
@@ -256,6 +438,7 @@ if [[ -n ${LISPTERM_VTTEST_AREA_REQUEST:-} ]]; then
   [[ $LISPTERM_VTTEST_AREA_REQUEST == /* && -f $LISPTERM_VTTEST_AREA_REQUEST && ! -L $LISPTERM_VTTEST_AREA_REQUEST ]]
   [[ ${LISPTERM_VTTEST_AREA_RECEIPT:-} == /* && ! -e $LISPTERM_VTTEST_AREA_RECEIPT ]]
   cp "$LISPTERM_VTTEST_AREA_REQUEST" "$art/area-request.sexp"
+  [[ -z $artifact_root ]] || area_request_sha=$(sha256sum "$art/area-request.sexp" | cut -d' ' -f1)
   (set -o noclobber; printf '%s\n' "$art" > "$LISPTERM_VTTEST_AREA_RECEIPT")
   cp tests/vttest-area.lisp tests/vttest-cursor-driver.lisp tests/vttest-cursor-oracle.lisp "$art/"
 fi
@@ -307,7 +490,7 @@ if [[ $backend == x11 ]]; then
   export XDG_RUNTIME_DIR=$runtime
   unset WAYLAND_DISPLAY SWAYSOCK DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID DBUS_SESSION_BUS_WINDOWID
   Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp 3> "$art/display-number" > "$art/xvfb.log" 2>&1 & server=$!
-  remember "$server"
+  remember_role server "$server" direct
   for ((i=0;i<100;i++)); do
     is_owned "$server" || { echo 'Owned Xvfb failed' >&2; exit 1; }
     [[ -s $art/display-number ]] && break; sleep .05
@@ -320,7 +503,7 @@ if [[ $backend == x11 ]]; then
 else
   timeout 15 tests/wayland-gate.sh start "$art/compositor" "$scale"
   source "$art/compositor/env.sh"
-  server=$(cat "$art/compositor/compositor.pid"); remember "$server"
+  server=$(cat "$art/compositor/compositor.pid"); remember_role compositor "$server"
   [[ -z ${DISPLAY+x} ]]
   fixture_isolation > "$art/isolation.txt" || exit 1
   # Initial size only. Subsequent capture rectangles follow actual native geometry.
@@ -329,12 +512,12 @@ else
   done
   printf 'DISPLAY=unset\nWAYLAND_DISPLAY=%s\n' "$WAYLAND_DISPLAY" > "$art/transport.txt"
   "$LISPTERM_WTYPE" -s "$(( (${LISPTERM_VTTEST_TIMEOUT:-1800} + 60) * 1000 ))" > "$art/keyboard-holder.log" 2>&1 & keyboard_holder=$!
-  remember "$keyboard_holder"; sleep .3; is_owned "$keyboard_holder"
+  remember_role keyboard-holder "$keyboard_holder" direct; sleep .3; is_owned "$keyboard_holder"
 fi
 fixture_isolation > "$art/isolation.txt" || { echo "Endpoint isolation failed" >&2; exit 1; }
 unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
 "$root/scripts/sbcl" --script tests/vttest-gate.lisp < /dev/null > "$art/client.log" 2>&1 & client=$!
-remember "$client"
+remember_role client "$client" direct
 audit_client_tree || { echo "Client endpoint audit failed" >&2; exit 1; }
 # Strictly one exact-title window on this private display. Native PID must equal
 # our client. X11 may omit _NET_WM_PID, so private server + unguessable title is

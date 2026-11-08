@@ -216,8 +216,8 @@
   (flet ((check (value name)
            (if value (verify t name)
                (progn (push name failures) (format t "REGRESSION FAIL ~a~%" name)))))
-    (dolist (spec '(("keyboard-cursor" (5 2) *cursor-titles* ("Up" "Down" "Left" "Right"))
-                    ("keyboard-keypad" (5 3) *keypad-titles* ("KP_1" "KP_2" "KP_Enter"))))
+    (dolist (spec '(("keyboard-cursor" (5 4) *cursor-titles* ("Up" "Down" "Left" "Right"))
+                    ("keyboard-keypad" (5 5) *keypad-titles* ("KP_1" "KP_2" "KP_Enter"))))
       (destructuring-bind (label path title-variable keys) spec
         (let* ((titles (symbol-value title-variable))
                (phases (mapcar #'keyboard-grid titles))
@@ -318,16 +318,16 @@
                                                  (list (length wire)))))
                 (format nil "retained ~a replay in ~d-byte chunks" label size)))
       (multiple-value-bind (result inputs)
-          (scripted-case label (if (= phases 3) '(5 2) '(5 3)) 1
+          (scripted-case label (if (= phases 3) '(5 4) '(5 5)) 1
                          (append (list *main-grid* *keyboard-menu-grid*)
                                  (mapcar #'keyboard-grid (keyboard-titles label))
                                  (list expected *keyboard-menu-grid* *main-grid*)))
         (verify (and (getf result :inventory-ok) (= 1 (count (string #\Return) inputs :test #'equal)))
                 (format nil "retained ~a final grid completes real recorder dispatch" label))))))
-(dolist (spec '(("keyboard-cursor" (5 2) "Down" "Up")
-                ("keyboard-keypad" (5 3) "KP_2" "KP_1")
-                ("keyboard-cursor" (5 2) "Tab" "Right")
-                ("keyboard-keypad" (5 3) "Tab" "KP_Enter")))
+(dolist (spec '(("keyboard-cursor" (5 4) "Down" "Up")
+                ("keyboard-keypad" (5 5) "KP_2" "KP_1")
+                ("keyboard-cursor" (5 4) "Tab" "Right")
+                ("keyboard-keypad" (5 5) "Tab" "KP_Enter")))
   (destructuring-bind (label path failed-key last-key) spec
     (multiple-value-bind (result inputs)
         (scripted-case label path 1

@@ -1,0 +1,76 @@
+;;;; Synthetic cleanup records for pure consumer controls, never native proof.
+(in-package #:vttest-keyboard-driver-tests)
+
+(defun cleanup-owned (role pid direct &optional (wait (and direct 143)))
+  (list :role role :pid pid :start (format nil "~d" (+ 10000 pid))
+        :state :stopped :observed :absent :direct direct :wait-status wait))
+(defun write-cleanup (root raw)
+  (c:write-value (c::cat root "recorder/cleanup-receipt.sexp") raw))
+(defun cleanup-fixture (backend &optional (root (temp-root)))
+  (let ((dir (c::cat root "recorder/")))
+    (unless (probe-file dir) (sb-posix:mkdir dir #o700)))
+  (put-bytes (c::cat root "launch-request.sexp") "(:synthetic-launch t)")
+  (put-bytes (c::cat root "recorder/area-request.sexp") "(:synthetic-launch t)")
+  (put-bytes (c::cat root "launch-receipt.txt") (format nil "~arecorder~%" root))
+  (let* ((hash (k::digest (c::cat root "launch-request.sexp")))
+         (launch (list :kind :vttest-keyboard-gate-launch :version 1 :backend backend
+                       :gate-pid 701 :gate-start "9001"
+                       :title "Lispterm-vttest-0123456789abcdef-701"
+                       :artifacts (c::cat root "recorder") :area-request-sha256 hash))
+         (exit (list :kind :vttest-keyboard-gate-exit :version 1 :backend backend
+                     :gate-pid 701 :gate-start "9001" :exit-code 0 :wait-observed t))
+         (raw (list :kind :vttest-gate-cleanup :version 1 :phase :post-close
+                    :launch (list :gate-pid 701 :gate-start "9001"
+                                  :title "Lispterm-vttest-0123456789abcdef-701"
+                                  :artifacts (c::cat root "recorder") :area-request-sha256 hash)
+                    :state :stopped :stop-owned :all-stopped
+                    :runtime (if (equal backend "x11") :none :removed)
+                    :owned (if (equal backend "x11")
+                               (list (cleanup-owned "server" 710 t) (cleanup-owned "client" 711 t 0))
+                               (list (cleanup-owned "compositor" 720 nil)
+                                     (cleanup-owned "client" 721 t 0)
+                                     ;; This holder was already stopped and reaped before close.
+                                     (cleanup-owned "keyboard-holder" 722 t 143)))
+                    :wayland-holder (if (equal backend "x11") :not-applicable :stopped)
+                    :launch-valid t :adoption-failures nil :identity-failures nil)))
+    (c:write-value (c::cat root "GATE-LAUNCH.sexp") launch)
+    (c:write-value (c::cat root "GATE-EXIT.sexp") exit)
+    (write-cleanup root raw)
+    (values root launch exit raw)))
+(defun cleanup-mutation (root backend launch exit raw expected label mutate)
+  (let ((l (copy-tree launch)) (e (copy-tree exit)) (r (copy-tree raw)))
+    (unwind-protect
+         (progn
+           (funcall mutate l e r)
+           (write-cleanup root r)
+           (check (eq expected (k::consume-gate-cleanup root backend l e)) label))
+      (write-cleanup root raw))))
+(defun cleanup-native-record (root backend projection)
+  (declare (ignore root))
+  (list :kind :vttest-keyboard-native :version 1 :backend backend
+        :manifest-sha256 (make-string 64 :initial-element (code-char 97))
+        :status :incomplete :checks nil :cleanup projection))
+(defun cleanup-summary-controls (backend)
+  (multiple-value-bind (root launch exit raw) (cleanup-fixture backend (recorder))
+    (declare (ignore launch exit raw))
+    (multiple-value-bind (status reasons projection)
+        (k::native-cleanup root backend nil)
+      (declare (ignore reasons))
+      (check (eq status :pass) (list backend :retained-launch-records))
+      (let* ((record (cleanup-native-record root backend projection))
+             (manifest (k:make-manifest backend)))
+        (multiple-value-bind (obs evidence) (k:summarize-native manifest record 3 root)
+          (check (and (eq (getf evidence :cleanup) :pass) (not (getf evidence :native-failed))
+                      (every (lambda (o) (and (not (getf o :fresh))
+                                             (eq (getf o :pixels) :unverified)
+                                             (eq (getf o :timing) :unverified))) obs)
+                      (= 26 (getf (getf evidence :counts) :unverified)))
+                 (list backend :cleanup-is-not-pixel-or-timing-proof)))
+        (dolist (key '(:state :owned :receipt-sha256))
+          (let* ((bad (copy-tree record)) (claim (getf bad :cleanup)))
+            (setf (getf claim key)
+                  (case key (:state :unknown) (:owned nil)
+                        (:receipt-sha256 (make-string 64 :initial-element (code-char 98)))))
+            (multiple-value-bind (obs evidence) (k:summarize-native manifest bad 3 root)
+              (declare (ignore obs))
+              (check (getf evidence :native-failed) (list :projection-mismatch key)))))))))
