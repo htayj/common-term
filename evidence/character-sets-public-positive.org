@@ -1,0 +1,47 @@
+#+title: Character sets public positive
+
+* Result
+
+On 2026-11-08 the repaired public synthetic positive passed once using the
+unchanged prepared controller, evaluator and runner in
+=.build/evidence/character-repaired-positive-admission-495-20261108-a/=.
+The selected 226 forms completed with 452 evaluation-order transcript lines.
+Focused reader/control verification previously passed 126 assertions (484).
+
+Execution: =231e7ceb-1a8b-4758-82ca-50c7041d8aaf=.
+Actual outer command exit: 0; no timeout or cancellation.
+Controller, SBCL outer, runner assertions, public command and client exits: 0.
+Runner assertion stderr and public stderr: empty.
+The evaluator stderr retains forward-definition compilation warnings.
+
+Public result: =.build/evidence/vttest-area-runs/run-sKs6qE/RESULT.sexp=.
+Outcome PASS, reason COMPLETE, exit 0. Required/observed/passed: 1/1/1;
+failed/unverified: 0/0. The repaired public result reader accepted the receipt.
+Case: x11/default/NIL/(:positive), one public invocation.
+
+Comparison: =recorder/pause-01-comparison.sexp= under that result directory.
+640x384, full 245760 pixels compared; 0 different pixels; no differing cells;
+tolerance 0; masked pixels 0; decoded RGBA length 983040; fully opaque.
+The original public MAIN/RUN-CASE, Terminus font, full-array comparison and
+publication path were used. This is synthetic public-plumbing evidence,
+not native X11 or Wayland conformance acceptance.
+
+* Cleanup
+
+The successful receipt records cleanup PASS, finalization COMPLETE,
+client exit 0, abort NIL and unowned endpoints NIL. All synchronous provider
+commands returned. No native display server, client or endpoint was launched
+by this synthetic fixture. Private tmp/cache/runtime directories are empty.
+Owned diagnostic artifacts are retained as evidence; prior failed evidence
+is unchanged. No foreign process inspection or cleanup was performed.
+
+* Original image
+
+Unique original, viewed directly by the executor:
+=.build/evidence/character-repaired-positive-admission-495-20261108-a/positive/images/synthetic-00-encoded.png=
+
+13841 bytes, 640x384 PNG; signature 89 50 4e 47 0d 0a 1a 0a.
+SHA256: =6c50b35d117a856f355393e4554df4b203972624e3b5d0e11c229b4c191d963d=.
+Duplicate: =.build/evidence/vttest-area-runs/run-sKs6qE/recorder/pause-01-actual.png=.
+Both names refer to dev 66306/inode 31102956 and identical bytes.
+No cropping, masking, fitting, tolerance, recapture or image search was used.

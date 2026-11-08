@@ -214,13 +214,13 @@
   (let ((requires (getf s :requires)))
     (proper requires 64)
     (need (or requires (member (getf s :recorder-label)
-                               '("screen" "double-size") :test #'equal)) :empty-requires)
+                               '("screen" "charsets" "double-size") :test #'equal)) :empty-requires)
     (dolist (r requires)
       (plist-keys r '(:capability :path)) (need (identifier-p (getf r :capability)) :capability)
       (safe-components (getf r :path)))
     (unique-strings (mapcar (lambda (r) (getf r :capability)) requires)
                     :nonempty (not (member (getf s :recorder-label)
-                                           '("screen" "double-size") :test #'equal)))) s)
+                                           '("screen" "charsets" "double-size") :test #'equal)))) s)
 (defun validate-manifest (m area backend)
   (proper m)
   ;; Documentary records are deliberately not promoted into executable scope.
@@ -244,7 +244,9 @@
              (= (getf m :required-count) (loop for s in (getf m :scenarios) sum (length (getf s :captures))))) :required-count)
   ;; New empty-requirement profiles must enter their closed native validators,
   ;; never the capability path. MAIN then admits the exact current factory.
-  (cond ((equal area "double-size-characters")
+  (cond ((equal area "character-sets")
+         (need (equal (getf m :native-driver) (format nil "charsets-~a-v1" backend)) :driver-not-integrated))
+        ((equal area "double-size-characters")
          (need (equal (getf m :native-driver) (format nil "double-size-~a-v1" backend)) :driver-not-integrated)))
   m)
 (defun parse-cli (args)
@@ -260,7 +262,8 @@
       (need (member area *areas* :test #'equal) :unknown-area)
       (need (member backend '("x11" "wayland") :test #'equal) :unknown-backend)
       (when path (safe-components path))
-      (need (or path (member area '("screen" "screen-features" "double-size-characters") :test #'equal)) :usage)
+      (need (or path (member area '("screen" "screen-features" "character-sets"
+                                    "double-size-characters") :test #'equal)) :usage)
       (values (if (equal area "screen-features") "screen" area) backend path))))
 (defun git-binding (name)
   (handler-case
@@ -295,10 +298,11 @@
 (load (merge-pathnames "vttest-cursor-driver.lisp" *load-truename*))
 
 (load (merge-pathnames "vttest-screen-driver.lisp" *load-truename*))
+(load (merge-pathnames "vttest-charsets-driver.lisp" *load-truename*))
 (load (merge-pathnames "vttest-double-size-driver.lisp" *load-truename*))
 (defvar *run-context* nil)
 (defun run-selected (manifest readiness)
-  "Dispatch only closed built-in cursor, screen and double-size drivers."
+  "Dispatch only closed built-in cursor, screen, character-set and double-size drivers."
   (declare (ignore readiness))
   (preflight-selection
    (format nil "~{~A~^,~}" (remove-duplicates
@@ -307,9 +311,12 @@
    (sb-ext:posix-getenv "LISPTERM_VTTEST_FILTER"))
   (let* ((area (getf manifest :area))
          (screen (equal area "screen"))
+         (charsets (equal area "character-sets"))
          (double-size (equal area "double-size-characters"))
-         (expected-label (cond (screen "screen") (double-size "double-size") (t "cursor")))
+         (expected-label (cond (screen "screen") (charsets "charsets")
+                               (double-size "double-size") (t "cursor")))
          (drivers (cond (screen '("screen-x11-v1" "screen-wayland-v1"))
+                        (charsets '("charsets-x11-v1" "charsets-wayland-v1"))
                         (double-size '("double-size-x11-v1" "double-size-wayland-v1"))
                         (t '("cursor-x11-v1" "cursor-wayland-v1"))))
          (labels (sb-ext:posix-getenv "LISPTERM_VTTEST_EXACT_LABELS")))
@@ -317,6 +324,7 @@
       (refuse :driver-not-integrated 3))
     (when (and labels (not (equal labels expected-label))) (refuse :invalid-recorder-selection))
     (apply (cond (screen #'vttest-screen-driver:run)
+                 (charsets #'vttest-charsets-driver:run)
                  (double-size #'vttest-double-size-driver:run)
                  (t #'vttest-cursor-driver:run))
            manifest *run-context*)))
@@ -396,7 +404,9 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
           (if path
               (multiple-value-setq (manifest hash) (read-data path))
               (progn
-                (setf manifest (cond ((equal area "double-size-characters")
+                (setf manifest (cond ((equal area "character-sets")
+                                      (vttest-charsets-driver:make-manifest backend))
+                                     ((equal area "double-size-characters")
                                       (vttest-double-size-driver:make-manifest backend))
                                      (t (vttest-screen-driver:make-manifest backend)))
                       path (concatenate 'string directory "MANIFEST.sexp"))
@@ -406,6 +416,7 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
           (setf count (getf manifest :required-count))
           (if (getf manifest :native-driver)
               (cond ((equal area "screen") (vttest-screen-driver:validate manifest))
+                    ((equal area "character-sets") (vttest-charsets-driver:validate manifest))
                     ((equal area "double-size-characters") (vttest-double-size-driver:validate manifest))
                     (t (vttest-cursor-driver:validate manifest)))
               (dolist (s (getf manifest :scenarios))
@@ -426,16 +437,16 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
     (let ((result (list :kind :vttest-area-result :version 1 :gate :vttest-area
                         :area area :backend backend :manifest-path path :manifest-sha256 hash
                         :source-head head :source-tree tree :required-count count
-                        :observed-count (if (member area '("screen" "double-size-characters") :test #'equal)
+                        :observed-count (if (member area '("screen" "character-sets" "double-size-characters") :test #'equal)
                                             (getf (getf driver-evidence :counts) :captured)
                                             (when observations (length observations)))
-                        :passed-count (if (member area '("screen" "double-size-characters") :test #'equal)
+                        :passed-count (if (member area '("screen" "character-sets" "double-size-characters") :test #'equal)
                                           (getf (getf driver-evidence :counts) :passed)
                                           (when observations (count :pass observations :key (lambda (o) (getf o :pixels)))))
-                        :failed-count (if (member area '("screen" "double-size-characters") :test #'equal)
+                        :failed-count (if (member area '("screen" "character-sets" "double-size-characters") :test #'equal)
                                           (getf (getf driver-evidence :counts) :failed)
                                           (when observations (count :fail observations :key (lambda (o) (getf o :pixels)))))
-                        :unverified-count (if (member area '("screen" "double-size-characters") :test #'equal)
+                        :unverified-count (if (member area '("screen" "character-sets" "double-size-characters") :test #'equal)
                                               (getf (getf driver-evidence :counts) :unverified)
                                               (when observations (count :unverified observations :key (lambda (o) (getf o :pixels)))))
 
