@@ -338,4 +338,136 @@
                    (not (member "Tab" inputs :test #'equal))
                    (not (member (string #\Return) inputs :test #'equal)))
               (format nil "~a failed ~a sends no speculative TAB/RETURN" label failed-key)))))
+
+;; Final-status wait: run the real compiled CAPTURE through its settle loop with
+;; the real 5-second deadline and .02-second polling. Barrier, host, screenshot
+;; acknowledgement and capture proof are fakes: this is loop flow, not native proof.
+(defun final-wait-sample (commit frame &rest top-level)
+  "A ready Wayland status apart from COMMIT/FRAME generations and TOP-LEVEL overrides."
+  (let ((sample (list :frames 1 :bytes-received 1 :columns 80 :rows 24 :pty-columns 80 :pty-rows 24
+                      :engine-geometry-generation 0 :error-count 0
+                      :geometry (list :request-id nil :phase :idle :epoch 0 :display-epoch 1 :metric-generation 0
+                                      :cell-width 9 :cell-height 18 :columns 80 :rows 24
+                                      :actual-width 720 :actual-height 432 :presentation 0 :target-presentation nil
+                                      :buffer-scale 1 :configured-p t :frame-pending-p nil
+                                      :committed-width 720 :committed-height 432 :committed-buffer-width 720
+                                      :committed-buffer-height 432 :buffer-width 720 :buffer-height 432
+                                      :commit-generation commit :frame-generation frame)
+                      :process-state :running :backend :wayland :input-pending 0)))
+    (loop for (key value) on top-level by #'cddr do (setf (getf sample key) value))
+    sample))
+(defun generations (sample)
+  (let ((g (getf sample :geometry))) (list (getf g :commit-generation) (getf g :frame-generation))))
+(defun final-wait-run (samples &key output-change-p host-error-p)
+  "Serve SAMPLES to CAPTURE in order, the first as its original status; the last repeats.
+Each served sample's :frames is its read number, identifying the recorded sample."
+  (let ((record (symbol-function 'record-value))
+        (progress (symbol-function 'vttest-check::geometry-progress-p))
+        (reads 0) (log nil) (inner nil) (proof nil)
+        (*label* "final-wait") (*phase* "final-wait") (*accept* nil) (*on-phase-supplements* nil)
+        (*desired-scale* 1) (*output-count* 5))
+    ;; An existing acknowledgement skips the 15-second screenshot wait.
+    (with-open-file (out (artifact "captured") :direction :output :if-exists :supersede)
+      (declare (ignore out)))
+    (when (probe-file (artifact "capture-request")) (delete-file (artifact "capture-request")))
+    (let* ((start (get-internal-real-time))
+           (result
+             (with-functions
+                 (list (cons 'frame-barrier
+                             (lambda (host) (declare (ignore host))
+                               (list :target-output *output-count* :status (copy-tree (first samples)))))
+                       (cons 'grid-text (lambda (host) (declare (ignore host)) "final-wait grid"))
+                       (cons 'lispterm:status
+                             (lambda (&optional host) (declare (ignore host))
+                               (let ((sample (copy-tree (nth (min reads (1- (length samples))) samples))))
+                                 (incf reads)
+                                 (when (and output-change-p (= reads 2)) (incf *output-count*))
+                                 (setf (getf sample :frames) reads)
+                                 (push (list :status reads) log)
+                                 sample)))
+                       (cons 'lispterm:host-errors
+                             (lambda (host) (declare (ignore host))
+                               (let ((errors (and host-error-p (>= reads 2) '(:native))))
+                                 (push (list :host errors) log)
+                                 errors)))
+                       (cons 'record-value
+                             (lambda (name value)
+                               (when (search ".final-status." name) (push (list :record name) log))
+                               (funcall record name value)))
+                       (cons 'vttest-check::geometry-progress-p
+                             (lambda (before after)
+                               (handler-bind ((error (lambda (condition) (setf inner condition))))
+                                 (funcall progress before after))))
+                       (cons 'vttest-check::capture-proof-p
+                             (lambda (status final barrier external png)
+                               (declare (ignore barrier external png))
+                               (setf proof (list status final))
+                               t)))
+               (lambda () (handler-case (capture :fake "final") (error (condition) condition)))))
+           (records (remove :record (reverse log) :key #'car :test-not #'eq)))
+      (list :result result :reads reads :inner inner :proof proof :records (length records)
+            :seconds (float (/ (- (get-internal-real-time) start) internal-time-units-per-second))
+            :final (when records (vttest-check:read-value (artifact (second (first records)))))
+            ;; Host checks and the final-status write, in order, without status reads.
+            :order (mapcar #'car (remove :status (reverse log) :key #'car))))))
+(defun failure-arguments (run)
+  (let ((condition (getf run :result)))
+    (and (typep condition 'simple-error) (simple-condition-format-arguments condition))))
+(defun record-then-host-p (run)
+  "The final-status write is followed directly by a host check."
+  (let ((after-record (member :record (getf run :order))))
+    (eq :host (second after-record))))
+(defun verify-final-wait (value name run)
+  (unless value
+    (format t "FINAL-WAIT RUN result=~a reads=~d records=~d seconds=~,3f final=~s frame=~s proof=~s order=~s~%"
+            (getf run :result) (getf run :reads) (getf run :records) (getf run :seconds)
+            (generations (getf run :final)) (getf (getf run :final) :frames)
+            (mapcar #'generations (getf run :proof)) (getf run :order)))
+  (verify value name))
+(let ((run (final-wait-run (list (final-wait-sample 38 38) (final-wait-sample 39 38)
+                                 (final-wait-sample 39 38) (final-wait-sample 39 39)))))
+  (verify-final-wait (and (stringp (getf run :result)) (= 4 (getf run :reads)) (= 1 (getf run :records))
+                          (equal '(39 39) (generations (getf run :final))) (= 4 (getf (getf run :final) :frames))
+                          (equal '((38 38) (39 39)) (mapcar #'generations (getf run :proof)))
+                          (= 1 (getf (first (getf run :proof)) :frames)))
+                     "final wait passes pending 39/38 twice, proves ready 38/38 with settled 39/39" run))
+(let ((run (final-wait-run (list (final-wait-sample 38 38) (final-wait-sample 39 38) (final-wait-sample 38 38)))))
+  (verify-final-wait (and (eq :regressed (first (failure-arguments run))) (= 3 (getf run :reads))
+                          (= 1 (getf run :records)) (equal '(38 38) (generations (getf run :final)))
+                          (= 3 (getf (getf run :final) :frames)) (null (getf run :proof)) (record-then-host-p run))
+                     "final wait rejects 39/38 -> 38/38 consecutive regression, though 38/38 is ready" run))
+(let ((run (final-wait-run (list (final-wait-sample 38 38) (final-wait-sample nil nil)))))
+  (verify-final-wait (and (typep (getf run :inner) 'type-error) (eq (getf run :inner) (getf run :result))
+                          (= 2 (getf run :reads)) (= 1 (getf run :records))
+                          (equal '(nil nil) (generations (getf run :final))) (= 2 (getf (getf run :final) :frames))
+                          (equal '(:host :record :host) (getf run :order)) (null (getf run :proof)))
+                     "malformed NIL generation records once, checks host, resignals the same condition" run))
+(dolist (spec (list (list "output" (final-wait-sample 38 38) '(:output-change-p t) :output-changed)
+                    (list "attempt" (final-wait-sample 38 38 :engine-geometry-generation 1) nil :attempt-changed)
+                    (list "bytes" (final-wait-sample 38 38 :bytes-received 2) nil :bytes-changed)
+                    (list "input" (final-wait-sample 38 38 :input-pending 1) nil :input-changed)
+                    (list "native host error" (final-wait-sample 38 38) '(:host-error-p t) :host-error)))
+  (destructuring-bind (kind second options problem) spec
+    (let* ((run (apply #'final-wait-run (list (final-wait-sample 38 38) second) options))
+           (arguments (failure-arguments run)))
+      ;; The host error is signalled by CHECK-HOST after the loop records its sample.
+      (verify-final-wait (and (if (eq problem :host-error)
+                                  (equal '(:native) (second arguments))
+                                  (eq problem (first arguments)))
+                              (= 2 (getf run :reads)) (= 1 (getf run :records))
+                              (= 2 (getf (getf run :final) :frames)) (< (getf run :seconds) 1)
+                              (null (getf run :proof)) (record-then-host-p run))
+                         (format nil "final wait fails at once on ~a change, recording before host check" kind) run))))
+(let* ((run (final-wait-run (list (final-wait-sample 38 38) (final-wait-sample 39 38))))
+       (arguments (failure-arguments run))
+       (loop-samples (1- (getf run :reads))))
+  ;; Each pending sample sleeps .02s, so at most 251 fit before the 5s deadline,
+  ;; plus the expired sample. More than 102 samples excludes .05s or coarser polling;
+  ;; the wall-time ceiling tolerates scheduler delay above the 5s floor.
+  (verify-final-wait (and (eq :settle-deadline (first arguments)) (eq :wayland-request (third arguments))
+                          (<= 5 (getf run :seconds) 10) (< 102 loop-samples 253)
+                          (= 1 (getf run :records)) (equal '(39 38) (generations (getf run :final)))
+                          (= (getf run :reads) (getf (getf run :final) :frames))
+                          (null (getf run :proof)) (record-then-host-p run))
+                     "persistent pending fails after real 5s deadline with reason and latest sample" run))
 (format t "~d recorder boundary checks passed; definitions compiled with real packages, no GUI launched~%" *test-count*)

@@ -234,8 +234,34 @@
     (loop with end = (deadline 15) until (probe-file (artifact "captured"))
           when (expired-p end) do (error "Screenshot acknowledgement deadline") do (sleep .05))
     (delete-file (artifact "captured"))
-    (let ((final (lispterm:status host)))
-      (record-value (concatenate 'string name ".final-status.sexp") final)
+    ;; Wait on this same screenshot for an ordinary redraw to settle. A pending
+    ;; sample is never accepted; the recorded sample is the last one observed.
+    ;; Progress is required between consecutive samples, so a pending redraw
+    ;; that falls back is rejected. A predicate error is recorded, then resignaled.
+    (let ((final (loop with end = (deadline 5)
+                       with previous = status
+                       for sample = (lispterm:status host)
+                       for problem = (if (lispterm:host-errors host)
+                                         :host-error
+                                         (handler-case
+                                             (cond ((/= (getf barrier :target-output) *output-count*) :output-changed)
+                                                   ((not (vttest-check::same-geometry-attempt-p status sample)) :attempt-changed)
+                                                   ((not (eql (getf status :bytes-received) (getf sample :bytes-received))) :bytes-changed)
+                                                   ((not (eql (getf status :input-pending) (getf sample :input-pending))) :input-changed)
+                                                   ((not (vttest-check::geometry-progress-p previous sample)) :regressed)
+                                                   ((vttest-check:geometry-capture-ready-p sample *desired-scale*) nil)
+                                                   ((expired-p end) :settle-deadline)
+                                                   (t :pending))
+                                           (error (condition) condition)))
+                       unless (eq problem :pending)
+                         do (record-value (concatenate 'string name ".final-status.sexp") sample)
+                            (when problem
+                              (check-host host)
+                              (when (typep problem 'condition) (error problem))
+                              (error "Final status ~(~a~) in ~a: ~a" problem *phase*
+                                     (nth-value 1 (vttest-check:geometry-capture-ready-p sample *desired-scale*))))
+                            (return sample)
+                       do (setf previous sample) (sleep .02))))
       (unless (and (= (getf barrier :target-output) *output-count*)
                    (vttest-check::capture-proof-p status final barrier
                      (vttest-check:read-value (artifact (concatenate 'string name ".external.sexp")))

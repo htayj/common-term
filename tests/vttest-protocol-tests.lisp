@@ -537,6 +537,17 @@ BOUNDARY splits each event once; SIZE chunks it repeatedly, including size one."
       (incf (getf (getf bad :geometry) key))
       (check (not (capture-proof-p ready bad barrier external '(2376 864)))
              (format nil "final ~a changed with reused request-id rejected" key))))
+  (flet ((final (commit frame pending)
+           (let ((s (copy-tree ready)))
+             (setf (getf s :frames) commit
+                   (getf (getf s :geometry) :commit-generation) commit
+                   (getf (getf s :geometry) :frame-generation) frame
+                   (getf (getf s :geometry) :frame-pending-p) pending)
+             s)))
+    (check (not (capture-proof-p ready (final 3 2 t) barrier external '(2376 864)))
+           "final redraw commit with frame pending rejected")
+    (check (capture-proof-p ready (final 3 3 nil) barrier external '(2376 864))
+           "same final redraw once settled accepted"))
   (dolist (key '(:frames :bytes-received :engine-geometry-generation :pty-columns :pty-rows))
     (let ((bad (copy-tree ready)))
       (setf (getf bad key) 0)
