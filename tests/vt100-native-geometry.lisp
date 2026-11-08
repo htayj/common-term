@@ -14,7 +14,9 @@
 (defvar *serial* 0)
 (defvar *capture* 0)
 (defvar *action-window* nil)
+(defvar *action-ordinal* 0)
 (defvar *preparation-deadline* nil)
+(defvar *acquisition* nil)
 (defun action-ack-p (line kind)
   (handler-case
       (let* ((parts (uiop:split-string line :separator '(#\Space)))
@@ -160,7 +162,13 @@
 (defun action (kind &optional w h)
   (when (or (probe-file (path "action-ack")) (probe-file (path "action-request")))
     (error "Stale action handshake"))
-  (publish "action-request" (format nil "~a~@[ ~d~]~@[ ~d~]~%" kind w h) :text t)
+  ;; Reserve the ordinal even on failure. Retain the complete request inode for
+  ;; the dispatcher's before/after validation; LINK must never replace evidence.
+  (let ((stage (path (format nil "action-request-s~2,'0d.staged" (incf *action-ordinal*)))))
+    (with-open-file (out stage :direction :output :if-exists :error
+                              :if-does-not-exist :create)
+      (format out "~a~@[ ~d~]~@[ ~d~]~%" kind w h))
+    (sb-posix:link (namestring stage) (namestring (path "action-request"))))
   (await (lambda () (probe-file (path "action-ack"))))
   (with-open-file (in (path "action-ack"))
     (let ((id (action-ack-p (read-line in nil "") kind)))

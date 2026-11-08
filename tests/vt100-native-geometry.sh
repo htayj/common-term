@@ -127,29 +127,155 @@ native_prepare_retry() {
  cmp -s <(jq -Sc . "$prefix.failed.outputs.json") <(jq -Sc . "$prefix.restore.after.outputs.json") || return 1
  is_owned "$client" && is_owned "$server"
 }
+# Reserve an action ordinal once. A failed handoff cannot be retried as a fresh
+# action, and producer serials never determine this independent 1/9 sequence.
+native_action_ordinal=0
+native_action_failed=0
+native_action_copy() (
+ local source=$1 destination=$2 byte count=0 status
+ local LC_ALL=C
+ [[ ! -L $source && -f $source && -r $source ]] || exit 1
+ [[ ! -L $art/record-read.stderr && ! -s $art/record-read.stderr ]] || exit 1
+ [[ ! -e $destination && ! -L $destination ]] || exit 1
+ set -C
+ exec 3> "$destination" || exit 1
+ # Keep malformed/partial bytes too. At most 4098 bytes are retained; overflow
+ # is failure, the original is kept, and this prefix is never a complete copy.
+ while ((count < 4098)); do
+  byte=
+  if IFS= read -r -d '' -n 1 byte; then status=0; else status=$?; fi
+  if ((status != 0)); then
+   [[ $status == 1 && ! -s $art/record-read.stderr ]]
+   exit $?
+  fi
+  if [[ -n $byte ]]; then printf '%s' "$byte" >&3; else printf '\0' >&3; fi || exit 1
+  count=$((count+1))
+ done < "$source" 2>> "$art/record-read.stderr"
+ exit 1
+)
+# Enumerate the source-defined suffix graph, never names discovered in R.
+native_action_resize_leaves() {
+ local base=$1 suffix
+ for suffix in before.tree.json outputs.json resize.command resize.reply.json resized.tree.json resized.outputs.json anchor.command anchor.reply.json anchored.tree.json after.outputs.json; do
+  action_leaves+=("$base.$suffix")
+ done
+}
+native_action_mode_leaves() {
+ local base=$1 steps=$2 index
+ action_leaves+=("$base.before.tree.json" "$base.outputs.json")
+ for ((index=1;index<=steps;index++)); do
+  action_leaves+=("$base.step$index.command" "$base.step$index.reply.json" "$base.step$index.tree.json" "$base.step$index.outputs.json")
+ done
+}
+native_action_context() {
+ is_owned "$client" && is_owned "$server" &&
+ [[ $XDG_RUNTIME_DIR == "$capture_runtime" && ${DISPLAY:-} == "$capture_display" && ${SWAYSOCK:-} == "$capture_swaysock" && ${WAYLAND_DISPLAY:-} == "$capture_wayland" ]]
+}
 external_action() {
- local action w h extra prefix
- read -r action w h extra < "$art/action-request" || return 1
- [[ -z $extra ]] || return 1
- window_identity || return 1
- prefix=$art/action-$(date +%s%N)
- case $action in
-  resize)
-   [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]] || return 1
-   if [[ $backend == x11 ]]; then timeout 5 xdotool windowsize --sync "$window" "$w" "$h" > "$prefix.json" || return 1
-   else native_resize_wayland "$w" "$h" "$prefix" || return 1; fi;;
-  tiled) [[ $backend == wayland && -z $w && -z $h ]] || return 1
-   native_mode_wayland "$prefix" 'floating disable' 'fullscreen enable' || return 1;;
-  floating) [[ $backend == wayland && -z $w && -z $h ]] || return 1
-   native_mode_wayland "$prefix" 'fullscreen disable' 'floating enable' 'border none' 'move position 0 0' || return 1;;
-  prepare-retry)
-   [[ $backend == wayland && $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ && $w -gt 0 && $h -gt 0 ]] || return 1
-   native_prepare_retry "$w" "$h" "$prefix" || return 1;;
+ local action w h extra prefix stage ordinal expected leaf target
+ local -a sequence action_leaves=()
+ [[ $native_action_failed == 0 && $native_action_ordinal =~ ^[0-9]$ ]] || return 1
+ native_action_failed=1
+ case $mode in
+  normal) sequence=(resize);;
+  refusal) [[ $backend == wayland ]] || return 1
+   sequence=(resize tiled prepare-retry tiled floating resize tiled floating resize);;
   *) return 1;;
  esac
- rm "$art/action-request" || return 1
- printf '%s\n' "$action $window" > "$art/action-ack.tmp" || return 1
- mv "$art/action-ack.tmp" "$art/action-ack"
+ ordinal=$((native_action_ordinal+1))
+ ((ordinal <= ${#sequence[@]})) || return 1
+ native_action_ordinal=$ordinal
+ expected=${sequence[ordinal-1]}
+ printf -v prefix '%s/action-%02d' "$art" "$ordinal"
+ printf -v stage '%s/action-request-s%02d.staged' "$art" "$ordinal"
+ native_action_copy "$art/action-request" "$prefix.request.raw" || return 1
+ [[ ! -L $stage && -f $stage && $stage -ef $art/action-request ]] || return 1
+ cmp -s "$prefix.request.raw" "$stage" || return 1
+ acq_read_record "$prefix.request.raw" 4096 || return 1
+ IFS=' ' read -r action w h extra <<< "$acq_record"
+ [[ -z $extra && $action == "$expected" ]] || return 1
+ case $action in
+  resize|prepare-retry)
+   [[ $w =~ ^[1-9][0-9]{0,4}$ && $h =~ ^[1-9][0-9]{0,4}$ && $w -le 32768 && $h -le 32768 && $acq_record == "$action $w $h" ]] || return 1;;
+  tiled|floating) [[ -z $w && -z $h && $acq_record == "$action" ]] || return 1;;
+  *) return 1;;
+ esac
+ [[ $backend == x11 || $backend == wayland ]] || return 1
+ action_leaves=("$prefix.ack.staged" "$prefix.ack.publish.stdout" "$prefix.ack.publish.stderr")
+ case $action in
+  resize) if [[ $backend == x11 ]]; then action_leaves+=("$prefix.json")
+   else native_action_resize_leaves "$prefix"; fi;;
+  tiled) native_action_mode_leaves "$prefix" 2;;
+  floating) native_action_mode_leaves "$prefix" 4;;
+  prepare-retry)
+   action_leaves+=("$prefix.failed.tree.json" "$prefix.failed.outputs.json")
+   native_action_mode_leaves "$prefix.floating" 3
+   native_action_resize_leaves "$prefix.restore";;
+ esac
+ # -L also detects dangling links. No pre-existing leaf is adopted or replaced.
+ for leaf in "$art/action-ack" "$art/action-ack.tmp" "$prefix.ack.raw" "${action_leaves[@]}"; do
+  [[ ! -e $leaf && ! -L $leaf ]] || return 1
+ done
+ native_action_context && window_identity || return 1
+ [[ $window =~ ^[1-9][0-9]{0,11}$ && ( ${capture_action_window:-NIL} == NIL || $window == "$capture_action_window" ) ]] || return 1
+ target=$window
+ case $action in
+  resize)
+   if [[ $backend == x11 ]]; then
+    (set -C; timeout 5 xdotool windowsize --sync "$window" "$w" "$h" > "$prefix.json") || return 1
+    window_identity && [[ $window == "$target" ]] || return 1
+   else native_resize_wayland "$w" "$h" "$prefix" || return 1; fi;;
+  tiled) native_mode_wayland "$prefix" 'floating disable' 'fullscreen enable' || return 1;;
+  floating) native_mode_wayland "$prefix" 'fullscreen disable' 'floating enable' 'border none' 'move position 0 0' || return 1;;
+  prepare-retry) native_prepare_retry "$w" "$h" "$prefix" || return 1;;
+ esac
+ native_action_context && [[ $window == "$target" ]] || return 1
+ # Recheck the same retained request after native operations, before removal.
+ [[ ! -L $stage && -f $stage && ! -L $art/action-request && $stage -ef $art/action-request ]] || return 1
+ cmp -s "$prefix.request.raw" "$stage" && cmp -s "$stage" "$art/action-request" || return 1
+ rm -- "$art/action-request" || return 1
+ (
+  set -C
+  printf '%s %s\n' "$action" "$window" > "$prefix.ack.staged" || exit 1
+  command timeout --signal=KILL 1 ln -T -- "$prefix.ack.staged" "$art/action-ack" > "$prefix.ack.publish.stdout" 2> "$prefix.ack.publish.stderr" || exit 1
+ ) || return 1
+ # Successful ln is required, not merely a staged ACK. The owner may already
+ # have consumed the alias; if present, it must still be that exact hardlink.
+ [[ ! -s $prefix.ack.publish.stdout && ! -s $prefix.ack.publish.stderr ]] || return 1
+ if [[ -e $art/action-ack || -L $art/action-ack ]]; then
+  [[ ! -L $art/action-ack && -f $art/action-ack && $prefix.ack.staged -ef $art/action-ack ]] || return 1
+ fi
+ native_action_failed=0
+}
+# Acquisition protocol v1. These helpers are sourceable without native dispatch.
+# Read one bounded ASCII record including its required LF and physical EOF.
+# -n, unlike -N, honors the empty delimiter: NUL is an empty successful read.
+# Never send bytes through command substitution, which would discard NUL/LF.
+acq_read_record() {
+ local path=$1 maximum=${2:-4096} byte count=0 ended=0 status errors
+ local LC_ALL=C
+ # Bash returns 1 for both EOF and I/O errors. Retain stderr and fail closed
+ # after any read diagnostic, including an error immediately after the LF.
+ [[ -n ${art:-} && -d $art ]] || return 1
+ errors=$art/record-read.stderr
+ [[ ! -L $errors && ! -s $errors ]] || return 1
+ acq_record=
+ [[ -f $path && -r $path && $maximum =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+ while :; do
+  byte=
+  if IFS= read -r -d '' -n 1 byte; then status=0; else status=$?; fi
+  if ((status != 0)); then
+   ((status == 1 && ended == 1)) && [[ -z $byte && ! -s $errors ]]
+   return $?
+  fi
+  count=$((count+1))
+  ((count <= maximum+1 && ended == 0)) || return 1
+  if [[ $byte == $'\n' ]]; then ended=1
+  elif [[ -n $byte && ( $byte == $'\t' || $byte == [\ -~] ) ]]; then
+   ((count <= maximum)) || return 1
+   acq_record+=$byte
+  else return 1; fi
+ done < "$path" 2>> "$errors"
 }
 # Source only fixture helpers for offline parser/IPC/action controls.
 [[ ${LISPTERM_NATIVE_FUNCTIONS_ONLY:-0} != 1 ]] || return 0
@@ -248,6 +374,8 @@ fixture_isolation > "$art/isolation.txt"
 unset CL_SOURCE_REGISTRY ASDF_OUTPUT_TRANSLATIONS
 scripts/sbcl --script tests/vt100-native-geometry.lisp --native < /dev/null > "$art/client.log" 2>&1 & client=$!; remember "$client"
 audit_client_tree
+capture_runtime=$XDG_RUNTIME_DIR; capture_display=${DISPLAY:-}; capture_swaysock=${SWAYSOCK:-}; capture_wayland=${WAYLAND_DISPLAY:-}
+capture_action_window=NIL
 capture_native() {
  local name ew eh ds cw extra
  read -r name ew eh ds cw extra < "$art/capture-request"
@@ -277,7 +405,7 @@ end=$((SECONDS+duration))
 while is_owned "$client"; do
  watchdog_check "$end"; fixture_isolation >> "$art/isolation-checks.txt"
  audit_client_tree allow-exit || { fixture_error 1 "${BASH_SOURCE[0]}" "$LINENO" audit_client_tree; exit 1; }
- if [[ -f $art/action-request ]]; then external_action; fi
+ if [[ -e $art/action-request || -L $art/action-request ]]; then external_action; capture_action_window=$window; fi
  if [[ -f $art/capture-request ]]; then capture_native; fi
  sleep .03
 done

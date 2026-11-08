@@ -4,11 +4,132 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 export PATH="$root/.build/test-tools/bin:$PATH"
+# This entry point reads only the action definitions, never the native runner or
+# the application system. The dispatcher is real; display operations are fakes.
+geometry_action_contract() (
+  export LISPTERM_ACTION_CONTRACT_ROOT=$1
+  scripts/sbcl --script /dev/stdin <<'LISP'
+(require :asdf)
+(require :sb-posix)
+(defpackage #:native-geometry (:use #:cl))
+(in-package #:native-geometry)
+;; Read only these complete source forms. No application package, bootstrap,
+;; capture implementation, or top-level native entry point is loaded/evaluated.
+(let ((wanted '("(defvar *art* " "(defvar *action-window* " "(defvar *action-ordinal* "
+                "(defvar *preparation-deadline* " "(defvar *acquisition* "
+                "(defun path " "(defun append-value " "(defun now " "(defun await "
+                "(defun action-ack-p " "(defun action ")))
+  (with-open-file (source "tests/vt100-native-geometry.lisp")
+    (loop for line = (read-line source nil) while line
+          when (some (lambda (prefix) (uiop:string-prefix-p prefix line)) wanted)
+            do (eval (read (make-concatenated-stream
+                            (make-string-input-stream (format nil "~a~%" line)) source)))
+               (setf wanted (remove-if (lambda (prefix) (uiop:string-prefix-p prefix line)) wanted))))
+  (assert (null wanted)))
+(defparameter *checks* 0)
+(defun check (value label)
+  (assert value () "Action contract failed: ~a" label)
+  (incf *checks*) (format t "PASS ~a~%" label))
+(defun fails (thunk) (handler-case (progn (funcall thunk) nil) (error () t)))
+(defparameter *dispatch*
+"LISPTERM_NATIVE_FUNCTIONS_ONLY=1 source tests/vt100-native-geometry.sh
+art=$1 mode=$2 native_action_ordinal=$3 fault=$4
+native_action_failed=0 backend=wayland client=1 server=1 capture_action_window=5
+export XDG_RUNTIME_DIR=$art/runtime
+capture_runtime=${XDG_RUNTIME_DIR:-} capture_display=${DISPLAY:-}
+capture_swaysock=${SWAYSOCK:-} capture_wayland=${WAYLAND_DISPLAY:-}
+is_owned() { [[ $1 == 1 ]]; }
+window_identity() { window=5; }
+native_resize_wayland() { :; }
+native_mode_wayland() { :; }
+native_prepare_retry() { :; }
+printf -v stage '%s/action-request-s%02d.staged' \"$art\" \"$((native_action_ordinal+1))\"
+case $fault in
+  missing) mv -- \"$stage\" \"$stage.removed\";;
+  replaced) mv -- \"$stage\" \"$stage.original\"; cp -- \"$art/action-request\" \"$stage\";;
+esac
+if external_action; then
+  [[ $fault == none && $native_action_failed == 0 && ! -e $art/action-request && -f $art/action-ack ]]
+else
+  [[ $fault != none && $native_action_failed == 1 && -f $art/action-request && ! -e $art/action-ack ]]
+fi")
+(defparameter *real-await* (symbol-function 'await))
+(defvar *mode*) (defvar *fault*) (defvar *dispatch-code* nil)
+(setf (symbol-function 'await)
+      (lambda (thunk &optional seconds)
+        (declare (ignore seconds))
+        (let ((code (nth-value 2 (uiop:run-program
+                                 (list "bash" "-c" *dispatch* "contract" (namestring *art*)
+                                       *mode* (write-to-string (1- *action-ordinal*)) *fault*)
+                                 :output *standard-output* :error-output *error-output*
+                                 :ignore-error-status t))))
+          (setf *dispatch-code* code)
+          (assert (eql 0 code) () "Dispatcher contract subprocess exit ~s" code))
+        (funcall *real-await* thunk .05)))
+(defun contract-case (name thunk)
+  (let ((*art* (uiop:ensure-directory-pathname
+                (merge-pathnames (format nil "~a/" name)
+                                 (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_ACTION_CONTRACT_ROOT")))))
+        (*action-ordinal* 0) (*action-window* nil) (*mode* "normal") (*fault* "none") (*dispatch-code* nil))
+    (ensure-directories-exist (path "placeholder"))
+    (funcall thunk)))
+(contract-case "normal"
+  (lambda () (action "resize" 800 416)
+    (check (and (= 1 *action-ordinal*) (= 5 *action-window*)
+                (probe-file (path "action-request-s01.staged"))
+                (not (probe-file (path "action-ack")))) "real ordinal1 request, dispatcher and strict ACK")))
+(contract-case "refusal"
+  (lambda ()
+    (setf *mode* "refusal")
+    (loop for kind in '("resize" "tiled" "prepare-retry" "tiled" "floating" "resize" "tiled" "floating" "resize")
+          for ordinal from 1
+          do (if (member kind '("resize" "prepare-retry") :test #'equal)
+                 (action kind 800 416) (action kind))
+             (check (and (= ordinal *action-ordinal*) (= 5 *action-window*)
+                         (probe-file (path (format nil "action-request-s~2,'0d.staged" ordinal))))
+                    (format nil "real refusal sequence ordinal ~d" ordinal)))))
+(dolist (fault '("missing" "replaced"))
+  (contract-case fault
+    (lambda () (setf *fault* fault)
+      (check (fails (lambda () (action "resize" 800 416)))
+             (format nil "~a stage fails closed without ACK" fault))
+      (check (and (eql 0 *dispatch-code*) (= 1 *action-ordinal*) (null *action-window*)
+                  (probe-file (path "action-request"))
+                  (probe-file (path "action-01.request.raw"))) "failed transaction evidence retained"))))
+(dolist (leaf '("action-request" "action-ack" "action-request-s01.staged"))
+  (contract-case leaf
+    (lambda ()
+      (with-open-file (out (path leaf) :direction :output :if-exists :error)
+        (write-line "prior evidence" out))
+      (let ((inode (sb-posix:stat-ino (sb-posix:stat (path leaf)))))
+        (check (fails (lambda () (action "resize" 800 416))) (format nil "~a collision rejected" leaf))
+        (check (and (= inode (sb-posix:stat-ino (sb-posix:stat (path leaf))))
+                    (string= "prior evidence" (with-open-file (in (path leaf)) (read-line in))))
+               "collision preserves original inode and bytes")))))
+;; Preserve a dangling destination too; the stale handshake check may reject it.
+(contract-case "dangling-request"
+  (lambda ()
+    (sb-posix:symlink "absent" (namestring (path "action-request")))
+    (check (fails (lambda () (action "resize" 800 416))) "dangling request destination rejected")
+    (check (and (null *dispatch-code*)
+                (string= "absent" (sb-posix:readlink (path "action-request"))))
+           "dangling request preserved without dispatch")))
+(format t "PASS ~d real producer/dispatcher contract checks; native operations mocked~%" *checks*)
+LISP
+)
+if [[ ${1:-} == --geometry-action-contract ]]; then
+  mkdir -p "$root/.build/evidence"
+  contract_art=$(mktemp -d "$root/.build/evidence/geometry-action-contract.XXXXXX")
+  printf 'ARTIFACTS %s\n' "$contract_art"
+  geometry_action_contract "$contract_art"
+  exit
+fi
 # Each invocation retains its own logs and fixtures under this workspace directory.
 # The ARTIFACTS line reports the generated absolute directory; no override is needed.
 mkdir -p "$root/.build/evidence"
 art=$(mktemp -d "$root/.build/evidence/vttest-harness.XXXXXX")
 printf 'ARTIFACTS %s\n' "$art"
+geometry_action_contract "$art/action-contract" > "$art/action-contract.log" 2> "$art/action-contract.stderr"
 export LISPTERM_VTTEST_FUNCTIONS_ONLY=1
 source tests/vttest-gate.sh
 unset LISPTERM_VTTEST_FUNCTIONS_ONLY
@@ -41,7 +162,11 @@ printf 'PASS latest create-once and historical regular/symlink/dangling/director
   art=$art/placement-controls; mkdir -p "$art"
   LISPTERM_NATIVE_FUNCTIONS_ONLY=1 source "$root/tests/vt100-native-geometry.sh"
   clear_session_endpoints
-  unset XDG_RUNTIME_DIR
+  export XDG_RUNTIME_DIR=$art/runtime SWAYSOCK=$art/sway.sock WAYLAND_DISPLAY=wayland-fixture
+  mkdir "$XDG_RUNTIME_DIR"
+  capture_runtime=$XDG_RUNTIME_DIR; capture_display=${DISPLAY:-}
+  capture_swaysock=$SWAYSOCK; capture_wayland=$WAYLAND_DISPLAY
+  capture_action_window=5
   backend=wayland; client=$BASHPID; server=$client; remember "$client"
   export LISPTERM_NATIVE_TITLE=placement-control
   export LISPTERM_SWAYMSG=$art/swaymsg
@@ -133,15 +258,48 @@ case $fault in
 esac
 MOCK
   chmod +x "$LISPTERM_SWAYMSG"
+  case_number=0
+  action_reset() {
+    local action=$1 previous
+    local -a leaves
+    ((case_number+=1))
+    previous=$art/case-$case_number
+    mkdir "$previous"
+    # Retain each completed or failed transaction before reserving another slot.
+    shopt -s nullglob
+    leaves=("$art"/action-*)
+    shopt -u nullglob
+    ((${#leaves[@]} == 0)) || mv -- "${leaves[@]}" "$previous/"
+    native_action_failed=0
+    case $action in
+      resize) mode=normal; native_action_ordinal=0;;
+      prepare-retry) mode=refusal; native_action_ordinal=2;;
+      tiled) mode=refusal; native_action_ordinal=1;;
+      floating) mode=refusal; native_action_ordinal=4;;
+      *) return 1;;
+    esac
+  }
+  stage_request() {
+    local stage
+    printf -v stage '%s/action-request-s%02d.staged' "$art" "$((native_action_ordinal+1))"
+    # Fault cases may replace the request bytes, but retain the producer's alias.
+    printf "$@" > "$stage"
+    [[ -e $art/action-request ]] || ln -- "$stage" "$art/action-request"
+  }
   placement_reset() {
-    rm -f "$art/action-ack" "$art/action-ack.tmp"
+    local requested_action=${2:-resize}
+    action_reset "$requested_action"
     : > "$art/operations"; printf '%s\n' "${1:-none}" > "$art/fault"
     jq -n --arg t "$LISPTERM_NATIVE_TITLE" --argjson p "$client" \
       --argjson w "$((132*cw))" --argjson h "$((24*ch))" \
       '{id:5,name:$t,pid:$p,type:"floating_con",rect:{x:0,y:0,width:$w,height:$h}}' > "$art/state.json"
     jq -n --argjson s "$scale" '[{name:"HEADLESS-1",active:true,scale:$s,
       current_mode:{width:(1280*$s),height:(800*$s)},rect:{x:0,y:0,width:1280,height:800}}]' > "$art/outputs.json"
-    printf 'resize %s %s\n' "$((100*cw))" "$((26*ch))" > "$art/action-request"
+    case $requested_action in
+      resize) stage_request 'resize %s %s\n' "$((100*cw))" "$((26*ch))";;
+      prepare-retry) stage_request 'prepare-retry %s %s\n' "$((132*cw))" "$(((800/ch)*ch))";;
+      tiled|floating) stage_request '%s\n' "$requested_action";;
+    esac
   }
   # The 8x16 case is saved139's 006->007 center shift; other strikes/scales
   # use logical font metrics, never scaled pixel dimensions in IPC commands.
@@ -182,7 +340,7 @@ MOCK
       wrong-pid) jq '.pid+=1' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
       duplicate) jq '[.,.]' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
       unsafe-anchor) jq '.rect.y = -16' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
-      oversized-request) printf 'resize 9999 416\n' > "$art/action-request";;
+      oversized-request) stage_request 'resize 9999 416\n';;
       stale-owner) owned[$client]=stale;;
       missing-owner) unset 'owned[$client]';;
       write-failure) mkdir "$art/action-ack.tmp";;
@@ -190,7 +348,7 @@ MOCK
     if external_action; then echo "Accepted placement fault: $fault" >&2; exit 1; fi
     [[ ! -e $art/action-ack ]]
     remember "$client"
-    [[ $fault != write-failure ]] || rmdir "$art/action-ack.tmp"
+    # Keep the write-failure directory for action_reset's evidence archive.
   done
   # Positive nonzero anchor is retained; negative geometry and oversize fail fit.
   placement_reset
@@ -203,10 +361,9 @@ MOCK
   printf 'PASS six metric/scale combinations, exact resize/anchor ordering, saved139 shift, nonzero anchor; 46 dispatcher rejection controls, IPC write failure; no ACK on failure\n' > "$art/tests.log"
   # The floating model restores80x24; setup must explicitly recover saved target.
   prep_reset() {
-    placement_reset "${1:-none}"
+    placement_reset "${1:-none}" "${2:-prepare-retry}"
     jq '.type="con" | .rect={x:0,y:0,width:1280,height:800}' "$art/state.json" > "$art/state.tmp"
     mv "$art/state.tmp" "$art/state.json"
-    printf 'prepare-retry %s %s\n' "$((132*cw))" "$(((800/ch)*ch))" > "$art/action-request"
   }
   for scale in 1 2; do
     for metrics in '7 14' '8 16' '9 18'; do
@@ -232,7 +389,7 @@ MOCK
     prep_reset
     case $fault in
       unsafe-anchor) jq '.rect.y=-16' "$art/state.json" > "$art/state.tmp"; mv "$art/state.tmp" "$art/state.json";;
-      oversized-request) printf 'prepare-retry 9999 800\n' > "$art/action-request";;
+      oversized-request) stage_request 'prepare-retry 9999 800\n';;
       stale-owner) owned[$client]=stale;;
       missing-owner) unset 'owned[$client]';;
       write-failure) mkdir "$art/action-ack.tmp";;
@@ -240,7 +397,7 @@ MOCK
     if external_action; then echo "Accepted preparation fault: $fault" >&2; exit 1; fi
     [[ ! -e $art/action-ack ]]
     if [[ $fault != write-failure ]]; then [[ ! -s $art/operations ]]; fi
-    rm -rf -- "$art/action-ack.tmp"; remember "$client"
+    remember "$client" # action_reset archives the write-failure directory too.
     ((prep_checks+=1))
   done
   prep_reset
@@ -251,17 +408,17 @@ MOCK
   before_write=$(wc -l < "$art/operations")
   if native_action_ipc '[con_id=5] move position 0 0' "$art/reply-write"; then exit 1; fi
   [[ $(wc -l < "$art/operations") == "$before_write" ]]
-  for mode in tiled floating; do
+  for action_mode in tiled floating; do
     for problem in transport false mixed two multiple; do
-      if [[ $mode == tiled ]]; then step=floating-disable; else step=fullscreen-disable; fi
-      prep_reset "$problem-$step"; printf '%s\n' "$mode" > "$art/action-request"
+      if [[ $action_mode == tiled ]]; then step=floating-disable; else step=fullscreen-disable; fi
+      prep_reset "$problem-$step" "$action_mode"
       if external_action; then exit 1; fi
       [[ ! -e $art/action-ack && $(wc -l < "$art/operations") == 1 ]]
       ((prep_checks+=1))
     done
   done
-  prep_reset; printf 'floating\n' > "$art/action-request"; external_action
-  prep_reset; printf 'tiled\n' > "$art/action-request"; external_action
+  prep_reset none floating; external_action
+  prep_reset none tiled; external_action
   printf 'PASS 6 preparation metric/scale combinations and %s failclosed dispatcher controls; target restore after modeled80x24; each scoped IPC validated, no ACK on failure\n' "$prep_checks" > "$art/preparation-tests.log"
 )
 # Deterministic non-GUI shutdown windows against the production shell helpers.
@@ -448,7 +605,8 @@ export LISPTERM_HARNESS_TEST_ARTIFACTS="$art/fixtures-$(date +%s%N)/"
 export LISPTERM_VTTEST_ARTIFACTS="$LISPTERM_HARNESS_TEST_ARTIFACTS"
 scripts/sbcl --script tests/vttest-protocol-tests.lisp > "$art/protocol-tests.log" 2>&1
 scripts/sbcl --script tests/vttest-requested-columns-tests.lisp > "$art/requested-columns-tests.log" 2>&1
-scripts/sbcl --script tests/vttest-recorder-tests.lisp > "$art/recorder-tests.log" 2>&1
+# The definition-only recorder reader skips LOAD forms; supply its selection package.
+scripts/sbcl --load tests/vttest-selection.lisp --script tests/vttest-recorder-tests.lisp > "$art/recorder-tests.log" 2>&1
 bash -n tests/vttest-gate.sh tests/vttest-harness-tests.sh tests/verify.sh tests/wayland-gate.sh
 # Retain a negative-control process; it is ours, but deliberately not in the
 # production cleanup ownership set. No existing process is inspected or signalled.
