@@ -48,13 +48,14 @@
            (title (nerimux/terminal:screen-title screen))
            (phase (session-blink-phase session))
            (visible (session-blink-visible session))
-           (next-blink (session-next-blink session)))
+           (next-blink (session-next-blink session))
+           (reset nil) (toggled nil))
       (when dirty
         (setf visible (screen-visible-blink-p screen))
         (unless (eql visible (session-blink-visible session))
-          (setf phase t next-blink (and visible (+ now 1/2)))))
+          (setf phase t next-blink (and visible (+ now 1/2)) reset t)))
       (when (and visible next-blink (>= now next-blink))
-        (setf phase (not phase) next-blink (+ now 1/2) dirty t))
+        (setf phase (not phase) next-blink (+ now 1/2) dirty t toggled t))
       (when (and title (not (equal title (session-last-title session))))
         (ltd:set-title display (subseq title 0 (min 1024 (length title))))
         (setf (session-last-title session) (copy-seq title)))
@@ -72,4 +73,12 @@
         (setf (session-last-cursor session) cursor (session-force-frame session) nil
               (session-blink-phase session) phase (session-blink-visible session) visible
               (session-next-blink session) next-blink)
+        (when reset
+          (incf (session-blink-epoch session))
+          (setf (session-blink-epoch-at session) now (session-blink-event-at session) now))
+        (when toggled
+          (incf (session-blink-toggles session))
+          (setf (session-blink-previous-at session) (session-blink-event-at session)
+                (session-blink-toggled-at session) now (session-blink-event-at session) now
+                (session-blink-toggle-frame session) (session-frames session)))
         (lispterm.engine:clear-damage screen)))))

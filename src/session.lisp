@@ -20,6 +20,11 @@
   (transport-state :open) process-state
   (bytes-received 0) (frames 0) (force-frame t) last-cursor last-title
   (blink-phase t) (blink-visible nil) next-blink
+  ;; Blink receipts, published with their completed frame. Times are exact
+  ;; rational seconds of the monotonic internal real time at toggle decisions.
+  ;; BLINK-EVENT-AT is the latest reset or toggle of the current epoch.
+  (blink-epoch 0) blink-epoch-at (blink-toggles 0) blink-toggled-at blink-previous-at
+  blink-toggle-frame blink-event-at
   ;; The window owner alone enqueues/drains. Observers use INPUT-LOCK.
   (input-lock (sb-thread:make-mutex :name "lispterm input"))
   input-head input-tail (input-offset 0) (input-pending 0))
@@ -29,6 +34,17 @@
       (when pty (lispterm.pty:pty-window-size pty))
     (%make-session :pty pty :screen (lispterm.engine:make-screen :rows rows :columns columns)
                    :pty-rows pty-rows :pty-columns pty-columns)))
+
+(defun session-blink-receipt (session)
+  "Blink state of the latest completed frame; call with SESSION-LOCK held."
+  (list :blink-phase (session-blink-phase session)
+        :blink-visible (session-blink-visible session)
+        :blink-epoch (session-blink-epoch session)
+        :blink-epoch-at (session-blink-epoch-at session)
+        :blink-toggles (session-blink-toggles session)
+        :blink-toggled-at (session-blink-toggled-at session)
+        :blink-previous-at (session-blink-previous-at session)
+        :blink-toggle-frame (session-blink-toggle-frame session)))
 
 (defun utf8 (text)
   (babel:string-to-octets text :encoding :utf-8))
