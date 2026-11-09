@@ -1,0 +1,80 @@
+;;;; Fresh negative fixtures and guarded, dedicated mid-validation mutation.
+(in-package :vttest-vt52-native-contract-tests)
+(defun change-recorder (fn)
+  (change-form "recorder/RESULT.sexp" fn)
+  (let ((r (a::parsed (queued "recorder/RESULT.sexp"))))
+    (change-form "VT52-RUN.sexp"
+      (lambda (n)
+        (setf (getf n :recorder-sha256) (getf (qref "recorder/RESULT.sexp") :sha256)
+          (getf n :navigation) (copy-tree (getf r :navigation))
+          (getf (getf (getf n :stages) :recorder) :origin) (qref "recorder/RESULT.sexp")
+          (getf (getf n :finalization) :result) (qref "recorder/RESULT.sexp")) n))))
+(defun dedicated-refusal (name mutate expected &optional (calls 0))
+  (let* ((root (fixture "x11" 1 mutate)) (a::*calls* 0)
+         (r (refusal name root)))
+    (format t "CASE ~s REASONS ~s DECODES ~d~%" name (getf r :reasons) a::*calls*)
+    (check (list name :reason) (member expected (getf r :reasons)))
+    (check (list name :decoder-calls) (= calls a::*calls*)) root))
+(defun mutate-once (root relative)
+  ;; The old inode is retained under an exclusive hard-link witness. Only this
+  ;; dedicated new fixture changes, after exact byte/hash guards. No overwrite.
+  (let* ((path (concatenate 'string root relative))
+         (witness (concatenate 'string path ".original-witness"))
+         (old (a::read-bytes path))
+         (hash (vttest-vt52-sha256:sha256-hex old))
+         (new (concatenate '(vector (unsigned-byte 8)) old (a::bytes (string #\Newline)))))
+    (assert (<= (length new) 8192))
+    (format t "PREWRITE-MUTATION ~a ~d ~a~%" path (length new)
+      (vttest-vt52-sha256:sha256-hex new)) (finish-output)
+    (a::absent witness)
+    (assert (and (equalp old (a::read-bytes path)) (equal hash (io:digest-file path))))
+    (sb-posix:link path witness)
+    (assert (equalp old (a::read-bytes witness)))
+    (assert (equal hash (io:digest-file path))) (sb-posix:unlink path)
+    (let ((fd (sb-posix:open path (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl sb-posix:o-nofollow) #o600)))
+      (with-open-stream (s (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8) :auto-close t))
+        (write-sequence new s)))
+    (assert (equalp new (a::read-bytes path)))
+    (assert (equal hash (io:digest-file witness)))))
+(defun original-refusal-cases ()
+  (dedicated-refusal :stored-pass-original-missing
+    (lambda () (setf *files* (remove "recorder/pause-02-before.sexp" *files* :key #'car :test #'equal)))
+    :capture-refused)
+  (dedicated-refusal :navigation-hold
+    (lambda () (change-recorder (lambda (r)
+      (setf (getf (second (getf r :navigation)) :released) nil) r))) :invalid-navigation)
+  (dedicated-refusal :original-prefix-replay
+    (lambda () (change-recorder (lambda (r)
+      (decf (getf (getf (getf r :navigation-proofs) :outer-hold) :end)) r))) :invalid-navigation)
+  (dedicated-refusal :source-post
+    (lambda () (let ((row (assoc "native/execution-inputs-post.check" *files* :test #'equal)))
+      (setf (cdr row) (a::bytes (format nil "wrong: OK~%"))))) :source-binding-failed)
+  (dedicated-refusal :scenario
+    (lambda () (change-form "MANIFEST.sexp" (lambda (m)
+      (setf (getf (first (getf m :scenarios)) :id) "other") m))) :invalid-manifest)
+  (dedicated-refusal :ledger-count
+    (lambda () (change-form "native/stages.sexp" (lambda (l)
+      (setf (getf l :entries) (append (getf l :entries) (copy-tree (getf l :entries)))) l))) :invalid-ledger)
+  (dedicated-refusal :finalization-client
+    (lambda () (change-form "VT52-RUN.sexp" (lambda (n)
+      (setf (getf (getf n :finalization) :client-exit) 143) n))) :finalization-failed)
+  (dedicated-refusal :build
+    (lambda () (change-form "build/BUILD.sexp" (lambda (b) (setf (getf b :status) :fail) b))) :build-failed)
+  (let* ((root (fixture "x11" 1))
+         (symbol 'vttest-vt52-png-adapter:decode-original-png)
+         (saved (symbol-function symbol)) (a::*calls* 0))
+    (unwind-protect
+      (progn
+        (setf (symbol-function symbol)
+          (lambda (&rest args)
+            (prog1 (apply #'a::fake-decode args) (mutate-once root "native/owned-cleanup.sexp"))))
+        (let ((r (refusal :after-root-before-rehash root)))
+          (check :mutation-reason (member :evidence-changed (getf r :reasons)))
+          (check :independently-valid-capture (eql 1 (getf r :valid-frames)))
+          (check :one-decode (= 1 a::*calls*))))
+      (setf (symbol-function symbol) saved)
+      (assert (eq saved (symbol-function symbol))))))
+(defun known-refusal-case ()
+  (dedicated-refusal :stored-pass-original-changed
+    (lambda () (change-form "recorder/pause-02-before.sexp" (lambda (s) (setf (getf s :rows) 23) s)))
+    :capture-refused 1))
