@@ -1,0 +1,113 @@
+;;;; Pure recorder-format fixtures. No application, capture or decoder execution.
+(load (merge-pathnames "vttest-vt52-native-navigation.lisp" *load-truename*))
+(defpackage :vttest-vt52-native-navigation-tests
+  (:use :cl) (:local-nicknames (:io :vttest-vt52-native-io))
+  (:export :fixture :publish :run-tests))
+(in-package :vttest-vt52-native-navigation-tests)
+(defparameter *outer* (format nil "Test of terminal response to IDENTIFY command~%Response was <27> / Z -- OK (means VT100 emulating VT52)~%Push <RETURN>"))
+(defparameter *menu* (format nil "Choose test type:~%7. Test of VT52 mode~%Enter choice number (0 - 12): "))
+(defun octets (s) (sb-ext:string-to-octets s :external-format :utf-8))
+(defun serial (x)
+  (with-standard-io-syntax
+    (let ((*print-readably* nil) (*print-pretty* nil) (*print-circle* nil))
+      (with-output-to-string (s) (write x :stream s) (terpri s)))))
+(defun exclusive (path bytes)
+  (assert (<= (length bytes) 8192))
+  (handler-case (progn (sb-posix:lstat path) (error "Existing fixture"))
+    (sb-posix:syscall-error (e) (assert (= sb-posix:enoent (sb-posix:syscall-errno e)))))
+  (let ((fd (sb-posix:open path (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl sb-posix:o-nofollow) #o600)))
+    (with-open-stream (s (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8) :auto-close t))
+      (write-sequence bytes s)))
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((actual (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (assert (= (length bytes) (read-sequence actual s))) (assert (equalp bytes actual))))
+  (length bytes))
+(defun fixture (root backend scale)
+  "Return RESULT, observations, output octets, chronological events as four values.
+ROOT is the canonical future run directory including final slash. Caller may mutate
+returned objects before PUBLISH. Proofs are produced through the real public gate."
+  (let ((events nil) (out (octets "")) (input 0) (seq 0) (pause 1))
+    (labels ((event (kind &rest data)
+               (let ((e (append (list :seq (incf seq) :kind kind :pause pause :time seq :out (length out) :in input) data)))
+                 (push e events) e))
+             (wire-out (text)
+               (let ((b (octets text)))
+                 (event :wire-out :start (length out) :end (+ (length out) (length b)) :bytes b :source nil :child-pid 42)
+                 (setf out (concatenate '(vector (unsigned-byte 8)) out b))))
+             (return-key (hold)
+               (event :driver :bytes (octets (string #\Return)))
+               (event :wire-in :start input :end (1+ input) :bytes (octets (string #\Return)) :source :driver)
+               (incf input) (event :navigation-released :hold hold))
+             (checkpoint ()
+               (assert (not (eq :refuse (getf (vttest-vt52-navigation:vt52-navigation-check out (reverse events) (length out) 42 :main-menu) :state))))
+               (list :start (length out) :event seq :input input :child-pid 42 :ticks seq))
+             (proof (cp stage)
+               (let ((p (vttest-vt52-navigation:vt52-navigation-check out (reverse events) (getf cp :start) 42 stage)))
+                 (assert (eq :ready (getf p :state)))
+                 (append p (list :end (length out) :event seq :input input :child-pid 42 :ticks seq :checkpoint (copy-list cp))))))
+      (event :navigation-reached :hold 1) (return-key 1)
+      (wire-out "original VT52 graphics hold") (setf pause 2)
+      (event :navigation-reached :hold 2)
+      (let* ((cp2 (checkpoint)) (outer nil) (menu nil))
+        (return-key 2) (wire-out *outer*) (setf outer (proof cp2 :outer-hold) pause 3)
+        (event :navigation-reached :hold 3 :proof outer)
+        (let ((cp3 (checkpoint)))
+          (return-key 3) (wire-out *menu*) (setf menu (proof cp3 :main-menu)))
+        (event :navigation-main-menu :proof menu)
+        (values
+          (list :kind :vttest-vt52-run :version 2 :backend backend :status :pass
+            :attempted 1 :reached 1 :captured 1 :frame-verified 1 :bytes :unverified
+            :wire-accounting :pass :reason "Synthetic navigation fixture" :cleanup :graceful-exit
+            :checks (list (list :pause 2 :pixels :pass :bytes :unverified :timing :pass :frame :pass
+                              :target nil :native nil :comparison nil :evidence nil))
+            :evidence '("events.sexp" "output.raw" "input.raw" "application.log" "launch.sexp" "terminal-status.sexp")
+            :profile :vt52 :scale scale :navigation-pauses '(1 2 3)
+            :navigation (loop for n from 1 to 3 collect (list :pause n :reached t :released t))
+            :navigation-proofs (list :outer-hold outer :main-menu menu) :unverified-count 0)
+          (list :kind :recorder-observations :version 1 :run root :backend (intern (string-upcase backend) :keyword)
+            :clock :get-internal-real-time :units-per-second internal-time-units-per-second :child-pid 42
+            :association :single-owned-recorder-session :query-production-time :unknown
+            :sampling :sequential-not-atomic :missing nil
+            :samples (list (list :kind :boundary :boundary :child-spawn :edge :return :child-pid 42)))
+          out (reverse events))))))
+(defun publish (root result obs output events &optional overrides)
+  "Write each original exactly once. OVERRIDES is a relative-path/raw-octets alist;
+:OMIT omits that original. Every file is measured before exclusive creation."
+  (sb-posix:mkdir root #o700) (sb-posix:mkdir (concatenate 'string root "recorder/") #o700)
+  (dolist (entry (list (cons "recorder/RESULT.sexp" (octets (serial result)))
+                      (cons "recorder/observations.sexp" (octets (serial obs)))
+                      (cons "recorder/output.raw" output)
+                      (cons "recorder/events.sexp" (octets (format nil "~{~a~}" (mapcar #'serial events))))))
+    (let* ((override (assoc (car entry) overrides :test #'equal))
+           (bytes (if override (cdr override) (cdr entry))))
+      (unless (eq bytes :omit) (exclusive (concatenate 'string root (car entry)) bytes))))
+  root)
+
+;; Extract only the audited pure-wait definition, never LOAD the recorder.
+(defparameter *recorder-source* (merge-pathnames "vttest-charsets-recorder.lisp" *load-truename*))
+(define-condition native-abort (error) ((reason :initarg :reason)))
+(defun first-hold-tests ()
+  (let* ((pkg (or (find-package :vttest-screen-frame) (make-package :vttest-screen-frame :use nil)))
+         (settled (intern "SETTLED-P" pkg))
+         (text (with-open-file (s *recorder-source*)
+                 (let ((x (make-string (file-length s)))) (read-sequence x s) x)))
+         (*package* (find-package :vttest-vt52-native-navigation-tests)) (*read-eval* nil))
+    (export settled pkg)
+    (let* ((form (read-from-string (subseq text (search "(defun await-vt52-first-hold " text) (search "(defun run-main " text))))
+           (markers (cadadr (car (second (nth 4 form)))))
+           (grid (make-string (* 24 81) :initial-element #\Space))
+           (out (octets (format nil "~{~a~%~}" (mapcar #'third markers)))))
+      (dolist (m markers) (replace grid (third m) :start1 (+ (* (1- (first m)) 81) (1- (second m)))))
+      (loop for pid in '(42 99) collect
+        (handler-case
+          (progn
+            (assert (eq :first-hold (getf (eval `(flet ((await (h f) (declare (ignore h)) (funcall f))
+                          (vt52-output-snapshot ()
+                            (values ',out ',(list (list :seq 1 :kind :wire-out :out 0 :in 0 :start 0 :end (length out) :bytes out :source nil :child-pid pid))
+                                    ',(list :child-pid 42 :start (length out) :event 1)))
+                          (grid (h) (declare (ignore h)) ,grid)
+                          (observed-status (h) (declare (ignore h)) ',(list :bytes-received (length out) :input-pending 0))
+                          (,settled (s) (declare (ignore s)) t))
+                     (funcall (lambda ,(third form) ,@(cdddr form)) nil '(:child-pid 42 :start 0)))) :stage)))
+            :accepted)
+          (native-abort () :refused))))))
