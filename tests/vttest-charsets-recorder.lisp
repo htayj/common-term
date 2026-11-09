@@ -3,9 +3,15 @@
 (load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
 (asdf:load-system "lispterm")
 (load (merge-pathnames "vttest-screen-frame.lisp" *load-truename*))
+(load (merge-pathnames "vttest-vt52-sha256.lisp" *load-truename*))
+;; Pure dependency: establish its package before reading qualified helper calls.
+(load (merge-pathnames "vttest-vt52-navigation.lisp" *load-truename*))
 (load (merge-pathnames "vttest-charsets-oracle.lisp" *load-truename*))
 (load (merge-pathnames "vttest-charsets-native-contract.lisp" *load-truename*))
 (load (merge-pathnames "vttest-charsets-pixels.lisp" *load-truename*))
+;; Establish canonical VT52 packages before reading any qualified references.
+(load (merge-pathnames "vttest-vt52-oracle.lisp" *load-truename*))
+(load (merge-pathnames "vttest-vt52-capture-adapter.lisp" *load-truename*))
 (defpackage #:vttest-charsets-recorder (:use #:cl))
 (in-package #:vttest-charsets-recorder)
 (defparameter *root* (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_VTTEST_RUN_ROOT")))
@@ -18,6 +24,11 @@
           ((and (string= value "2") (eq *backend* :wayland)) 2)
           (t (error "Unsupported LISPTERM_VTTEST_SCALE ~s for backend ~(~a~)" value *backend*))))
   "Selected output scale: exactly \"1\" or \"2\", default 1; X11 accepts only 1.")
+(defparameter *profile*
+  (let ((value (or (uiop:getenv "LISPTERM_VTTEST_PROFILE") "charsets")))
+    (cond ((string= value "charsets") :charsets)
+          ((string= value "vt52") :vt52)
+          (t (error "Unsupported LISPTERM_VTTEST_PROFILE ~s" value)))))
 (defparameter *binary* (uiop:getenv "LISPTERM_VTTEST_EXECUTABLE"))
 (defparameter *lock* (sb-thread:make-mutex :name "character-set recorder"))
 (defparameter *output* 0)
@@ -36,6 +47,41 @@
 (define-condition native-abort (error)
   ((reason :initarg :reason :reader native-abort-reason))
   (:report (lambda (condition stream) (write-string (native-abort-reason condition) stream))))
+(defun validate-vt52-native-failure (record root backend pause &optional envelope)
+  "Validate the shared notify schema; VT52 accepts its actual pause range 0..3.
+No pause ordering beyond equality with the recorder's current pause is inferred."
+  (vttest-charsets-native-contract::tree record)
+  (vttest-charsets-native-contract::properties
+    record (append '(:kind :version :run :backend :pause :reason :stage :manifest)
+                   (when envelope '(:origin))))
+  (vttest-charsets-native-contract::need
+    (and (eq :vttest-charsets-native-failure (getf record :kind))
+         (eql 1 (getf record :version))
+         (equal (namestring (truename root)) (getf record :run))
+         (equal backend (getf record :backend))
+         (member backend '("x11" "wayland") :test #'equal)
+         (typep pause '(integer 0 3)) (eql pause (getf record :pause))
+         (member (getf record :reason)
+                 '("recorder" "request" "geometry" "authorization" "capture" "placement") :test #'equal)
+         (member (getf record :stage) '(:placement :request :geometry :authorization :capture)))
+    "Foreign/stale VT52 native failure")
+  (vttest-charsets-native-contract::check-reference (getf record :manifest) root "MANIFEST.sexp")
+  (when envelope
+    (vttest-charsets-native-contract::check-reference
+      (getf record :origin) root "native/native-failure-origin.sexp")
+    (let ((origin (vttest-charsets-native-contract:read-data
+                    (vttest-charsets-native-contract::local-path root "native/native-failure-origin.sexp"))))
+      (validate-vt52-native-failure origin root backend pause)
+      (vttest-charsets-native-contract::need
+        (equal origin (loop for (k v) on record by #'cddr
+                            unless (eq k :origin) append (list k v)))
+        "Failure origin differs")))
+  record)
+(defun validate-profile-native-failure (record root backend pause &optional envelope)
+  (ecase *profile*
+    (:vt52 (validate-vt52-native-failure record root backend pause envelope))
+    (:charsets (vttest-charsets-native-contract::validate-native-failure
+                 record root backend pause envelope))))
 (defun check-native-failure ()
   "Validate on the controlling thread, before accepting any simultaneous success."
   (let ((file (merge-pathnames "native/native-failure.sexp" *root*)))
@@ -46,7 +92,7 @@
                     (when *native-failure-seen* (error "Duplicate native failure"))
                     (setf *native-failure-seen* t)
                     (let ((record (vttest-charsets-native-contract:read-data file)))
-                      (vttest-charsets-native-contract::validate-native-failure
+                      (validate-profile-native-failure
                         record (namestring *root*) (string-downcase *backend*) *pause* t)
                       (save "native-failure-observed.sexp"
                         (list :origin (vttest-charsets-native-contract:reference
@@ -63,6 +109,19 @@
 (defparameter *saved-bindings* nil)
 (defparameter *observation-active* nil)
 (defparameter *owned-child* :unknown)
+(defparameter *owned-pty* nil)
+
+(defun bind-vt52-owned-pty (pty argv)
+  "Bind the actual successfully spawned PTY, before the owner's first read."
+  (let* ((process (lispterm.pty:pty-process pty))
+         (pid (and process (lispterm.pty:process-pid process))))
+    (unless (and (typep pty 'lispterm.pty:pty) (integerp pid) (plusp pid)
+                 (equal argv (list *binary* "-l" (namestring (path "application.log")) "24x80.132")))
+      (error 'native-abort :reason "VT52 spawn ownership is unproven"))
+    (sb-thread:with-mutex (*lock*)
+      (when *owned-pty*
+        (error 'native-abort :reason "Duplicate VT52 owned spawn"))
+      (setf *owned-pty* pty *owned-child* pid))))
 (defparameter *primary-nodes* (make-hash-table :test #'eq))
 (defvar *primary-write* nil)
 (defvar *wait-observer* nil)
@@ -119,8 +178,10 @@
                   (call-observed boundary original arguments
                     (when (eq boundary :child-spawn)
                       (lambda (args)
-                        (let ((process (lispterm.pty:pty-process (first args))))
-                          (setf *owned-child* (if process (lispterm.pty:process-pid process) :unknown)))))))))))))
+                        (if (eq *profile* :vt52)
+                            (bind-vt52-owned-pty (first args) (second args))
+                            (let ((process (lispterm.pty:pty-process (first args))))
+                              (setf *owned-child* (if process (lispterm.pty:process-pid process) :unknown))))))))))))))
 
 (defun save-observations ()
   (save "observations.sexp"
@@ -169,20 +230,23 @@
                      :edge edge candidate))))
       (await host
         (lambda ()
-          (let* ((status (lispterm:status host)) (actual (grid host))
+          (let* ((status (observed-status host)) (actual (grid host))
                  (session (lispterm::host-session host))
                  (cursor (sb-thread:with-mutex ((lispterm::session-lock session))
                            (let ((screen (lispterm::session-screen session)))
                              (list :row (1+ (lispterm.engine:cursor-row screen))
                                    :column (1+ (lispterm.engine:cursor-column screen))))))
                  (details (predicate-details text actual
-                            (getf (vttest-charsets-oracle:snapshot-metadata snapshot) :cursor) cursor
+                             (getf (snapshot-metadata snapshot) :cursor) cursor
                             nil
                             status n stage))
-                 (matches (if (eq stage :grid-wait) (getf details :grid-match)
-                              (every (lambda (key) (getf details key))
-                                     '(:grid-match :cursor-match :settled :output-match :input-empty
-                                       :blink-content-match :frame-complete :blink-phase-match)))))
+                 (matches (if (and (eq *profile* :charsets) (eq stage :grid-wait))
+                              (getf details :grid-match)
+                              (and (every (lambda (key) (getf details key))
+                                          '(:grid-match :cursor-match :settled :output-match :input-empty
+                                            :blink-content-match :frame-complete :blink-phase-match))
+                                   (or (eq *profile* :charsets)
+                                       (eq t (vttest-screen-frame:required-value status :blink-phase)))))))
             (setf candidate (append (list :candidate-result (not (null matches))
                                          :candidate-ticks (get-internal-real-time)
                                          :candidate-event *sequence* :candidate-output *output*
@@ -190,10 +254,19 @@
             (when matches (if (eq stage :grid-wait) t status))))))))
 
 (defun path (name) (merge-pathnames name *art*))
+(defun write-receipt-value (value stream)
+  "Write one receipt and LF; VT52 uses the admission reader's plain syntax."
+  (if (eq *profile* :vt52)
+      (with-standard-io-syntax
+        (let ((*print-readably* nil) (*print-escape* t) (*print-base* 10)
+              (*print-pretty* nil) (*print-length* nil) (*print-level* nil))
+          (write value :stream stream) (terpri stream)))
+      (let ((*print-pretty* nil) (*print-length* nil) (*print-level* nil))
+        (write value :stream stream) (terpri stream))))
+
 (defun save (name value)
   (with-open-file (s (path name) :direction :output :if-exists :error)
-    (let ((*print-pretty* nil) (*print-length* nil) (*print-level* nil))
-      (write value :stream s) (terpri s))))
+    (write-receipt-value value s)))
 
 (defun publish-request (name writer)
   "Publish closed request bytes once, without replacing any final pathname."
@@ -213,13 +286,64 @@
 
 (defun publish-request-value (name value)
   (publish-request name
-    (lambda (s)
-      (let ((*print-pretty* nil) (*print-length* nil) (*print-level* nil))
-        (write value :stream s) (terpri s)))))
+    (lambda (s) (write-receipt-value value s))))
+(defun vt52-properties (value)
+  "Bound and reject shared/cyclic trees before any plist traversal."
+  (let ((seen (make-hash-table :test #'eq)) (todo (list value)) (nodes 0))
+    (loop while todo for node = (pop todo) when (consp node) do
+      (unless (and (not (gethash node seen)) (<= (incf nodes) 4096))
+        (error 'native-abort :reason "VT52 record tree refusal"))
+      (setf (gethash node seen) t)
+      (push (car node) todo) (push (cdr node) todo)))
+  (let ((keys nil))
+    (loop for tail = value then (cddr tail) while tail do
+      (unless (and (consp tail) (consp (cdr tail)) (keywordp (car tail))
+                   (not (member (car tail) keys)))
+        (error 'native-abort :reason "VT52 record properties refusal"))
+      (push (car tail) keys)))
+  value)
+(defun observed-status (host)
+  (let ((value (lispterm:status host)))
+    (when (eq *profile* :vt52)
+      (vt52-properties value)
+      ;; A legitimate startup may have NIL geometry; no settled claim follows.
+      (vt52-properties (getf value :geometry)))
+    value))
+(defun read-vt52-value (name)
+  "Bound original UTF-8 bytes and forbid reader dispatch before parsing."
+  (let ((file (path name)))
+    (unless (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:lstat file)))
+      (error 'native-abort :reason "VT52 nonregular native receipt"))
+    (let* ((bytes
+             (with-open-file (s file :element-type '(unsigned-byte 8))
+               (let ((size (file-length s)))
+                 (unless (<= 1 size 8192) (error "VT52 native receipt size refusal"))
+                 (let ((v (make-array size :element-type '(unsigned-byte 8))))
+                   (unless (and (= size (read-sequence v s)) (null (read-byte s nil nil)))
+                     (error "VT52 native receipt readback refusal"))
+                   v))))
+           (text (sb-ext:octets-to-string bytes :external-format :utf-8))
+           (quoted nil) (escape nil))
+      (loop for c across text do
+        (cond (escape (setf escape nil))
+              ((and quoted (char= c #\\)) (setf escape t))
+              ((and (not quoted) (find c '(#\\ #\| #\; #\#)))
+               (error "VT52 native receipt syntax refusal"))
+              ((char= c #\") (setf quoted (not quoted)))))
+      (with-standard-io-syntax
+        (let ((*read-eval* nil) (*readtable* (copy-readtable nil)))
+          (multiple-value-bind (form end) (read-from-string text nil :eof)
+            (unless (and (not (eq form :eof))
+                         (every (lambda (c) (find c '(#\Space #\Tab #\Newline #\Return #\Page)))
+                                (subseq text end)))
+              (error "VT52 native receipt single-form refusal"))
+            (vt52-properties form)))))))
 (defun read-value (name)
-  (with-open-file (s (path name))
-    (let ((*read-eval* nil))
-      (let ((value (read s))) (unless (eq (read s nil :eof) :eof) (error "Extra receipt form")) value))))
+  (if (eq *profile* :vt52)
+      (read-vt52-value name)
+      (with-open-file (s (path name))
+        (let ((*read-eval* nil))
+          (let ((value (read s))) (unless (eq (read s nil :eof) :eof) (error "Extra receipt form")) value)))))
 (defun touch (name) (with-open-file (s (path name) :direction :output :if-exists :error)))
 (defun event-unlocked (kind &rest data)
   (let ((record (append (list :seq (incf *sequence*) :kind kind :pause *pause*
@@ -230,7 +354,7 @@
         (write record :stream s) (terpri s)))
     record))
 (defun event (kind &rest data) (sb-thread:with-mutex (*lock*) (apply #'event-unlocked kind data)))
-(defun wire (kind bytes &optional source)
+(defun wire (kind bytes &optional source read-pty)
   (when (plusp (length bytes))
     (sb-thread:with-mutex (*lock*)
       (let* ((outp (eq kind :wire-out)) (start (if outp *output* *input*))
@@ -238,9 +362,79 @@
         (with-open-file (s (path (if outp "output.raw" "input.raw")) :direction :output
                            :element-type '(unsigned-byte 8) :if-exists :append :if-does-not-exist :create)
           (write-sequence bytes s))
-        (event-unlocked kind :start start :end end :bytes (copy-seq bytes) :source source)
+        (if (and outp (eq *profile* :vt52))
+            ;; READ-PTY comes from this actual PTY-READ invocation, not global PID state.
+            (let* ((process (and read-pty (lispterm.pty:pty-process read-pty)))
+                   (pid (and process (lispterm.pty:process-pid process))))
+              (event-unlocked kind :start start :end end :bytes (copy-seq bytes) :source source
+                              :child-pid (and (eq read-pty *owned-pty*)
+                                              (eql pid *owned-child*) pid)))
+            (event-unlocked kind :start start :end end :bytes (copy-seq bytes) :source source))
         (if outp (setf *output* end) (setf *input* end))
         (values *sequence* start end)))))
+
+(defun vt52-output-snapshot ()
+  "Coherent complete raw octets and chronological events; never acquire session locks."
+  (unless (eq *profile* :vt52)
+    (error 'native-abort :reason "VT52 navigation requested in another profile"))
+  (sb-thread:with-mutex (*lock*)
+    (unless (and *owned-pty* (integerp *owned-child*) (plusp *owned-child*)
+                 (<= 0 *output* 1048576))
+      (error 'native-abort :reason "VT52 output ownership or size is unproven"))
+    ;; WIRE closes its append stream before publishing its event/counter under
+    ;; this same lock. No live output buffer needs flushing here.
+    (let ((bytes (make-array *output* :element-type '(unsigned-byte 8))))
+      (cond ((probe-file (path "output.raw"))
+             (with-open-file (s (path "output.raw") :element-type '(unsigned-byte 8))
+               (unless (and (= (file-length s) *output*)
+                            (= (read-sequence bytes s) *output*)
+                            (eq (read-byte s nil :eof) :eof))
+                 (error 'native-abort :reason "VT52 raw output length changed"))))
+            ((plusp *output*)
+             (error 'native-abort :reason "VT52 raw output is missing")))
+      (values bytes (reverse (copy-tree *events*))
+              (list :start *output* :event *sequence* :input *input*
+                    :child-pid *owned-child* :ticks (get-internal-real-time))))))
+
+(defun vt52-navigation-checkpoint ()
+  "Take immediately BEFORE one separately authorized Return; this sends no input."
+  (multiple-value-bind (output events checkpoint) (vt52-output-snapshot)
+    ;; Validate the coherent prefix even when no fresh marker is required yet.
+    (let ((proof (vttest-vt52-navigation:vt52-navigation-check
+                   output events (length output) (getf checkpoint :child-pid) :main-menu)))
+      (when (eq (getf proof :state) :refuse)
+        (error 'native-abort :reason "VT52 checkpoint provenance refused")))
+    checkpoint))
+
+(defun await-vt52-navigation (checkpoint stage &optional (timeout 30))
+  "Read-only polling. Return gate proof and absolute ledger offsets, never input."
+  (unless (and (member stage '(:outer-hold :main-menu))
+               (realp timeout) (< 0 timeout 120))
+    (error 'native-abort :reason "Invalid VT52 navigation wait"))
+  (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+    (loop
+      (check-native-failure)
+      (multiple-value-bind (output events current) (vt52-output-snapshot)
+        (unless (and (eql (getf checkpoint :child-pid) (getf current :child-pid))
+                     (integerp (getf checkpoint :event))
+                     (<= 0 (getf checkpoint :event) (getf current :event)))
+          (error 'native-abort :reason "VT52 navigation checkpoint ownership changed"))
+        (let ((proof (vttest-vt52-navigation:vt52-navigation-check
+                       output events (getf checkpoint :start)
+                       (getf checkpoint :child-pid) stage)))
+          (ecase (getf proof :state)
+            (:ready
+             (return (append proof
+                       (list :end (length output) :event (getf current :event)
+                             :input (getf current :input) :child-pid (getf current :child-pid)
+                             :ticks (getf current :ticks) :checkpoint (copy-list checkpoint)))))
+            (:refuse
+             (error 'native-abort :reason
+                    (format nil "VT52 navigation refused: ~s" (getf proof :reasons))))
+            (:pending nil))))
+      (when (>= (get-internal-real-time) deadline)
+        (error 'native-abort :reason "VT52 navigation timed out without authorization"))
+      (sleep .01))))
 
 (defun install-wire-recorder ()
   (let ((reader (symbol-function 'lispterm.pty:pty-read))
@@ -256,7 +450,7 @@
                       (lambda (bytes &rest more)
                         (let ((returned (get-internal-real-time)))
                           (when (and (vectorp bytes) (plusp (length bytes)))
-                            (multiple-value-bind (seq start end) (wire :wire-out bytes)
+                            (multiple-value-bind (seq start end) (wire :wire-out bytes nil (first args))
                               (observe-once :first-output :first-pty-output
                                             :read-entry-ticks entry :read-return-ticks returned
                                             :event-range (list seq seq) :output-range (list start end)))))
@@ -330,18 +524,38 @@
             (dotimes (c (lispterm.engine:columns screen))
               (write-char (or (lispterm.engine:cell-character (lispterm.engine:cell-at screen r c)) #\Space) s))
             (terpri s)))))))
+(defun snapshot-metadata (snapshot)
+  (ecase *profile*
+    (:charsets (vttest-charsets-oracle:snapshot-metadata snapshot))
+    (:vt52 (vttest-vt52-oracle:snapshot-metadata snapshot))))
+(defun require-snapshot (snapshot)
+  (ecase *profile*
+    (:charsets (vttest-charsets-oracle:require-complete snapshot))
+    (:vt52
+     (unless (and (eql 2 (vttest-vt52-oracle:snapshot-pause snapshot))
+                  (eq :complete-reference (getf (snapshot-metadata snapshot) :status)))
+       (error "Incomplete VT52 reference"))
+     snapshot)))
 (defun expected-text (snapshot)
   (with-output-to-string (s)
-    (loop for cell across (vttest-charsets-oracle:snapshot-cells snapshot) for i from 1 do
+    (loop for cell across (ecase *profile*
+                            (:charsets (vttest-charsets-oracle:snapshot-cells snapshot))
+                            (:vt52 (vttest-vt52-oracle:snapshot-cells snapshot)))
+          for i from 1 do
       (write-char (code-char (vttest-screen-oracle:cell-code cell)) s)
-      (when (zerop (mod i (vttest-charsets-oracle:snapshot-columns snapshot))) (terpri s)))))
+      (when (zerop (mod i (ecase *profile*
+                            (:charsets (vttest-charsets-oracle:snapshot-columns snapshot))
+                            (:vt52 (vttest-vt52-oracle:snapshot-columns snapshot)))))
+        (terpri s)))))
 (defun cursor-matches-p (host snapshot)
-  (let* ((expected (getf (vttest-charsets-oracle:snapshot-metadata snapshot) :cursor))
+  (let* ((expected (getf (snapshot-metadata snapshot) :cursor))
          (session (lispterm::host-session host)))
     (sb-thread:with-mutex ((lispterm::session-lock session))
       (let ((screen (lispterm::session-screen session)))
         (and (= (getf expected :row) (1+ (lispterm.engine:cursor-row screen)))
-             (= (getf expected :column) (1+ (lispterm.engine:cursor-column screen))))))))
+             (= (getf expected :column) (1+ (lispterm.engine:cursor-column screen)))
+             (or (eq *profile* :charsets)
+                 (eq (getf expected :visible) (nerimux/terminal:screen-cursor-visible screen))))))))
 (defun completed-wayland-frame-p (status target)
   (let ((g (getf status :geometry)))
     (and (>= *ack* target) *presentation-witness*
@@ -367,19 +581,54 @@
 (defun send (host text) (event :driver :bytes (map 'vector #'char-code text)) (lispterm:send-input host text))
 (defun pause-name (pause suffix) (format nil "pause-~2,'0d-~a" pause suffix))
 
+(defun control-file-sha256 (n suffix)
+  "Hash the exact closed original file, not a printed reconstruction."
+  (with-open-file (s (path (pause-name n suffix)) :element-type '(unsigned-byte 8))
+    (let ((size (file-length s)))
+      (unless (<= 1 size 8192) (error "Control input size refusal: ~a" suffix))
+      (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+        (unless (and (= size (read-sequence bytes s)) (null (read-byte s nil nil)))
+          (error "Control input readback refusal: ~a" suffix))
+        (vttest-vt52-sha256:sha256-hex bytes)))))
+
+(defun vt52-control-cursor (host status target when linked seq)
+  "Sequential engine bracket, not atomic status, presentation or scanout."
+  (let* ((output-before (sb-thread:with-mutex (*lock*) *output*))
+         (session (lispterm::host-session host))
+         (sample
+           (sb-thread:with-mutex ((lispterm::session-lock session))
+             (let ((screen (lispterm::session-screen session)))
+               (list (1+ (lispterm.engine:cursor-row screen))
+                     (1+ (lispterm.engine:cursor-column screen))
+                     (nerimux/terminal:screen-cursor-visible screen)
+                     (lispterm::session-bytes-received session)))))
+         ;; Never call STATUS or acquire recorder lock while holding session lock.
+         (after (observed-status host))
+         (output-after (sb-thread:with-mutex (*lock*) *output*)))
+    (unless (and (= target output-before output-after (fourth sample))
+                 (eql target (getf status :bytes-received))
+                 (eql target (getf after :bytes-received))
+                 (= 12 (first sample)) (= 14 (second sample)) (eq t (third sample)))
+      (error "VT52 cursor/output bracket refusal: ~s" sample))
+    (list :seq seq :kind :cursor-sample :when when :row (first sample)
+          :col (second sample) :visible (third sample) :linked-sha256 linked)))
+
 (defun capture-hold (host n snapshot)
-  (unless (eql n 1) (error "Character-set pause must be 1"))
-  (vttest-charsets-oracle:require-complete snapshot)
+  (unless (eql n (ecase *profile* (:charsets 1) (:vt52 2)))
+    (error "Capture pause does not match profile ~s" *profile*))
+  (require-snapshot snapshot)
   (let* ((text (expected-text snapshot))
          (content nil)
          (before (await-target host snapshot n :capture-hold))
-         (target (getf before :bytes-received)) (ready nil) (pre nil) (final nil) (native nil))
+         (target (getf before :bytes-received)) (ready nil) (pre nil) (final nil) (native nil)
+         (control-p (and (eq *profile* :vt52) (= n 2)))
+         (control nil) (pre-hash nil) (final-hash nil))
     (save (pause-name n "grid.sexp") (grid host))
     (save (pause-name n "before.sexp") before)
     (event :source-endpoint :status :unverified :reason :full-session-wire-not-yet-admitted)
     (lispterm:invalidate host)
     (setf ready (await host (lambda ()
-                             (let ((st (lispterm:status host)))
+                             (let ((st (observed-status host)))
                                (when (> (getf st :frames) (1+ (getf before :frames)))
                                  (error "More than one fresh frame"))
                                (and (= (getf st :frames) (1+ (getf before :frames)))
@@ -411,16 +660,33 @@
                      (eql (getf g :actual-height) (getf receipt :height))
                      (eql window (getf receipt (if (eq *backend* :x11) :window-id :surface-id))))
           (error "Native READY identity/geometry refusal")))
-      (setf pre (lispterm:status host))
+      (setf pre (observed-status host))
       (save (pause-name n "pre.sexp") pre)
+      (when control-p
+        (setf pre-hash (control-file-sha256 n "pre.sexp"))
+        (push (list :seq 1 :kind :pre-written :sha256 pre-hash) control)
+        (push (vt52-control-cursor host pre target :before-authorization pre-hash 2) control))
       (unless (and (equal ready pre) (= target *output*) (string= text (grid host))
                    (cursor-matches-p host snapshot)
                    (or (eq *backend* :x11) (completed-wayland-frame-p pre target)))
         (error "READY/PRE or target changed before authorization"))
+      (when control-p
+        (push (list :seq 3 :kind :authorize
+                    :request-sha256 (control-file-sha256 n "request")
+                    :request-sexp-sha256 (control-file-sha256 n "request.sexp")
+                    :native-ready-sha256 (control-file-sha256 n "native-ready.sexp")) control)
+        (unless (= target (sb-thread:with-mutex (*lock*) *output*))
+          (error "VT52 output advanced before GO")))
       (touch (pause-name n "go"))
       (await host (lambda () (probe-file (path (pause-name n "done")))))
-      (setf final (lispterm:status host))
+      (when control-p
+        (push (list :seq 4 :kind :done :native-sha256 (control-file-sha256 n "native.sexp")) control))
+      (setf final (observed-status host))
       (save (pause-name n "final.sexp") final)
+      (when control-p
+        (setf final-hash (control-file-sha256 n "final.sexp"))
+        (push (list :seq 5 :kind :final-written :sha256 final-hash) control)
+        (push (vt52-control-cursor host final target :after-done final-hash 6) control))
       (setf native (read-value (pause-name n "native.sexp"))))
     (vttest-screen-frame:validate-frame before ready pre final native
       :pause n :target target :blink-content content :endpoint nil :ack-output *ack* :surface-id *surface*
@@ -428,8 +694,22 @@
     (unless (and (= target *output*) (string= text (grid host)) (cursor-matches-p host snapshot)
                  (or (eq *backend* :x11) (completed-wayland-frame-p final target)))
       (error "Final source target changed"))
-    (let ((comparison (vttest-charsets-pixels:compare-capture
-                       (namestring *root*) n snapshot before ready pre final native target *ack* *surface* :scale *scale*)))
+    ;; Publish only a complete, validated capture trace, before mandatory admission.
+    ;; The adapter reads these ORIGINAL closed files, never reconstructed records.
+    (when control-p
+      (publish-request-value (pause-name n "control.sexp") (nreverse control)))
+    (let ((comparison
+            (ecase *profile*
+              (:charsets
+               (vttest-charsets-pixels:compare-capture
+                 (namestring *root*) n snapshot before ready pre final native target *ack* *surface* :scale *scale*))
+              (:vt52
+               (let ((report (vttest-vt52-capture-adapter:check-vt52-capture-directory
+                              *art* :pause n :scale *scale*)))
+                 (save (pause-name n "comparison.sexp") report)
+                 (unless (eq :pass (getf report :verdict))
+                   (error "Mandatory VT52 capture comparison refused: ~s" (getf report :reasons)))
+                 report)))))
       (list :pause n :pixels :pass :bytes :unverified :timing :pass
             :frame :pass :target :recognized-navigation-only :native native :comparison comparison
             :evidence (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp" "presentation.sexp")
@@ -440,7 +720,7 @@
     (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8)))) (read-sequence v s) v)))
 
 (defun record-launch-identity (host)
-  (let* ((status (lispterm:status host)) (pid (getf status :child-pid))
+  (let* ((status (observed-status host)) (pid (getf status :child-pid))
          (command (list "/nix/store/cb987zkxvsv0490753ilrvn5yk7ylgxi-coreutils-9.12/bin/readlink"
                         "-f" (format nil "/proc/~d/exe" pid))))
     (event :owned-proc-exe-command :argv command)
@@ -452,7 +732,39 @@
                                 :proc-exe-stdout out :proc-exe-stderr err :proc-exe-exit code))
       (unless (and (eql code 0) (string= (namestring (truename *binary*))
                                         (string-right-trim '(#\Newline) out)))
-        (error "Launched child executable identity mismatch or unobserved")))))
+          (error "Launched child executable identity mismatch or unobserved")))))
+
+(defun await-vt52-first-hold (host checkpoint)
+  "vt52.c:149-157, fresh source strings at their exact one-based grid positions."
+  (let ((markers '((10 16 "The screen should be cleared, and have a centered")
+                   (11 16 "rectangle of \"*\"s with \"!\"s on the inside to the")
+                   (12 16 "left and right. Only this, and")
+                   (13 16 "Push <RETURN>"))))
+    (await host
+      (lambda ()
+        (multiple-value-bind (output events current) (vt52-output-snapshot)
+          (let ((proof (vttest-vt52-navigation:vt52-navigation-check
+                         output events (getf checkpoint :start) (getf current :child-pid) :main-menu)))
+            (when (eq :refuse (getf proof :state))
+              (error 'native-abort :reason "VT52 first-hold provenance refused")))
+          (let ((position (getf checkpoint :start)) (text (grid host))
+                (status (observed-status host)))
+            (and (eql (getf checkpoint :child-pid) (getf current :child-pid))
+                 (every (lambda (marker)
+                          (destructuring-bind (row column string) marker
+                            (let* ((raw (map 'vector #'char-code string))
+                                   (found (search raw output :start2 position))
+                                   (cell (+ (* (1- row) 81) (1- column))))
+                              (when found (setf position (+ found (length raw))))
+                              (and found (<= (+ cell (length string)) (length text))
+                                   (string= string text :start2 cell :end2 (+ cell (length string)))))))
+                        markers)
+                 (vttest-screen-frame:settled-p status)
+                 (eql (getf current :start) (getf status :bytes-received))
+                 (eql 0 (getf status :input-pending))
+                 (list :stage :first-hold :checkpoint (copy-list checkpoint)
+                       :end (length output) :event (getf current :event)
+                       :markers (copy-tree markers) :status status))))))))
 (defun run-main ()
   (when (probe-file *art*) (error "Recorder directory already exists"))
   (ensure-directories-exist (path ".reserve"))
@@ -460,44 +772,85 @@
   (install-startup-observers)
   (install-wire-recorder) (install-presentation-recorder)
   (let ((host nil) (checks nil) (failure nil) (attempted 0) (reached 0) (captured 0)
-        (released 0) (cleanup nil) (native-aborted nil) (accounting :unverified))
+        (released 0) (cleanup nil) (native-aborted nil) (accounting :unverified)
+        (navigation (loop for p from 1 to 3 collect (list :pause p :reached nil :released nil)))
+        (outer-proof nil) (menu-proof nil))
     (unwind-protect
          (handler-case
              (progn
                (setf host (lispterm:open :backend *backend* :rows 24 :columns 80
-                                        :title "Lispterm-charsets-owned-run"
+                                        :title (ecase *profile*
+                                                 (:charsets "Lispterm-charsets-owned-run")
+                                                 (:vt52 "Lispterm-vt52-owned-run"))
                                         :argv (list *binary* "-l" (namestring (path "application.log")) "24x80.132")))
                (record-launch-identity host)
                ;; Native observes initial placement before any target or BEFORE transaction.
                (publish-request-value "placement-request.sexp" (list :pid (sb-posix:getpid)))
                (await host (lambda () (probe-file (path "placement-ready.sexp"))))
                (await host (lambda () (search "Enter choice number" (grid host))))
-               (send host (format nil "3~c" #\Return))
-               (loop for n from 1 to 1 do
-                 (setf *pause* n attempted n)
-                (let ((snapshot (vttest-charsets-oracle:require-complete (vttest-charsets-oracle:character-set-snapshot))))
-                  (await-target host snapshot n :grid-wait)
-                   (incf reached)
-                   (push (capture-hold host n snapshot) checks)
-                   (incf captured)
-                   (send host (string #\Return)) (incf released)))
+               (ecase *profile*
+                 (:charsets
+                  (send host (format nil "3~c" #\Return))
+                  (loop for n from 1 to 1 do
+                    (setf *pause* n attempted n)
+                    (let ((snapshot (vttest-charsets-oracle:require-complete (vttest-charsets-oracle:character-set-snapshot))))
+                      (await-target host snapshot n :grid-wait)
+                      (incf reached)
+                      (push (capture-hold host n snapshot) checks)
+                      (incf captured)
+                      (send host (string #\Return)) (incf released))))
+                 (:vt52
+                  (let ((entry (vt52-navigation-checkpoint))
+                        (snapshot (require-snapshot (vttest-vt52-oracle:vt52-snapshot))))
+                    (send host (format nil "7~c" #\Return))
+                    (setf *pause* 1)
+                    (let ((proof (await-vt52-first-hold host entry)))
+                      (setf (getf (first navigation) :reached) t)
+                      (event :navigation-reached :hold 1 :proof proof))
+                    (send host (string #\Return))
+                    (setf (getf (first navigation) :released) t)
+                    (event :navigation-released :hold 1)
+                    (setf *pause* 2 attempted 1)
+                    (await-target host snapshot 2 :grid-wait)
+                    (incf reached)
+                    (setf (getf (second navigation) :reached) t)
+                    (event :navigation-reached :hold 2)
+                    (push (capture-hold host 2 snapshot) checks)
+                    (incf captured)
+                    ;; The checkpoint is immediately before the single local Return2.
+                    (let ((checkpoint (vt52-navigation-checkpoint)))
+                      (send host (string #\Return))
+                      (setf (getf (second navigation) :released) t)
+                      (event :navigation-released :hold 2)
+                      (setf outer-proof (await-vt52-navigation checkpoint :outer-hold)))
+                    (setf *pause* 3 (getf (third navigation) :reached) t)
+                    (event :navigation-reached :hold 3 :proof outer-proof)
+                    ;; This NEW checkpoint cannot reuse output from the outer hold.
+                    (let ((checkpoint (vt52-navigation-checkpoint)))
+                      (send host (string #\Return))
+                      (setf (getf (third navigation) :released) t)
+                      (event :navigation-released :hold 3)
+                      (setf menu-proof (await-vt52-navigation checkpoint :main-menu)))
+                    (event :navigation-main-menu :proof menu-proof))))
                (setf *pause* 0)
                (await host (lambda () (search "Enter choice number" (grid host))))
                (send host (format nil "0~c" #\Return))
-               (await host (lambda () (eq :exited (getf (lispterm:status host) :process-state))))
+               (await host (lambda () (eq :exited (getf (observed-status host) :process-state))))
                (setf cleanup :graceful-exit))
            (error (c)
              (setf native-aborted (typep c 'native-abort))
              (setf failure (princ-to-string c))
              (save "abort.sexp" (list :pause *pause* :reason failure))
              (touch "ABORT")
-             (when (plusp *pause*)
+             (when (and (plusp *pause*)
+                        (or (eq *profile* :charsets)
+                            (and (= *pause* 2) (not (find 2 checks :key (lambda (v) (getf v :pause)))))))
                (push (list :pause *pause* :pixels :unverified :bytes :unverified :timing :fail
                            :frame :fail :reason failure :evidence (pause-name *pause* "")) checks))))
       ;; After failure there are no more captures or target PASS claims.
       (when host
         (when native-aborted (setf cleanup :cooperative-native-abort))
-        (when (and failure (not native-aborted))
+        (when (and failure (not native-aborted) (eq *profile* :charsets))
           (handler-case
               (progn
                 (when (plusp reached)
@@ -505,10 +858,10 @@
                     (send host (string #\Return)) (sleep .1)))
                 (await host (lambda () (search "Enter choice number" (grid host))) 5)
                 (send host (format nil "0~c" #\Return))
-                (await host (lambda () (eq :exited (getf (lispterm:status host) :process-state))) 5)
+                (await host (lambda () (eq :exited (getf (observed-status host) :process-state))) 5)
                 (setf cleanup :graceful-exit-after-failure))
             (error (c) (setf cleanup (list :graceful-exit-unverified (princ-to-string c))))))
-        (save "terminal-status.sexp" (lispterm:status host))
+        (save "terminal-status.sexp" (observed-status host))
         (handler-case (lispterm:close host)
           (error (c) (setf failure (or failure (princ-to-string c))
                            cleanup (list cleanup :close-error (princ-to-string c)))))))
@@ -523,17 +876,35 @@
                      (= (length checks) 1)
                      (every (lambda (c) (every (lambda (k) (eq :pass (getf c k)))
                                                 '(:pixels :timing :frame))) checks)))
-      (setf failure "Incomplete character-set run"))
-    (let ((result (list :kind :vttest-charsets-run :version 2 :backend (string-downcase *backend*)
-                        :status (if failure :fail :pass) :attempted attempted :reached reached
-                        :captured (loop for n from 1 to attempted count (probe-file (path (pause-name n "actual.png"))))
-                        :frame-verified captured :bytes :unverified :wire-accounting accounting
-                        :reason (or failure "One complete character-set comparison passed")
-                        :cleanup cleanup :checks
-                        (loop for n from 1 to 1 collect
-                          (or (find n checks :key (lambda (v) (getf v :pause)))
-                              (list :pause n :pixels :unverified :bytes :unverified :timing :unverified)))
-                        :evidence '("events.sexp" "output.raw" "input.raw" "application.log" "launch.sexp" "terminal-status.sexp"))))
+      (setf failure (ecase *profile*
+                      (:charsets "Incomplete character-set run")
+                      (:vt52 "Incomplete VT52 run"))))
+    (when (and (eq *profile* :vt52) (not failure)
+               (not (and outer-proof menu-proof
+                         (every (lambda (n) (and (getf n :reached) (getf n :released))) navigation))))
+      (setf failure "Incomplete VT52 navigation"))
+    (let ((result
+            (append
+              (list :kind (ecase *profile* (:charsets :vttest-charsets-run) (:vt52 :vttest-vt52-run))
+                    :version 2 :backend (string-downcase *backend*)
+                    :status (if failure :fail :pass) :attempted attempted :reached reached
+                    :captured (if (eq *profile* :charsets)
+                                  (loop for n from 1 to attempted count (probe-file (path (pause-name n "actual.png"))))
+                                  (if (probe-file (path (pause-name 2 "actual.png"))) 1 0))
+                    :frame-verified captured :bytes :unverified :wire-accounting accounting
+                    :reason (or failure (ecase *profile*
+                                          (:charsets "One complete character-set comparison passed")
+                                          (:vt52 "One complete VT52 comparison and three navigation holds passed")))
+                    :cleanup cleanup :checks
+                    (loop for n in (ecase *profile* (:charsets '(1)) (:vt52 '(2))) collect
+                      (or (find n checks :key (lambda (v) (getf v :pause)))
+                          (list :pause n :pixels :unverified :bytes :unverified :timing :unverified)))
+                    :evidence '("events.sexp" "output.raw" "input.raw" "application.log" "launch.sexp" "terminal-status.sexp"))
+              (when (eq *profile* :vt52)
+                (list :profile :vt52 :scale *scale* :navigation-pauses '(1 2 3)
+                      :navigation navigation
+                      :navigation-proofs (list :outer-hold outer-proof :main-menu menu-proof)
+                      :unverified-count (if failure 1 0))))))
       (save "RESULT.sexp" result) (save "end.sexp" (list :status (getf result :status)))
       (touch "END")
       (if failure 1 0))))
