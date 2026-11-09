@@ -1,0 +1,136 @@
+;;;; Pure VT52 pause-2 check of admitted original bytes and exact oracle pixels.
+;;;; Cursor observations bracket authorization/DONE; they are not atomic scanout.
+(load (merge-pathnames "vttest-vt52-admission.lisp" *load-truename*))
+(load (merge-pathnames "vttest-vt52-pixels.lisp" *load-truename*))
+(load (merge-pathnames "vttest-screen-frame.lisp" *load-truename*))
+
+(defpackage #:vttest-vt52-native-check
+  (:use #:cl)
+  (:local-nicknames (#:o #:vttest-vt52-oracle) (#:p #:vttest-vt52-pixels)
+                    (#:f #:vttest-screen-frame) (#:h #:vttest-vt52-sha256)
+                    (#:a #:vttest-vt52-admission))
+  (:export #:validate-vt52-capture))
+(in-package #:vttest-vt52-native-check)
+
+(defun tree-ok-p (x)
+  "Bounded acyclic tree of proper lists, atoms and short strings."
+  (let ((seen (make-hash-table :test #'eq)) (budget 4096))
+    (labels ((walk (x depth)
+               (cond ((typep x '(or symbol number character)) t)
+                     ((stringp x) (< (length x) 4096))
+                     ((and (consp x) (< depth 16))
+                      (loop for cell = x then (cdr cell)
+                            while (consp cell)
+                            always (and (plusp (decf budget))
+                                        (not (gethash cell seen))
+                                        (setf (gethash cell seen) t)
+                                        (walk (car cell) (1+ depth)))
+                            finally (return (null cell)))))))
+      (walk x 0))))
+
+(defun keys (x) (loop for k in x by #'cddr collect k))
+(defun record-p (x)
+  (and (consp x) (tree-ok-p x) (evenp (length x)) (every #'keywordp (keys x))
+       (= (length (keys x)) (length (remove-duplicates (keys x))))))
+(defun status-p (x)
+  (and (record-p x) (or (null (getf x :geometry)) (record-p (getf x :geometry)))))
+(defun octets-p (x) (typep x '(vector (unsigned-byte 8))))
+
+(defun cells-of (entries)
+  (mapcar (lambda (e) (list (getf e :row) (getf e :column))) entries))
+
+(defun validate-vt52-capture (&key admission snapshot font font-sha256 scale rgba width height)
+  "Check one admitted pause-2 VT52 capture. Returns a report; refuses malformed input."
+  (let* ((reasons nil) (raster t) (canon (o:vt52-snapshot)) (s (find scale '(1 2)))
+         (admitted (a:admission-p admission))
+         (before (and admitted (a:admission-before admission)))
+         (ready (and admitted (a:admission-ready admission)))
+         (pre (and admitted (a:admission-pre admission)))
+         (final (and admitted (a:admission-final admission)))
+         (native (and admitted (a:admission-native admission)))
+         cmp e-sha a-sha cursor g b)
+    (labels ((refuse (r) (push r reasons))
+             (bad (r) (refuse r) (setf raster nil)))
+      (unless admitted (refuse :admission-missing))
+      (unless (ignore-errors
+               (and (equalp (o:snapshot-cells snapshot) (o:snapshot-cells canon))
+                    (equal (o:snapshot-metadata snapshot) (o:snapshot-metadata canon))))
+        (bad :snapshot))
+      (unless s (bad :scale))
+      (unless (equal font-sha256 p:+font-sha256+) (bad :font-sha256))
+      (unless (and (octets-p font) (= (length font) p:+font-length+)
+                   (equal (h:sha256-hex font) p:+font-sha256+))
+        (bad :font))
+      (unless (and s (eql width (* 640 s)) (eql height (* 384 s))) (bad :size))
+      (cond ((not (and s (octets-p rgba) (= (length rgba) (* 983040 s s))))
+             (bad :rgba-length))
+            (t (setf a-sha (h:sha256-hex rgba))
+               (unless (loop for i from 3 below (length rgba) by 4 always (= 255 (aref rgba i)))
+                 (bad :nonopaque))))
+      (when admitted
+        (unless (and (eql 2 (a:admission-pause admission))
+                     (member (a:admission-backend admission) '(:x11 :wayland)))
+          (refuse :admission-profile))
+        (unless (and s (eql scale (a:admission-scale admission))
+                     (eql 640 (a:admission-width admission))
+                     (eql 384 (a:admission-height admission)))
+          (bad :admission-geometry))
+        (loop for (name r) on (list :before before :ready ready :pre pre :final final)
+              by #'cddr do
+              (cond ((not (status-p r)) (refuse (list :malformed name)))
+                    (t (unless (eq (getf r :backend) (a:admission-backend admission))
+                         (refuse (list :backend name)))
+                       (unless (subsetp '(:blink-phase :blink-visible) (keys r))
+                         (refuse (list :blink-missing name)))
+                       (unless (and (eq t (getf r :blink-phase))
+                                    (null (getf r :blink-visible)))
+                         (refuse (list :blink name))))))
+        (cond ((not (record-p native)) (refuse (list :malformed :native)))
+              (t (unless (eq (getf native :backend) (a:admission-backend admission))
+                   (refuse (list :backend :native)))
+                 (when (every #'status-p (list before ready pre final))
+                   (handler-case
+                       (f:validate-frame before ready pre final native
+                                         :pause 2 :blink-content nil :scale scale
+                                         :target (a:admission-target admission)
+                                         :ack-output (a:admission-ack-output admission)
+                                         :surface-id (a:admission-surface-id admission))
+                     (f:frame-refusal (c) (refuse (list :frame-bracket (f:refusal-reasons c))))
+                     (error () (refuse :frame-malformed))))))
+        (let ((cb (a:admission-cursor-before admission))
+              (ca (a:admission-cursor-after admission))
+              (hashes (a:admission-hashes admission)))
+          (setf cursor (list :before-seq (getf cb :seq) :after-seq (getf ca :seq)
+                             :pre-sha256 (getf hashes :pre)
+                             :final-sha256 (getf hashes :final)
+                             :trace-sha256 (getf hashes :control)))))
+      (when raster
+        (handler-case
+            (let* ((expected (p:expected-rgba canon font :font-sha256 font-sha256
+                                              :scale s :blink-phase t))
+                   (result (p:compare-frames canon expected rgba :scale s)))
+              (setf e-sha (h:sha256-hex expected) cmp result g (getf result :graphics)
+                    b (loop for k in '(:left :right :above :below :comparison)
+                            append (getf result k)))
+              (unless (and (equal (cells-of g) (cells-of (o:graphics-cells canon)))
+                           (= 102 (length b))
+                           (null (set-exclusive-or (cells-of b) (o:boundary-cells)
+                                                   :test #'equal)))
+                (refuse :named-positions))
+              (unless (eql 0 (getf result :different-pixels)) (refuse :frame-differences))
+              (when (notevery (lambda (e) (getf e :pass)) g) (refuse :graphics))
+              (when (notevery (lambda (e) (getf e :pass)) b) (refuse :boundaries)))
+          (error () (setf cmp nil) (refuse :comparison)))))
+    (flet ((failed (es) (cells-of (remove-if (lambda (e) (getf e :pass)) es))))
+      (list :schema :vt52-capture-check-v1
+            :verdict (if (and cmp (null reasons)) :pass :refuse)
+            :reasons (reverse reasons) :scale s :pause 2
+            :frame-differences (getf cmp :different-pixels)
+            :graphics (list :count (and cmp (length g)) :failed (failed g))
+            :boundaries (list :count (and cmp (length b)) :failed (failed b))
+            :expected-sha256 e-sha :actual-rgba-sha256 a-sha :cursor cursor
+            :limitations '(:sequential-cursor-samples :recorder-trace-trusted
+                            :protocol-surface-ack-request-bound
+                            :native-ownership-harness-asserted
+                            :source-manifest-conditional
+                            :owned-capture-presentation-conditional)))))
