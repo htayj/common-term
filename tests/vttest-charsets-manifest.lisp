@@ -69,12 +69,13 @@
                             :sha256 (charsets-digest "tests/vttest-charsets-oracle.lisp"))
               :requires nil)))
 
-(defun make-manifest (backend)
+(defun make-manifest (backend &optional (scale 1))
   "Declare one complete reference capture; no launch readiness is asserted.
 Both bare SCS 1/2 select ASCII under the matches-xterm emulator policy.
 The actual stable boolean blink phase, including NIL, is used unchanged."
   (vttest-area::need (member backend '("x11" "wayland") :test #'equal) :unknown-backend)
-  (list :kind :vttest-area-manifest :version 1 :area "character-sets" :backend backend
+  (vttest-area::check-scale backend scale)
+  (list :kind :vttest-area-manifest :version 1 :area "character-sets" :backend backend :scale scale
         :scope-status :frozen
         :conditions '("private-headless" "source-built-per-run"
           "complete-character-set-area" "matches-xterm" "bare-scs-1-2-ascii"
@@ -92,6 +93,6 @@ The actual stable boolean blink phase, including NIL, is used unchanged."
   "Require the exact current declaration, including original archive bytes."
   (vttest-area::need (equal (charsets-digest +charsets-archive+) +charsets-source-sha+)
                     :charsets-source-archive-mismatch)
-  (vttest-area::need (equal manifest (make-manifest (getf manifest :backend)))
+  (vttest-area::need (equal manifest (make-manifest (getf manifest :backend) (getf manifest :scale)))
                     :charsets-manifest-mismatch)
   manifest)

@@ -44,14 +44,16 @@
     (error () nil)))
 
 (defun validate-frame (before ready pre final native &key pause target blink-content
-                                                       endpoint ack-output surface-id)
+                                                        endpoint ack-output surface-id (scale 1))
   "Return T or signal FRAME-REFUSAL. No field normalization or capture retries.
-ENDPOINT is independently derived or NIL; NIL cannot establish byte proof."
+ENDPOINT is independently derived or NIL; NIL cannot establish byte proof.
+SCALE is the run's selected output scale, integer 1 or 2; the native receipt must equal it."
   (let ((reasons nil))
     (flet ((need (test reason) (unless test (push reason reasons))))
       (handler-case
           (progn
             (need (and (integerp pause) (<= 1 pause 6)) :pause)
+            (need (member scale '(1 2)) :run-scale)
             (need (natural-p target) :target)
             (need (boolean-p blink-content) :expected-content-boolean)
             (need (eq blink-content (not (null (member pause (quote (5 6)))))) :double-size-content)
@@ -109,7 +111,7 @@ ENDPOINT is independently derived or NIL; NIL cannot establish byte proof."
               (need (eq (required-value native :custody) t) :custody)
               (need (eql (required-value native :capture-count) 1) :capture-count)
               (need (eql (required-value native :capture-exit) 0) :capture-exit)
-              (need (eql (required-value native :scale) 1) :scale)
+              (need (eql (required-value native :scale) scale) :scale)
               (if (eq backend :x11)
                   (need (equal (required-value native :window-id) (required-value g :window-id)) :window)
                   (need (and (integerp surface-id) (plusp surface-id)
@@ -245,6 +247,25 @@ This is transport accounting, not a proof of application output semantics."
              (stringp (getf ref :sha256)) (= 64 (length (getf ref :sha256)))
              (every (lambda (c) (find c "0123456789abcdef")) (getf ref :sha256))) "Bad reference")
   (when root (need (equal ref (reference root (getf ref :path))) "Reference hash mismatch")))
+(defparameter +manifest-keys+
+  '(:kind :version :area :backend :scale :scope-status :conditions :scenarios :required-count
+    :native-driver :pins))
+(defun manifest-scale (root backend)
+  "Return the selected scale declared by this run's canonical MANIFEST.sexp.
+The manifest is the scale authority; receipts must agree with it. A selected
+scale exported in the environment must name the same scale."
+  (let ((m (read-data (local-path root "MANIFEST.sexp"))))
+    (properties m +manifest-keys+ (remove-if (lambda (k) (member k '(:native-driver :pins))) +manifest-keys+))
+    (need (and (eq :vttest-area-manifest (getf m :kind)) (eql 1 (getf m :version))
+               (equal "double-size-characters" (getf m :area)) (equal backend (getf m :backend))
+               (eq :frozen (getf m :scope-status)))
+          "Foreign run manifest")
+    (let ((scale (getf m :scale)))
+      (need (member scale (if (equal backend "wayland") '(1 2) '(1))) "Unsupported manifest scale")
+      (dolist (name '("LISPTERM_DOUBLE_SIZE_SCALE" "LISPTERM_VTTEST_SCALE"))
+        (let ((text (sb-ext:posix-getenv name)))
+          (when text (need (equal text (princ-to-string scale)) "Selected scale differs from manifest"))))
+      scale)))
 (defun counts (object keys &optional unknown)
   (let ((values (mapcar (lambda (k) (getf object k)) keys)))
     (if (and unknown (every #'null values)) nil
@@ -279,21 +300,40 @@ This is transport accounting, not a proof of application output semantics."
            (eq :graceful-exit-unverified (first value)) (stringp (second value)))
       (and (listp value) (= 3 (length value))
            (cleanup-value-p (first value)) (eq :close-error (second value)) (stringp (third value)))))
-(defun validate-comparison (check root)
-  "Bind complete comparison evidence to this pause's original PNG and bracket."
+(defun validate-comparison (check root &optional (scale 1))
+  "Bind complete comparison evidence to this pause's original PNG and bracket.
+SCALE is the manifest-selected run scale, integer 1 or 2. Version 2 records
+carry :SCALE and PHYSICAL dimensions, the logical grid size times SCALE.
+Legacy version 1 records have no :SCALE and are accepted only at scale 1.
+Native bracket receipts carry LOGICAL dimensions."
+  (need (member scale '(1 2)) "Unsupported comparison scale")
   (let* ((n (getf check :pause)) (stem (format nil "recorder/pause-~2,'0d-" n))
          (r (read-data (local-path root (getf (getf check :comparison) :path))))
-         (width (if (member n '(3 4)) 1056 640))
+         (version (ignore-errors (getf r :version)))
+         (logical-width (if (member n '(3 4)) 1056 640))
+         (logical-height 384)
+         (width (* scale logical-width))
+         (height (* scale logical-height))
          (font '( :path "/nix/store/9qvd27vg12177prxcl778rdhxh4lk2mi-terminus-font-4.49.1/share/fonts/terminus/ter-u16n.otb"
                   :sha256 "0d11d8ed0889a412fb6903710804643ad85858cc56905286cedae392a57255ca"))
          (decoder '(:path "/nix/store/h74lg8wfwndnf5glr171kmcshlffi7l2-imagemagick-7.1.2-29/bin/magick"
                     :sha256 "054c52b583c303bca2aae9fadcfd9e09fbc946f83e6621b39f22650d28d3027e")))
-    (properties r '(:version :pause :png :phase :width :height :font :decoder :bracket
-                    :identify :decode :rgba :decoded-length :opaque :comparison))
-    (need (and (eql 1 (getf r :version)) (eql n (getf r :pause))
-               (eql width (getf r :width)) (eql 384 (getf r :height))
+    (need (member version '(1 2)) "Unsupported comparison record version")
+    (properties r (if (eql version 1)
+                      '(:version :pause :png :phase :width :height :font :decoder :bracket
+                        :identify :decode :rgba :decoded-length :opaque :comparison)
+                      '(:version :pause :png :phase :scale :width :height :font :decoder :bracket
+                        :identify :decode :rgba :decoded-length :opaque :comparison)))
+    (if (eql version 1)
+        (need (eql 1 scale) "Legacy comparison record outside scale 1")
+        (need (eql scale (getf r :scale)) "Comparison record scale differs from manifest"))
+    (when (> scale 1)
+      (need (not (or (eql logical-width (getf r :width)) (eql logical-height (getf r :height))))
+            "Logical dimensions in physical comparison record"))
+    (need (and (eql n (getf r :pause))
+               (eql width (getf r :width)) (eql height (getf r :height))
                (equal font (getf r :font)) (equal decoder (getf r :decoder))
-               (eql (* width 384 4) (getf r :decoded-length)) (eq t (getf r :opaque)))
+               (eql (* width height 4) (getf r :decoded-length)) (eq t (getf r :opaque)))
           "Comparison profile refusal")
     (check-reference (getf r :png) root (concatenate 'string stem "actual.png"))
     (check-reference (getf r :rgba) root (concatenate 'string stem "actual.rgba"))
@@ -315,7 +355,11 @@ This is transport accounting, not a proof of application output semantics."
           (need (and (equal ready (getf request :status)) (eql n (getf request :pause))) "Comparison request mismatch")
           (vttest-double-size-native-contract:validate-frame before ready pre final native :pause n :target target
             :blink-content (if (>= n 5) t nil) :endpoint nil :ack-output (getf request :ack-output)
-            :surface-id (getf request :surface-id)))))
+            :surface-id (getf request :surface-id) :scale scale))
+        ;; VALIDATE-FRAME has established NATIVE as a complete receipt.
+        (need (and (eql scale (getf native :scale))
+                   (eql logical-width (getf native :width)) (eql logical-height (getf native :height)))
+              "Native receipt is not logical at the selected scale")))
     (loop for key in '(:identify :decode) for action in '("identify" "decode") do
       (let ((refs (getf r key)) (base (concatenate 'string stem action)))
         (need (= 4 (length refs)) "Missing decoder evidence")
@@ -329,12 +373,28 @@ This is transport accounting, not a proof of application output semantics."
                          (list (getf decoder :path) (local-path root (concatenate 'string stem "actual.png"))
                                "-depth" "8" (concatenate 'string "rgba:" root stem "actual.rgba"))))
               "Foreign decoder invocation")))
+    (when (eql version 2)
+      (with-open-file (s (regular-file (local-path root (concatenate 'string stem "identify.stdout")))
+                         :element-type '(unsigned-byte 8))
+        (need (<= (file-length s) 64) "Oversize identify output")
+        (let ((bytes (make-array (file-length s) :element-type '(unsigned-byte 8))))
+          (need (= (read-sequence bytes s) (length bytes)) "Short identify output")
+          (need (equal (format nil "~d ~d" width height) (map 'string #'code-char bytes))
+                "Identify dimensions differ from physical record"))))
     (let ((c (getf r :comparison)))
-      (properties c '(:pass :compared-pixels :different-pixels :different-cells :first-difference :tolerance :masked-pixels))
-      (need (and (eq t (getf c :pass)) (= (* width 384) (getf c :compared-pixels))
+      (properties c (if (eql version 1)
+                        '(:pass :compared-pixels :different-pixels :different-cells :first-difference
+                          :tolerance :masked-pixels)
+                        '(:pass :scale :width :height :compared-pixels :different-pixels :different-cells
+                          :first-difference :last-difference :tolerance :masked-pixels)))
+      (need (and (eq t (getf c :pass)) (eql (* width height) (getf c :compared-pixels))
                  (eql 0 (getf c :different-pixels)) (null (getf c :different-cells))
                  (null (getf c :first-difference)) (eql 0 (getf c :tolerance))
-                 (eql 0 (getf c :masked-pixels))) "Nonexact comparison"))
+                 (eql 0 (getf c :masked-pixels))
+                 (or (eql version 1)
+                     (and (eql scale (getf c :scale)) (eql width (getf c :width))
+                          (eql height (getf c :height)) (null (getf c :last-difference)))))
+            "Nonexact comparison"))
     r))
 
 (defun validate-recorder (record backend &optional root)
@@ -361,24 +421,25 @@ This is transport accounting, not a proof of application output semantics."
                (every (lambda (c) (every (lambda (k) (eq :pass (getf c k)))
                                           '(:pixels :timing :frame))) (getf record :checks)))
           "Invalid recorder PASS"))
+  (let ((scale (if root (manifest-scale root backend) 1)))
   (dolist (c (getf record :checks))
     (when (eq :pass (getf c :pixels))
       (need (eq :pass (getf c :frame)) "Pixels without strict frame")
       (check-reference (getf c :comparison) root
                        (format nil "recorder/pause-~2,'0d-comparison.sexp" (getf c :pause)))
-      (when root (validate-comparison c root)))
+      (when root (validate-comparison c root scale)))
     (when (member :target c) (need (eq :recognized-navigation-only (getf c :target))))
     (when (member :reason c) (need (stringp (getf c :reason))))
     (when (getf c :native)
       (let ((r (getf c :native)))
         (need (and (eql 3 (getf r :version)) (eql (getf c :pause) (getf r :pause))
                    (eq (intern (string-upcase backend) :keyword) (getf r :backend))
-                   (eql 1 (getf r :capture-count)) (eql 1 (getf r :scale))
+                   (eql 1 (getf r :capture-count)) (eql scale (getf r :scale))
                    (eq t (getf r :owned)) (typep (getf r :capture-exit) '(integer 0 255))
                    (member (getf r :custody) '(t nil))
                    (eq :recorder-request-binding (getf r :ack-basis))
                    (equal (getf r :png) (format nil "pause-~2,'0d-actual.png" (getf c :pause)))))))
-    (when (eq :pass (getf c :frame)) (need (getf c :native))))
+    (when (eq :pass (getf c :frame)) (need (getf c :native)))))
   (need (equal (getf record :evidence)
                '("events.sexp" "output.raw" "input.raw" "application.log" "launch.sexp" "terminal-status.sexp"))
         "Foreign recorder evidence")
@@ -509,6 +570,7 @@ This is transport accounting, not a proof of application output semantics."
                             :scale :capture-count :owned :capture-exit :png :ack-output :ack-basis :custody))
             (need (and (eql 3 (getf r :version)) (eq (intern (string-upcase backend) :keyword) (getf r :backend))
                        (eql n (getf r :pause)) (getf entry :completed)
+                       (eql (manifest-scale root backend) (getf r :scale))
                        (eql (getf entry :capture-exit) (getf r :capture-exit))) "Foreign capture receipt")))))
     (need (and (= (length entries) (getf stage :request-observed))
                (= invoked (getf stage :capture-invoked)) (= completed (getf stage :capture-completed))) "Ledger count mismatch"))
@@ -621,7 +683,7 @@ This is transport accounting, not a proof of application output semantics."
   record)
 
 (defun build-ledger (root backend)
-  (let ((entries nil))
+  (let ((entries nil) (refused nil))
     (with-open-file (s (concatenate 'string root "native/stage-events.sexp"))
       (need (<= (file-length s) 16384))
       (let ((*read-eval* nil))
@@ -641,6 +703,12 @@ This is transport accounting, not a proof of application output semantics."
                                        (not (getf entry :completed)) (typep exit '(integer 0 255))))
                             (setf (getf entry :completed) t (getf entry :capture-exit) exit
                                   (getf entry :exit-origin) (reference root (format nil "recorder/pause-~2,'0d-capture.exit" n))))
+                ;; Annotation only: a completed, successful capture whose PNG dimensions were refused.
+                (:physical-size-refused
+                 (need (and (eql n (getf entry :pause)) (getf entry :completed) (eql 0 (getf entry :capture-exit))
+                            (typep exit '(integer 0 255)) (not (member n refused)))
+                       "Stray physical-size refusal")
+                 (push n refused))
                 (otherwise (error "Unknown stage event"))))))))
     (dolist (entry entries)
       (let ((path (format nil "recorder/pause-~2,'0d-native.sexp" (getf entry :pause))))

@@ -30,10 +30,11 @@
           :oracle (list :path "tests/vttest-screen-oracle.lisp"
                         :sha256 (screen-digest "tests/vttest-screen-oracle.lisp"))
           :requires nil)))
-(defun make-manifest (backend)
+(defun make-manifest (backend &optional (scale 1))
   "Fresh executable declaration, not a claim that any native check was observed."
   (vttest-area::need (member backend '("x11" "wayland") :test #'equal) :unknown-backend)
-  (list :kind :vttest-area-manifest :version 1 :area "screen" :backend backend
+  (vttest-area::check-scale backend scale)
+  (list :kind :vttest-area-manifest :version 1 :area "screen" :backend backend :scale scale
         :scope-status :frozen :conditions '("private-headless" "source-built-per-run"
           "all-15-fixed-holds" "strict-original-frame-bracket" "pause14-blink-on"
           "content-aware-blink" "fresh-native-custody")
@@ -47,7 +48,7 @@
 
   (vttest-area::need (equal (screen-digest +screen-archive+) +screen-source-sha+)
                     :screen-source-archive-mismatch)
-  (let ((expected (make-manifest (getf manifest :backend))))
+  (let ((expected (make-manifest (getf manifest :backend) (getf manifest :scale))))
     (vttest-area::need (equal manifest expected) :screen-manifest-mismatch))
   manifest)
 (defun summarize-native (manifest record process-exit &optional root)

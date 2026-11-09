@@ -31,17 +31,24 @@
     (loop for suffix in '(".argv.sexp" ".stdout" ".stderr" ".exit") collect
       (vttest-screen-native-contract:reference root (concatenate 'string prefix suffix)))))
 
-(defun compare-capture (root n snapshot before ready pre final native target ack surface)
-  "Admit the strict current bracket before decoding once at the observed phase."
+(defun compare-capture (root n snapshot before ready pre final native target ack surface
+                        &key (scale 1))
+  "Admit the strict current bracket at SCALE, then compare the entire unchanged
+native image once, at the observed phase, against the exactly scaled expected raster.
+Native receipt dimensions are logical; identify, decode and the record are physical."
+  (unless (member scale '(1 2)) (error "Screen comparison scale refusal: ~s" scale))
   (let* ((stem (format nil "recorder/pause-~2,'0d-" n))
          (png (concatenate 'string stem "actual.png"))
          (path (concatenate 'string root png))
          (phase (vttest-screen-frame:required-value ready :blink-phase))
          (content (getf (vttest-screen-oracle:snapshot-metadata snapshot) :blink-visible))
-         (width (* 8 (vttest-screen-oracle:snapshot-columns snapshot))))
+         (width (* 8 (vttest-screen-oracle:snapshot-columns snapshot)))
+         (physical-width (* width scale))
+         (physical-height (* 384 scale)))
     (vttest-screen-frame:validate-frame before ready pre final native :pause n :target target
-      :blink-content content :endpoint nil :ack-output ack :surface-id surface)
+      :blink-content content :endpoint nil :ack-output ack :surface-id surface :scale scale)
     (unless (and (= (getf native :width) width) (= (getf native :height) 384)
+                 (eql (getf native :scale) scale)
                  (equal (getf native :png) (format nil "pause-~2,'0d-actual.png" n))
                  (eq t (getf native :owned)) (eql 0 (getf native :capture-exit))
                  (eql 1 (getf native :capture-count)))
@@ -54,27 +61,33 @@
                               (list +decoder+ "identify" "-format" "%w %h" path))))
       (with-open-file (s (concatenate 'string root stem "identify.stdout"))
         (let ((*read-eval* nil))
-          (unless (and (eql width (read s nil nil)) (eql 384 (read s nil nil))
+          (unless (and (eql physical-width (read s nil nil)) (eql physical-height (read s nil nil))
                        (eq :eof (read s nil :eof))) (error "PNG dimensions refusal"))))
       (let* ((raw (concatenate 'string stem "actual.rgba"))
              (raw-path (concatenate 'string root raw)))
         (when (probe-file raw-path) (error "Decoded output already exists"))
         (let* ((decode (command root (concatenate 'string stem "decode")
                                 (list +decoder+ path "-depth" "8" (concatenate 'string "rgba:" raw-path))))
-               (rgba (octets raw-path))
-               (comparison (vttest-screen-oracle:compare-screen-snapshot
-                            snapshot rgba (octets +font+) :blink-phase phase)))
-          (unless (equal original (vttest-screen-native-contract:reference root png))
-            (error "PNG changed during decoding"))
-          (let ((record
-                  (list :version 1 :pause n :png original :phase phase :width width :height 384
-                        :font (list :path +font+ :sha256 +font-sha+)
-                        :decoder (list :path +decoder+ :sha256 +decoder-sha+)
-                        :bracket (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp")
-                                       collect (vttest-screen-native-contract:reference root (concatenate 'string stem suffix)))
-                        :identify identify :decode decode
-                        :rgba (vttest-screen-native-contract:reference root raw)
-                        :decoded-length (length rgba) :opaque t :comparison comparison)))
-            (vttest-screen-native-contract:write-data (concatenate 'string root stem "comparison.sexp") record)
-            (unless (getf comparison :pass) (error "Exact screen raster mismatch at pause ~d" n))
-            (vttest-screen-native-contract:reference root (concatenate 'string stem "comparison.sexp"))))))))
+               (rgba (octets raw-path)))
+          (unless (and (= (length rgba) (* physical-width physical-height 4))
+                       (loop for p from 3 below (length rgba) by 4 always (= 255 (aref rgba p))))
+            (error "Decoded full opaque RGBA refusal"))
+          (let ((comparison (vttest-cursor-oracle:compare-physical
+                             (vttest-screen-oracle:rasterize-attributed snapshot (octets +font+)
+                                                                        :blink-phase phase)
+                             rgba width 384 scale)))
+            (unless (equal original (vttest-screen-native-contract:reference root png))
+              (error "PNG changed during decoding"))
+            (let ((record
+                    (list :version 2 :pause n :png original :phase phase :scale scale
+                          :width physical-width :height physical-height
+                          :font (list :path +font+ :sha256 +font-sha+)
+                          :decoder (list :path +decoder+ :sha256 +decoder-sha+)
+                          :bracket (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp")
+                                         collect (vttest-screen-native-contract:reference root (concatenate 'string stem suffix)))
+                          :identify identify :decode decode
+                          :rgba (vttest-screen-native-contract:reference root raw)
+                          :decoded-length (length rgba) :opaque t :comparison comparison)))
+              (vttest-screen-native-contract:write-data (concatenate 'string root stem "comparison.sexp") record)
+              (unless (getf comparison :pass) (error "Exact screen raster mismatch at pause ~d" n))
+              (vttest-screen-native-contract:reference root (concatenate 'string stem "comparison.sexp")))))))))

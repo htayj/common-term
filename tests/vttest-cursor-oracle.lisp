@@ -3,8 +3,10 @@
 (require :asdf)
 (defpackage #:vttest-cursor-oracle
   (:use #:cl)
-  (:export #:first-screen #:read-bytes #:read-data #:rasterize #:write-ppm
-           #:compare-rgb #:font-info #:glyph-rows #:screen #:compare-screen #:compare-png))
+  (:export #:first-screen #:read-bytes #:read-data #:rasterize #:write-ppm #:scale-raster
+           #:compare-rgb #:font-info #:glyph-rows #:screen #:compare-screen #:compare-png
+           #:compare-physical #:physical-comparison-refusal
+           #:physical-refusal-reason #:physical-refusal-details))
 (in-package #:vttest-cursor-oracle)
 
 (defun read-bytes (path)
@@ -129,18 +131,43 @@ palette contract (framebuffer.lisp), not sampled from the screenshot."
                 (loop for b in rgb for i from p do (setf (aref pixels i) b))))))))
     pixels))
 
-(defun write-ppm (path rgb &key (width 640))
-  (assert (= (* width 384 3) (length rgb)))
+(defun scale-raster (pixels width height scale &key (channels 4))
+  "Expand a logical raster to physical pixels by exact SCALExSCALE replication,
+as the Wayland SHM path does for its buffer scale. Every channel, alpha included,
+is copied unchanged. Scale 1 returns PIXELS itself.
+Returns the physical pixels, physical width and physical height."
+  (assert (member scale '(1 2)))
+  (assert (member channels '(3 4)))
+  (assert (and (typep width '(integer 1)) (typep height '(integer 1))))
+  (assert (typep pixels '(vector (unsigned-byte 8))))
+  (assert (= (* width height channels) (length pixels)))
+  (if (= scale 1)
+      (values pixels width height)
+      (let* ((physical-width (* width scale)) (physical-height (* height scale))
+             (out (make-array (* physical-width physical-height channels)
+                              :element-type '(unsigned-byte 8))))
+        (dotimes (y physical-height)
+          (dotimes (x physical-width)
+            (let ((from (* channels (+ (* (floor y scale) width) (floor x scale))))
+                  (to (* channels (+ (* y physical-width) x))))
+              (replace out pixels :start1 to :start2 from :end2 (+ from channels)))))
+        (values out physical-width physical-height))))
+
+(defun write-ppm (path rgb &key (width 640) (height 384))
+  (assert (and (typep width '(integer 1)) (typep height '(integer 1))))
+  (assert (= (* width height 3) (length rgb)))
   (with-open-file (s path :direction :output :if-exists :error :element-type '(unsigned-byte 8))
-    (write-sequence (map '(vector (unsigned-byte 8)) #'char-code (format nil "P6~%~d 384~%255~%" width)) s)
+    (write-sequence (map '(vector (unsigned-byte 8)) #'char-code (format nil "P6~%~d ~d~%255~%" width height)) s)
     (write-sequence rgb s)))
 
-(defun compare-rgb (expected actual &key (diff-path nil) (width 640))
-  "Compare every pixel exactly. No tolerance, masks, or registration."
-  (assert (= (* width 384 3) (length expected) (length actual)))
+(defun compare-rgb (expected actual &key (diff-path nil) (width 640) (height 384))
+  "Compare every pixel exactly. No tolerance, masks, or registration.
+Cell coordinates assume the logical 8x16 cell grid."
+  (assert (and (typep width '(integer 1)) (typep height '(integer 1))))
+  (assert (= (* width height 3) (length expected) (length actual)))
   (let ((count 0) (first nil) (cells (make-hash-table :test 'equal))
         (diff (make-array (length expected) :element-type '(unsigned-byte 8) :initial-element 0)))
-    (dotimes (pixel (* width 384))
+    (dotimes (pixel (* width height))
       (let* ((p (* pixel 3))
              (same (loop for i from p below (+ p 3) always (= (aref expected i) (aref actual i)))))
         (unless same
@@ -152,8 +179,8 @@ palette contract (framebuffer.lisp), not sampled from the screenshot."
                                 :expected (coerce (subseq expected p (+ p 3)) 'list)
                                 :actual (coerce (subseq actual p (+ p 3)) 'list)))))
           (setf (aref diff p) 255))))
-    (when diff-path (write-ppm diff-path diff :width width))
-    (list :pass (zerop count) :compared-pixels (* width 384) :different-pixels count
+    (when diff-path (write-ppm diff-path diff :width width :height height))
+    (list :pass (zerop count) :compared-pixels (* width height) :different-pixels count
           :different-cells (sort (loop for k being the hash-keys of cells collect k)
                                  (lambda (a b) (or (< (first a) (first b))
                                                   (and (= (first a) (first b)) (< (second a) (second b))))))
@@ -196,14 +223,14 @@ All six pauses use normal attributes. No terminal stream is interpreted here."
       (text cursor-row 1 "Push <RETURN>"))
     (values cells (list :row cursor-row :column 14 :bold nil :underline nil :inverse nil :blink nil))))
 
-(defun compare-screen (pause actual-rgb font &key diff-path)
+(defun compare-screen (pause actual-rgb font &key diff-path (height 384))
   "Compare decoded input pixels for one pause against the independent oracle."
   (multiple-value-bind (cells cursor) (screen pause)
     (compare-rgb (rasterize cells font :cursor cursor) actual-rgb
-                 :width (* 8 (array-dimension cells 1)) :diff-path diff-path)))
+                 :width (* 8 (array-dimension cells 1)) :height height :diff-path diff-path)))
 
 
-(defun compare-png (pause input-png font-path output-directory magick)
+(defun compare-png (pause input-png font-path output-directory magick &key (height 384))
   "Compare one case identity (pause 1..6) from PNG input, using a fresh output directory.
 MAGICK decodes opaque RGB only; cell semantics and font rasterization are independent.
 Returns the exact comparison plus input identity and cursor metadata."
@@ -213,18 +240,84 @@ Returns the exact comparison plus input identity and cursor metadata."
          (cells (screen pause)) (width (* 8 (array-dimension cells 1))))
     (assert (not (probe-file out)))
     (ensure-directories-exist raw)
-    (assert (string= (format nil "~d 384" width)
+    (assert (string= (format nil "~d ~d" width height)
                      (string-trim '(#\Space #\Newline #\Return)
                        (uiop:run-program (list magick "identify" "-format" "%w %h" input-png)
                                          :output :string))))
     (uiop:run-program (list magick input-png "-depth" "8"
                             (concatenate 'string "rgba:" (namestring raw))))
     (let* ((rgba (read-bytes raw))
-           (rgb (make-array (* width 384 3) :element-type '(unsigned-byte 8))))
-      (assert (= (* width 384 4) (length rgba)))
+           (rgb (make-array (* width height 3) :element-type '(unsigned-byte 8))))
+      (assert (= (* width height 4) (length rgba)))
       (assert (loop for p from 3 below (length rgba) by 4 always (= 255 (aref rgba p))))
-      (dotimes (p (* width 384))
+      (dotimes (p (* width height))
         (dotimes (i 3) (setf (aref rgb (+ (* p 3) i)) (aref rgba (+ (* p 4) i)))))
       (list :pause pause :input input-png :font font-path
             :cursor (nth-value 1 (screen pause))
-            :comparison (compare-screen pause rgb (read-bytes font-path) :diff-path diff)))))
+            :comparison (compare-screen pause rgb (read-bytes font-path) :diff-path diff :height height)))))
+
+(define-condition physical-comparison-refusal (error)
+  ((reason :initarg :reason :reader physical-refusal-reason)
+   (details :initarg :details :initform nil :reader physical-refusal-details))
+  (:report (lambda (c s) (format s "Physical comparison refused: ~s ~s"
+                                 (physical-refusal-reason c) (physical-refusal-details c)))))
+
+(defun refuse-physical (reason &rest details)
+  (error 'physical-comparison-refusal :reason reason :details details))
+
+(defun first-translucent (pixels width)
+  "The first RGBA pixel whose alpha is not 255, as (:x :y :alpha), or NIL."
+  (loop for p from 3 below (length pixels) by 4
+        unless (= 255 (aref pixels p))
+          return (multiple-value-bind (y x) (floor (floor p 4) width)
+                   (list :x x :y y :alpha (aref pixels p)))))
+
+(defun compare-physical (expected-logical actual logical-width logical-height scale)
+  "Compare an unchanged physical RGBA capture with EXPECTED-LOGICAL expanded by
+exact SCALExSCALE replication. Every physical pixel is compared; any differing
+channel makes the pixel differ. No tolerance, masks, decimation or resampling.
+Rows and columns attribute physical pixels to the logical 8x16 cell grid.
+Signals PHYSICAL-COMPARISON-REFUSAL for unusable input, before any comparison."
+  (unless (typep scale '(integer 1 2))
+    (refuse-physical :scale :scale scale))
+  (unless (and (typep logical-width '(integer 1)) (typep logical-height '(integer 1)))
+    (refuse-physical :logical-dimensions :width logical-width :height logical-height))
+  (let* ((width (* logical-width scale)) (height (* logical-height scale))
+         (logical-length (* logical-width logical-height 4))
+         (physical-length (* width height 4)))
+    (unless (and (typep expected-logical '(vector (unsigned-byte 8)))
+                 (= logical-length (length expected-logical)))
+      (refuse-physical :expected-raster :expected-length logical-length
+                       :actual-length (and (vectorp expected-logical) (length expected-logical))))
+    (let ((translucent (first-translucent expected-logical logical-width)))
+      (when translucent (apply #'refuse-physical :expected-alpha translucent)))
+    (unless (and (typep actual '(vector (unsigned-byte 8))) (= physical-length (length actual)))
+      (refuse-physical :actual-raster :expected-length physical-length
+                       :actual-length (and (vectorp actual) (length actual))))
+    (let ((translucent (first-translucent actual width)))
+      (when translucent (apply #'refuse-physical :actual-alpha translucent)))
+    (let ((expected (scale-raster expected-logical logical-width logical-height scale :channels 4))
+          (count 0) (first nil) (last nil) (cells (make-hash-table :test 'equal)))
+      (flet ((difference (x y)
+               (let ((p (* 4 (+ x (* width y)))))
+                 (list :x x :y y :logical-x (floor x scale) :logical-y (floor y scale)
+                       :row (1+ (floor y (* 16 scale))) :column (1+ (floor x (* 8 scale)))
+                       :expected (coerce (subseq expected p (+ p 4)) 'list)
+                       :actual (coerce (subseq actual p (+ p 4)) 'list)))))
+        (dotimes (y height)
+          (dotimes (x width)
+            (let ((p (* 4 (+ x (* width y)))))
+              (unless (loop for i from p below (+ p 4) always (= (aref expected i) (aref actual i)))
+                (incf count)
+                (setf (gethash (list (1+ (floor y (* 16 scale))) (1+ (floor x (* 8 scale)))) cells) t
+                      last (cons x y))
+                (unless first (setf first (cons x y)))))))
+        (list :pass (zerop count) :scale scale :width width :height height
+              :compared-pixels (* width height) :different-pixels count
+              :different-cells (sort (loop for k being the hash-keys of cells collect k)
+                                     (lambda (a b) (or (< (first a) (first b))
+                                                      (and (= (first a) (first b))
+                                                           (< (second a) (second b))))))
+              :first-difference (and first (difference (car first) (cdr first)))
+              :last-difference (and last (difference (car last) (cdr last)))
+              :tolerance 0 :masked-pixels 0)))))

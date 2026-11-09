@@ -68,40 +68,66 @@
     (loop for suffix in '(".argv.sexp" ".stdout" ".stderr" ".exit") collect
       (vttest-charsets-native-contract:reference root (concatenate 'string prefix suffix)))))
 
-(defun validate-comparison-facts (comparison)
-  "Validate the actual public comparator result without absent-field defaults."
-  (vttest-charsets-native-contract::tree comparison)
-  (vttest-charsets-native-contract::properties comparison
-    '(:pass :compared-pixels :different-pixels :different-cells :first-difference :tolerance :masked-pixels))
-  (unless (and (member (getf comparison :pass) '(t nil))
-               (eql 245760 (getf comparison :compared-pixels))
-               (typep (getf comparison :different-pixels) '(integer 0 245760))
-               (listp (getf comparison :different-cells))
-               (listp (getf comparison :first-difference))
-               (eql 0 (getf comparison :tolerance)) (eql 0 (getf comparison :masked-pixels)))
+(defparameter +comparison-keys+
+  '(:pass :scale :width :height :compared-pixels :different-pixels :different-cells
+    :first-difference :last-difference :tolerance :masked-pixels)
+  "Exact key order of the shared physical comparator result.")
+
+(defun validate-comparison-facts (comparison width height)
+  "Validate the shared physical comparator result for a WIDTH x HEIGHT physical image,
+without absent-field defaults."
+  (unless (and (typep width '(integer 1)) (typep height '(integer 1)))
     (error "Malformed full comparison facts"))
+  (vttest-charsets-native-contract::tree comparison)
+  (vttest-charsets-native-contract::properties comparison +comparison-keys+)
+  (unless (equal +comparison-keys+ (loop for key in comparison by #'cddr collect key))
+    (error "Malformed full comparison facts"))
+  (let ((pixels (* width height)))
+    (unless (and (member (getf comparison :pass) '(t nil))
+                 (member (getf comparison :scale) '(1 2))
+                 (eql width (getf comparison :width)) (eql height (getf comparison :height))
+                 (eql pixels (getf comparison :compared-pixels))
+                 (typep (getf comparison :different-pixels) `(integer 0 ,pixels))
+                 (listp (getf comparison :different-cells))
+                 (listp (getf comparison :first-difference))
+                 (listp (getf comparison :last-difference))
+                 (eql 0 (getf comparison :tolerance)) (eql 0 (getf comparison :masked-pixels)))
+      (error "Malformed full comparison facts")))
   (if (getf comparison :pass)
       (unless (and (eql 0 (getf comparison :different-pixels))
-                   (null (getf comparison :different-cells)) (null (getf comparison :first-difference)))
+                   (null (getf comparison :different-cells))
+                   (null (getf comparison :first-difference))
+                   (null (getf comparison :last-difference)))
         (error "Contradictory comparison PASS"))
       (unless (and (plusp (getf comparison :different-pixels))
-                   (getf comparison :different-cells) (getf comparison :first-difference))
+                   (getf comparison :different-cells)
+                   (getf comparison :first-difference)
+                   (getf comparison :last-difference))
         (error "Contradictory comparison failure")))
   comparison)
 
-(defun compare-capture (root n snapshot before ready pre final native target ack surface)
-  "Admit the strict current bracket before decoding once at the observed phase."
+(defun compare-capture (root n snapshot before ready pre final native target ack surface
+                        &key (scale 1))
+  "Admit the strict current bracket at SCALE, decode the unchanged native image once at
+the observed phase and compare every physical pixel with the integer-expanded logical
+raster. Native receipt dimensions are logical; identify, decode and record dimensions
+are physical."
   (unless (eql n 1) (error "Character-set pause must be 1"))
+  (unless (member scale '(1 2)) (error "Character-set scale refusal: ~s" scale))
   (vttest-charsets-oracle:require-complete snapshot)
   (let* ((stem (format nil "recorder/pause-~2,'0d-" n))
          (png (concatenate 'string stem "actual.png"))
          (path (concatenate 'string root png))
          (phase (vttest-screen-frame:required-value ready :blink-phase))
          (content nil)
-         (width 640))
+         (width 640)
+         (height 384)
+         (physical-width (* scale width))
+         (physical-height (* scale height)))
     (vttest-screen-frame:validate-frame before ready pre final native :pause n :target target
-      :blink-content content :endpoint nil :ack-output ack :surface-id surface)
-    (unless (and (= (getf native :width) width) (= (getf native :height) 384)
+      :blink-content content :endpoint nil :ack-output ack :surface-id surface :scale scale)
+    (unless (and (eql (getf native :width) width) (eql (getf native :height) height)
+                 (eql (getf native :scale) scale)
                  (equal (getf native :png) (format nil "pause-~2,'0d-actual.png" n))
                  (eq t (getf native :owned)) (eql 0 (getf native :capture-exit))
                  (eql 1 (getf native :capture-count)))
@@ -114,7 +140,7 @@
                               (list +decoder+ "identify" "-format" "%w %h" path))))
       (with-open-file (s (concatenate 'string root stem "identify.stdout"))
         (let ((*read-eval* nil))
-          (unless (and (eql width (read s nil nil)) (eql 384 (read s nil nil))
+          (unless (and (eql physical-width (read s nil nil)) (eql physical-height (read s nil nil))
                        (eq :eof (read s nil :eof))) (error "PNG dimensions refusal"))))
       (let* ((raw (concatenate 'string stem "actual.rgba"))
              (raw-path (concatenate 'string root raw)))
@@ -127,19 +153,22 @@
                (comparison
                  (progn
                    (unless (equal +font-sha+ font-sha) (error "Actual font vector digest refusal"))
-                   (unless (and (= 983040 (length rgba))
+                   (unless (and (= (* physical-width physical-height 4) (length rgba))
                                 (loop for i from 3 below (length rgba) by 4 always (= 255 (aref rgba i))))
                      (error "Decoded full opaque RGBA refusal"))
-                   (vttest-charsets-oracle:compare-snapshot
-                     snapshot rgba font :font-sha256 font-sha :blink-phase phase))))
-          (validate-comparison-facts comparison)
+                   (let ((expected (vttest-charsets-oracle:rasterize-snapshot
+                                    snapshot font :font-sha256 font-sha :blink-phase phase)))
+                     (vttest-cursor-oracle:compare-physical expected rgba width height scale)))))
+          (validate-comparison-facts comparison physical-width physical-height)
+          (unless (eql scale (getf comparison :scale)) (error "Malformed full comparison facts"))
           (unless (and (equal +font-sha+ (vttest-charsets-native-contract::digest +font+))
                        (equal +decoder-sha+ (vttest-charsets-native-contract::digest +decoder+)))
             (error "Font/decoder changed during comparison"))
           (unless (equal original (vttest-charsets-native-contract:reference root png))
             (error "PNG changed during decoding"))
           (let ((record
-                  (list :version 1 :pause n :png original :phase phase :width width :height 384
+                  (list :version 2 :pause n :png original :phase phase :scale scale
+                        :width physical-width :height physical-height
                         :font (list :path +font+ :sha256 +font-sha+)
                         :decoder (list :path +decoder+ :sha256 +decoder-sha+)
                         :bracket (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp")

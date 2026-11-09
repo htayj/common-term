@@ -59,7 +59,7 @@ charsets_wait_file() {
 charsets_read_request() {
     local path=$1 expected=$2
     read -r nn window width height scale target ack extra < "$path" || return 1
-    [[ $expected == 1 && $nn =~ ^0?1$ && $((10#$nn)) == 1 && $window =~ ^[0-9]+$ && $width == 640 && $height == 384 && $scale == 1 && $target =~ ^[0-9]+$ && -z ${extra:-} ]] || return 1
+    [[ $expected == 1 && $nn =~ ^0?1$ && $((10#$nn)) == 1 && $window =~ ^[0-9]+$ && $width == 640 && $height == 384 && $scale == "$run_scale" && $target =~ ^[0-9]+$ && -z ${extra:-} ]] || return 1
     if [[ $backend == x11 ]]; then [[ $ack == -1 ]]; else [[ $ack =~ ^[0-9]+$ ]]; fi
 }
 # Register each deferred map command separately. IPC commas end for_window registration.
@@ -80,7 +80,7 @@ charsets_register_placement() {
     done
 }
 charsets_output_valid() {
-    "$jq" -e 'length==1 and .[0].name=="HEADLESS-1" and .[0].scale==1 and .[0].active==true and .[0].rect=={"x":0,"y":0,"width":1280,"height":800}' "$1" >/dev/null
+    "$jq" -e --argjson s "$run_scale" 'length==1 and .[0].name=="HEADLESS-1" and .[0].scale==$s and .[0].active==true and .[0].rect=={"x":0,"y":0,"width":1280,"height":800}' "$1" >/dev/null
 }
 charsets_owned_node() {
     "$jq" -ce --argjson pid "$2" '[.. | objects | select(.pid?==$pid and .type?=="floating_con")] | if length==1 and .[0].app_id=="org.autolith.lispterm" and .[0].name=="Lispterm-charsets-owned-run" then .[0] else error("ambiguous/missing/foreign owned surface") end' "$1"
@@ -104,7 +104,7 @@ charsets_receipt() {
     local path=$1 count=$2 exitcode=$3 custody=$4 surface=NIL
     [[ $backend != wayland ]] || surface=$window
     # ACK and protocol surface ID bind the recorder witness, not independent native observations.
-    (set -o noclobber; printf '(:version 3 :backend :%s :pause %s :window-id %s :native-window-id %s :surface-id %s :width %s :height %s :scale 1 :capture-count %s :owned T :capture-exit %s :png "pause-%02d-actual.png" :ack-output %s :ack-basis :recorder-request-binding :custody %s)\n' "$backend" "$n" "$native_window" "$native_window" "$surface" "$width" "$height" "$count" "$exitcode" "$n" "$ack" "$custody" > "$path.tmp") || return 1
+    (set -o noclobber; printf '(:version 3 :backend :%s :pause %s :window-id %s :native-window-id %s :surface-id %s :width %s :height %s :scale %s :capture-count %s :owned T :capture-exit %s :png "pause-%02d-actual.png" :ack-output %s :ack-basis :recorder-request-binding :custody %s)\n' "$backend" "$n" "$native_window" "$native_window" "$surface" "$width" "$height" "$run_scale" "$count" "$exitcode" "$n" "$ack" "$custody" > "$path.tmp") || return 1
     ln -T -- "$path.tmp" "$path" || return 1
     rm -- "$path.tmp"
 }
@@ -220,6 +220,10 @@ charsets_native_main() {
     [[ $# == 3 && ( $1 == x11 || $1 == wayland ) && $2 == /* && -d $2 && ! -L $2 && -O $2 && $3 == /* && -f $3 && ! -L $3 ]] || return 2
     backend=$1; run=${2%/}/; manifest=$3; native=$run/native; recorder=$run/recorder
     [[ $manifest == "${run}MANIFEST.sexp" ]] || return 2
+    # Selected scale arrives explicitly through env -i; X11 (Xvfb) is scale 1 only.
+    run_scale=${LISPTERM_VTTEST_SCALE-}
+    [[ $run_scale == 1 || $run_scale == 2 ]] || return 2
+    [[ $backend == wayland || $run_scale == 1 ]] || return 2
     mkdir -m700 -- "$native" || return 1
     started=NIL; cleanup=:not-applicable; build_status=:unverified
     attempted=0; reached=0; captured=0; reason=preparation; binary=; server=; client=
@@ -227,6 +231,7 @@ charsets_native_main() {
     n=0; native_stage=placement
     contract_helper=/home/taylor/projects/lispterm/tests/vttest-charsets-native-contract.lisp
     : > "$native/stage-events.sexp"; : > "$native/unowned-endpoints.txt"
+    printf '%s\n' "$run_scale" > "$native/scale.txt"
     trap charsets_cleanup EXIT
     local root=/home/taylor/projects/lispterm
     cd "$root"
@@ -283,7 +288,7 @@ charsets_native_main() {
         local wp=$runtime/wayland-1 ip=$runtime/sway-ipc.$UID.9999999999.sock
         printf 'wayland=%s bytes=%s\nipc-upper-bound=%s bytes=%s\nrequire<=100 (108 including NUL kernel capacity)\n' "$wp" "${#wp}" "$ip" "${#ip}" > "$native/socket-precheck.txt"
         [[ ${#wp} -le 100 && ${#ip} -le 100 ]] || return 1
-        printf '%s\n' 'xwayland disable' 'output HEADLESS-1 mode 1280x800 scale 1' 'seat seat0 fallback true' 'font monospace 12' 'default_border none' 'focus_follows_mouse no' > "$native/sway.conf"
+        printf '%s\n' 'xwayland disable' "output HEADLESS-1 mode $((1280*run_scale))x$((800*run_scale)) scale $run_scale" 'seat seat0 fallback true' 'font monospace 12' 'default_border none' 'focus_follows_mouse no' > "$native/sway.conf"
         printf 'WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 %q --config %q\n' "$sway" "$native/sway.conf" > "$native/server.command"
         WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 "$sway" --config "$native/sway.conf" </dev/null > "$native/server.stdout" 2> "$native/server.stderr" & server=$!
         started=T; charsets_remember "$server"
@@ -302,7 +307,7 @@ charsets_native_main() {
         sleep .3; charsets_is_owned "$keyboard" || return 1
     fi
     reason=recorder
-    export LISPTERM_VTTEST_RUN_ROOT=$run LISPTERM_VTTEST_EXECUTABLE=$binary LISPTERM_VTTEST_BACKEND=$backend
+    export LISPTERM_VTTEST_RUN_ROOT=$run LISPTERM_VTTEST_EXECUTABLE=$binary LISPTERM_VTTEST_BACKEND=$backend LISPTERM_VTTEST_SCALE=$run_scale
     printf '%q ' "$sbcl" --noinform --no-userinit --no-sysinit --script "$root/tests/vttest-charsets-recorder.lisp" > "$native/client.command"; printf '\n' >> "$native/client.command"
     "$sbcl" --noinform --no-userinit --no-sysinit --script "$root/tests/vttest-charsets-recorder.lisp" </dev/null > "$native/client.stdout" 2> "$native/client.stderr" & client=$!
     charsets_remember "$client"
@@ -374,6 +379,15 @@ charsets_native_main() {
         printf '%s\n' "$e" > "${prefix}capture.exit"
         printf '(%s :completed %s)\n' "$n" "$e" >> "$native/stage-events.sexp"
         if [[ $e != 0 || ! -s ${prefix}actual.png ]]; then charsets_receipt "${prefix}native.sexp" 1 "$e" NIL; : > "${prefix}done"; return 1; fi
+        # Physical raster proof on the unchanged PNG: logical size times selected scale.
+        local -a identify=("$magick" identify -format '%w %h' "${prefix}actual.png")
+        printf '%q ' "${identify[@]}" > "${prefix}dimensions.command"; printf '\n' >> "${prefix}dimensions.command"
+        local de=0
+        "${identify[@]}" </dev/null > "${prefix}dimensions.stdout" 2> "${prefix}dimensions.stderr" || de=$?
+        printf '%s\n' "$de" > "${prefix}dimensions.exit"
+        if [[ $de != 0 || $(cat "${prefix}dimensions.stdout") != "$((width*run_scale)) $((height*run_scale))" ]]; then
+            charsets_receipt "${prefix}native.sexp" 1 0 NIL; : > "${prefix}done"; return 1
+        fi
         ((captured+=1))
         sha256sum "${prefix}actual.png" > "${prefix}actual.sha256"
         charsets_receipt "${prefix}native.sexp" 1 0 T
@@ -385,13 +399,15 @@ charsets_native_main() {
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     [[ $# == 3 && ( $1 == x11 || $1 == wayland ) && $2 == /* && -d $2 && ! -L $2 && -O $2 && $3 == "${2%/}/MANIFEST.sexp" && -f $3 && ! -L $3 ]] || exit 2
+    [[ ${LISPTERM_VTTEST_SCALE-} == 1 || ${LISPTERM_VTTEST_SCALE-} == 2 ]] || exit 2
+    [[ $1 == wayland || $LISPTERM_VTTEST_SCALE == 1 ]] || exit 2
     umask 077
     # Allocate only run-owned environment dirs before executing any native/build tool.
     for dir in home cache config data tmp; do mkdir -m700 -- "$2/$dir" || exit 1; done
     script=$(readlink -f -- "$0")
     bash=/nix/store/kwyi4bq5s2qgwbhz6cs4gjy57c2zdxws-bash-interactive-5.3p20/bin/bash
     env=/nix/store/cb987zkxvsv0490753ilrvn5yk7ylgxi-coreutils-9.12/bin/env
-    command=("$env" -i PATH=/run/current-system/sw/bin "HOME=$2/home" "XDG_CACHE_HOME=$2/cache" "XDG_CONFIG_HOME=$2/config" "XDG_DATA_HOME=$2/data" "TMPDIR=$2/tmp" LANG=C.UTF-8 LC_ALL=C.UTF-8 LISPTERM_FONT=/nix/store/9qvd27vg12177prxcl778rdhxh4lk2mi-terminus-font-4.49.1/share/fonts/terminus/ter-u16n.otb LISPTERM_XKBCOMMON_LIBRARY=/nix/store/f7dllvig9i72z13kzxczwq7wy8a1jpgg-libxkbcommon-1.13.2/lib/libxkbcommon.so.0 "$bash" --noprofile --norc -c 'source "$1"; charsets_native_main "${@:2}"' charsets-native "$script" "$@")
+    command=("$env" -i PATH=/run/current-system/sw/bin "HOME=$2/home" "XDG_CACHE_HOME=$2/cache" "XDG_CONFIG_HOME=$2/config" "XDG_DATA_HOME=$2/data" "TMPDIR=$2/tmp" LANG=C.UTF-8 LC_ALL=C.UTF-8 "LISPTERM_VTTEST_SCALE=$LISPTERM_VTTEST_SCALE" LISPTERM_FONT=/nix/store/9qvd27vg12177prxcl778rdhxh4lk2mi-terminus-font-4.49.1/share/fonts/terminus/ter-u16n.otb LISPTERM_XKBCOMMON_LIBRARY=/nix/store/f7dllvig9i72z13kzxczwq7wy8a1jpgg-libxkbcommon-1.13.2/lib/libxkbcommon.so.0 "$bash" --noprofile --norc -c 'source "$1"; charsets_native_main "${@:2}"' charsets-native "$script" "$@")
     printf '%q ' "${command[@]}" > "$2/native-environment.command"; printf '\n' >> "$2/native-environment.command"
     for fdpath in /proc/$$/fd/*; do fd=${fdpath##*/}; if [[ $fd =~ ^[0-9]+$ && $fd -gt 2 && $fd -ne 255 ]]; then eval "exec $fd>&-"; fi; done
     exec "${command[@]}" </dev/null

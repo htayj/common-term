@@ -36,16 +36,17 @@
           ;; Built-in native execution, not a capability-ready receipt.
           :requires nil)))
 
-(defun make-manifest (backend)
+(defun make-manifest (backend &optional (scale 1))
   "Declare all six holds; this does not certify launch or native observations.
 The independent oracle covers widths 640,640,1056,1056,640,640 at height384,
 area-local single/wide/top/bottom row modes, and cursors23/14 (1..4),23/54
 (5),1/53 (6). Holds5/6 contain real blink attributes. Only5 requires phaseT;
 6 uses its actual stable boolean, including NIL. No phase selection is allowed."
   (vttest-area::need (member backend '("x11" "wayland") :test #'equal) :unknown-backend)
+  (vttest-area::check-scale backend scale)
   (list :kind :vttest-area-manifest :version 1 :area "double-size-characters"
-        :backend backend :scope-status :frozen
-        :conditions '("private-headless" "source-built-per-run" "scale-1"
+        :backend backend :scale scale :scope-status :frozen
+        :conditions (list "private-headless" "source-built-per-run" (format nil "scale-~d" scale)
           "grid-80-132x24" "cell-8x16" "all-6-fixed-holds"
           "normal-default-colors-sgr-screen" "ascii-g0-gl" "full-margins"
           "absolute-cursor-addressing" "autowrap-overwrite" "visible-solid-block-cursor"
@@ -63,6 +64,6 @@ area-local single/wide/top/bottom row modes, and cursors23/14 (1..4),23/54
 Conditions describe the existing public launch profile, not private attestation."
   (vttest-area::need (equal (digest +archive+) +archive-sha256+) :double-size-archive-mismatch)
   (vttest-area::need (equal (digest +oracle+) +oracle-sha256+) :double-size-oracle-mismatch)
-  (vttest-area::need (equal manifest (make-manifest (getf manifest :backend)))
+  (vttest-area::need (equal manifest (make-manifest (getf manifest :backend) (getf manifest :scale)))
                     :double-size-manifest-mismatch)
   manifest)

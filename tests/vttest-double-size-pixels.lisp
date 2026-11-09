@@ -1,7 +1,7 @@
-;;;; Exact double-size comparison and closed publication adapter.
+;;;; Exact double-size physical comparison and capture recording.
 (defpackage #:vttest-double-size-pixels
   (:use #:cl)
-  (:export #:compare-capture #:compare-memory #:publication-comparison))
+  (:export #:compare-capture #:compare-memory))
 (in-package #:vttest-double-size-pixels)
 
 (defparameter +font+
@@ -55,44 +55,27 @@
           (setf (aref h i) (u32 (+ (aref h i) value))))))
     (string-downcase (format nil "~{~8,'0x~}" (coerce h 'list)))))
 
-(defun publication-comparison (comparison expected actual width)
-  "Derive cell and first-difference facts from the same complete arrays.
-The supplied oracle result must agree with every recomputed fact."
-  (vttest-double-size-native-contract::tree comparison)
-  (vttest-double-size-native-contract::properties comparison
-    '(:pass :compared-pixels :different-pixels :width :height :tolerance :mask))
-  (unless (and (member width '(640 1056))
-               (every (lambda (a) (and (vectorp a) (= (length a) (* width 384 4))
-                                      (every (lambda (b) (typep b '(unsigned-byte 8))) a)
-                                      (loop for p from 3 below (length a) by 4 always (= 255 (aref a p)))))
-                      (list expected actual)))
-    (error "Full opaque RGBA arrays required"))
-  (let ((different 0) (cells nil) (first nil))
-    (loop for p below (* width 384) do
-      (when (loop for c below 4 thereis (/= (aref expected (+ (* p 4) c))
-                                           (aref actual (+ (* p 4) c))))
-        (incf different)
-        (let ((x (mod p width)) (y (floor p width)))
-          (unless first (setf first (list :x x :y y :row (1+ (floor y 16)) :column (1+ (floor x 8)) :expected (coerce (subseq expected (* p 4) (+ (* p 4) 3)) (quote list)) :actual (coerce (subseq actual (* p 4) (+ (* p 4) 3)) (quote list)))))
-          (pushnew (list (1+ (floor y 16)) (1+ (floor x 8))) cells :test #'equal))))
-    (unless (equal comparison
-                   (list :pass (zerop different) :compared-pixels (* width 384)
-                         :different-pixels different :width width :height 384 :tolerance 0 :mask nil))
-      (error "Oracle/publication comparison contradiction"))
-    (list :pass (zerop different) :compared-pixels (* width 384) :different-pixels different
-          :different-cells (nreverse cells) :first-difference first :tolerance 0 :masked-pixels 0)))
+(defun admit-actual (actual physical-width physical-height)
+  "Admit only a full opaque RGBA octet vector of the exact physical size.
+Refusal is the oracle's typed :rgba profile error carrying the actual vector."
+  (unless (and (vectorp actual)
+               (every (lambda (b) (typep b '(unsigned-byte 8))) actual)
+               (= (length actual) (* physical-width physical-height 4))
+               (loop for p from 3 below (length actual) by 4 always (= 255 (aref actual p))))
+    (error 'vttest-double-size-oracle:profile-error :field :rgba :value actual)))
 
-(defun compare-memory (snapshot actual font phase)
-  "One observed boolean, exact freshly hashed font vector, approved reference API."
+(defun compare-memory (snapshot actual font phase &key (scale 1))
+  "One observed boolean, exact freshly hashed font vector, logical oracle raster,
+then one exact whole-image comparison at the integer physical SCALE."
   (unless (member phase '(t nil)) (error "Explicit boolean phase required"))
   (let ((digest (font-digest font)))
     (unless (equal digest +font-sha+) (error "Font vector authentication refusal"))
-    (let* ((comparison (vttest-double-size-oracle:compare-reference
-                         snapshot actual font :blink-phase phase :verified-font-sha256 digest))
-           (expected (vttest-double-size-oracle:rasterize
-                       snapshot font :blink-phase phase :verified-font-sha256 digest)))
-      (publication-comparison comparison expected actual
-                               (* 8 (vttest-double-size-oracle:snapshot-columns snapshot))))))
+    (let ((width (* 8 (vttest-double-size-oracle:snapshot-columns snapshot)))
+          (expected (vttest-double-size-oracle:rasterize
+                     snapshot font :blink-phase phase :verified-font-sha256 digest)))
+      (when (member scale '(1 2))
+        (admit-actual actual (* width scale) (* 384 scale)))
+      (vttest-cursor-oracle:compare-physical expected actual width 384 scale))))
 
 (defun command (root prefix argv)
   "Retain argv before execution, separate streams and the actual exit."
@@ -108,8 +91,10 @@ The supplied oracle result must agree with every recomputed fact."
     (loop for suffix in '(".argv.sexp" ".stdout" ".stderr" ".exit") collect
       (vttest-double-size-native-contract:reference root (concatenate 'string prefix suffix)))))
 
-(defun compare-capture (root n snapshot before ready pre final native target ack surface)
-  "Decode the original capture once, at its strict observed READY phase."
+(defun compare-capture (root n snapshot before ready pre final native target ack surface
+                        &key (scale 1))
+  "Decode the original capture once, at its strict observed READY phase.
+Native receipt dimensions are logical; the PNG, decoded RGBA and record are physical."
   (let* ((stem (format nil "recorder/pause-~2,'0d-" n))
          (png (concatenate 'string stem "actual.png")) (path (concatenate 'string root png))
          (phase (vttest-double-size-native-contract:required-value ready :blink-phase))
@@ -117,27 +102,29 @@ The supplied oracle result must agree with every recomputed fact."
          (width (* 8 (vttest-double-size-oracle:snapshot-columns snapshot))))
     (unless (= n (vttest-double-size-oracle:snapshot-pause snapshot)) (error "Foreign snapshot"))
     (vttest-double-size-native-contract:validate-frame before ready pre final native :pause n :target target
-      :blink-content content :endpoint nil :ack-output ack :surface-id surface)
+      :blink-content content :endpoint nil :ack-output ack :surface-id surface :scale scale)
     (unless (and (equal +decoder-sha+ (vttest-double-size-native-contract::digest +decoder+))
                  (= (getf native :width) width) (= (getf native :height) 384))
       (error "Native geometry/decoder refusal"))
-    (let* ((original (vttest-double-size-native-contract:reference root png))
+    (let* ((physical-width (* width scale)) (physical-height (* 384 scale))
+           (original (vttest-double-size-native-contract:reference root png))
            (identify (command root (concatenate 'string stem "identify")
                               (list +decoder+ "identify" "-format" "%w %h" path))))
       (with-open-file (s (concatenate 'string root stem "identify.stdout"))
         (let ((*read-eval* nil))
-          (unless (and (eql width (read s nil nil)) (eql 384 (read s nil nil))
+          (unless (and (eql physical-width (read s nil nil)) (eql physical-height (read s nil nil))
                        (eq :eof (read s nil :eof))) (error "PNG dimensions refusal"))))
       (let* ((raw (concatenate 'string stem "actual.rgba")) (raw-path (concatenate 'string root raw)))
         (when (probe-file raw-path) (error "Decoded output already exists"))
         (let* ((decode (command root (concatenate 'string stem "decode")
                                 (list +decoder+ path "-depth" "8" (concatenate 'string "rgba:" raw-path))))
                (rgba (octets raw-path)) (font (octets +font+))
-               (comparison (compare-memory snapshot rgba font phase)))
+               (comparison (compare-memory snapshot rgba font phase :scale scale)))
           (unless (equal original (vttest-double-size-native-contract:reference root png))
             (error "PNG changed during decoding"))
           (let ((record
-                  (list :version 1 :pause n :png original :phase phase :width width :height 384
+                  (list :version 2 :pause n :png original :phase phase :scale scale
+                        :width physical-width :height physical-height
                         :font (list :path +font+ :sha256 +font-sha+)
                         :decoder (list :path +decoder+ :sha256 +decoder-sha+)
                         :bracket (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp")

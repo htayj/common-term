@@ -12,6 +12,12 @@
 (defparameter *art* (merge-pathnames "recorder/" *root*))
 (defparameter *backend* (ecase (intern (string-upcase (uiop:getenv "LISPTERM_VTTEST_BACKEND")) :keyword)
                           (:x11 :x11) (:wayland :wayland)))
+(defparameter *scale*
+  (let ((value (or (uiop:getenv "LISPTERM_VTTEST_SCALE") "1")))
+    (cond ((string= value "1") 1)
+          ((and (string= value "2") (eq *backend* :wayland)) 2)
+          (t (error "Unsupported LISPTERM_VTTEST_SCALE ~s for backend ~(~a~)" value *backend*))))
+  "Selected output scale: exactly \"1\" or \"2\", default 1; X11 accepts only 1.")
 (defparameter *binary* (uiop:getenv "LISPTERM_VTTEST_EXECUTABLE"))
 (defparameter *lock* (sb-thread:make-mutex :name "character-set recorder"))
 (defparameter *output* 0)
@@ -395,12 +401,12 @@
                   :surface-id *surface* :executable *binary*))
       (publish-request (pause-name n "request")
         (lambda (s)
-          (format s "~d ~d ~d ~d 1 ~d ~d~%" n window (getf g :actual-width) (getf g :actual-height) target *ack*)))
+          (format s "~d ~d ~d ~d ~d ~d ~d~%" n window (getf g :actual-width) (getf g :actual-height) *scale* target *ack*)))
       (await host (lambda () (probe-file (path (pause-name n "native-ready.sexp")))))
       (let ((receipt (read-value (pause-name n "native-ready.sexp"))))
         (unless (and (eql 3 (getf receipt :version)) (eq *backend* (getf receipt :backend))
                      (eql n (getf receipt :pause)) (eq t (getf receipt :owned))
-                     (eql 0 (getf receipt :capture-count)) (eql 1 (getf receipt :scale))
+                     (eql 0 (getf receipt :capture-count)) (eql *scale* (getf receipt :scale))
                      (eql (getf g :actual-width) (getf receipt :width))
                      (eql (getf g :actual-height) (getf receipt :height))
                      (eql window (getf receipt (if (eq *backend* :x11) :window-id :surface-id))))
@@ -417,12 +423,13 @@
       (save (pause-name n "final.sexp") final)
       (setf native (read-value (pause-name n "native.sexp"))))
     (vttest-screen-frame:validate-frame before ready pre final native
-      :pause n :target target :blink-content content :endpoint nil :ack-output *ack* :surface-id *surface*)
+      :pause n :target target :blink-content content :endpoint nil :ack-output *ack* :surface-id *surface*
+      :scale *scale*)
     (unless (and (= target *output*) (string= text (grid host)) (cursor-matches-p host snapshot)
                  (or (eq *backend* :x11) (completed-wayland-frame-p final target)))
       (error "Final source target changed"))
     (let ((comparison (vttest-charsets-pixels:compare-capture
-                       (namestring *root*) n snapshot before ready pre final native target *ack* *surface*)))
+                       (namestring *root*) n snapshot before ready pre final native target *ack* *surface* :scale *scale*)))
       (list :pause n :pixels :pass :bytes :unverified :timing :pass
             :frame :pass :target :recognized-navigation-only :native native :comparison comparison
             :evidence (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp" "presentation.sexp")

@@ -221,7 +221,24 @@
     (unique-strings (mapcar (lambda (r) (getf r :capability)) requires)
                     :nonempty (not (member (getf s :recorder-label)
                                            '("screen" "charsets" "double-size" "keyboard-cursor" "keyboard-keypad") :test #'equal)))) s)
-(defun validate-manifest (m area backend)
+(defparameter *scaled-areas* '("screen" "character-sets" "double-size-characters")
+  "Areas whose manifests declare :SCALE. Others, including keyboard, run only at scale 1.")
+(defun check-scale (backend scale)
+  "X11 runs only at scale 1; Wayland at integer buffer scale 1 or 2."
+  (need (member scale (if (equal backend "wayland") '(1 2) '(1))) :unsupported-scale)
+  scale)
+(defun parse-scale (text)
+  (cond ((equal text "1") 1) ((equal text "2") 2) (t (refuse :invalid-scale))))
+(defun check-scale-environment (scale inherited)
+  "An inherited LISPTERM_VTTEST_SCALE must name exactly the selected scale."
+  (need (or (null inherited) (equal inherited (princ-to-string scale))) :inherited-scale-mismatch)
+  scale)
+(defun restore-scale-environment (prior)
+  "Return LISPTERM_VTTEST_SCALE to PRIOR, or unset it when PRIOR is NIL."
+  (if prior
+      (sb-posix:setenv "LISPTERM_VTTEST_SCALE" prior 1)
+      (sb-posix:unsetenv "LISPTERM_VTTEST_SCALE")))
+(defun validate-manifest (m area backend &optional (scale 1))
   (proper m)
   ;; Documentary records are deliberately not promoted into executable scope.
   (when (and (getf m :areas) (getf m :area-dependencies))
@@ -229,10 +246,15 @@
     (need (find (if (equal area "screen") "screen-features" area)
                 (getf m :areas) :test #'equal :key (lambda (r) (getf r :area))) :unknown-documentary-area)
     (refuse :scope-not-executable 3))
-  (plist-keys m '(:kind :version :area :backend :scope-status :conditions :scenarios :required-count :native-driver :pins)
-              '(:kind :version :area :backend :scope-status :conditions :scenarios :required-count))
-  (need (and (eq (getf m :kind) :vttest-area-manifest) (eql (getf m :version) 1)) :manifest-version)
-  (need (and (equal (getf m :area) area) (equal (getf m :backend) backend)) :manifest-selector)
+  (let ((scaled (when (member area *scaled-areas* :test #'equal) '(:scale))))
+    (plist-keys m (append '(:kind :version :area :backend :scope-status :conditions :scenarios :required-count :native-driver :pins) scaled)
+                (append '(:kind :version :area :backend :scope-status :conditions :scenarios :required-count) scaled))
+    (need (and (eq (getf m :kind) :vttest-area-manifest) (eql (getf m :version) 1)) :manifest-version)
+    (need (and (equal (getf m :area) area) (equal (getf m :backend) backend)) :manifest-selector)
+    (check-scale backend scale)
+    (if scaled
+        (need (eql (getf m :scale) scale) :manifest-scale)
+        (need (eql scale 1) :scale-not-integrated)))
   (need (eq (getf m :scope-status) :frozen) :scope-not-frozen)
   (unique-strings (getf m :conditions))
   (let ((scenarios (getf m :scenarios)))
@@ -252,21 +274,24 @@
          (need (equal (getf m :native-driver) (format nil "keyboard-~a-v1" backend)) :driver-not-integrated)))
   m)
 (defun parse-cli (args)
-  (need (member (length args) '(4 6)) :usage)
+  "Return area, backend, manifest path and scale; --scale defaults to 1."
+  (need (member (length args) '(4 6 8)) :usage)
   (let ((seen nil) (values nil))
     (loop for (key value) on args by #'cddr do
-      (need (member key '("--area" "--backend" "--manifest") :test #'equal) :unknown-flag)
+      (need (member key '("--area" "--backend" "--manifest" "--scale") :test #'equal) :unknown-flag)
       (need (not (member key seen :test #'equal)) :repeated-flag)
       (push key seen) (push (cons key value) values))
     (let ((area (cdr (assoc "--area" values :test #'equal)))
           (backend (cdr (assoc "--backend" values :test #'equal)))
-          (path (cdr (assoc "--manifest" values :test #'equal))))
+          (path (cdr (assoc "--manifest" values :test #'equal)))
+          (scale-text (cdr (assoc "--scale" values :test #'equal))))
       (need (member area *areas* :test #'equal) :unknown-area)
       (need (member backend '("x11" "wayland") :test #'equal) :unknown-backend)
       (when path (safe-components path))
       (need (or path (member area '("screen" "screen-features" "character-sets"
                                     "double-size-characters" "keyboard") :test #'equal)) :usage)
-      (values (if (equal area "screen-features") "screen" area) backend path))))
+      (values (if (equal area "screen-features") "screen" area) backend path
+              (check-scale backend (if scale-text (parse-scale scale-text) 1))))))
 (defun git-binding (name)
   (handler-case
       (with-output-to-string (out)
@@ -396,14 +421,20 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
     ;; link is atomic and fails if the target exists, unlike rename overwrite.
     (sb-posix:link tmp target) (sb-posix:unlink tmp) target))
 (defun main (args)
-  (let ((directory nil) (area nil) (backend nil) (path nil) (hash nil) (head nil) (tree nil)
+  (let ((directory nil) (area nil) (backend nil) (path nil) (scale nil) (hash nil) (head nil) (tree nil)
          (manifest nil) (readiness nil) (count nil) (exit 3) (reason :internal-error)
-         (observations nil) (scenario-results nil) (outcome :unverified) (driver-evidence nil))
+         (observations nil) (scenario-results nil) (outcome :unverified) (driver-evidence nil)
+         (prior-scale (sb-ext:posix-getenv "LISPTERM_VTTEST_SCALE")) (scale-exported nil))
     (handler-case
+        ;; The exported scale lives only for this run, whatever its outcome.
+        (unwind-protect
         (progn
           (setf directory (new-run-directory))
           (multiple-value-setq (head tree) (source-bindings))
-          (multiple-value-setq (area backend path) (parse-cli args))
+          (multiple-value-setq (area backend path scale) (parse-cli args))
+          (check-scale-environment scale prior-scale)
+          ;; Keyboard and cursor manifests carry no scale until their own integration.
+          (need (or (eql scale 1) (member area *scaled-areas* :test #'equal)) :scale-not-integrated)
             ;; Explicit selectors must refuse before documentary scope or readiness.
             (when (sb-ext:posix-getenv "LISPTERM_VTTEST_EXACT_LABELS")
               (preflight-selection (sb-ext:posix-getenv "LISPTERM_VTTEST_EXACT_LABELS")
@@ -412,16 +443,19 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
               (multiple-value-setq (manifest hash) (read-data path))
               (progn
                 (setf manifest (cond ((equal area "character-sets")
-                                      (vttest-charsets-driver:make-manifest backend))
+                                      (vttest-charsets-driver:make-manifest backend scale))
                                      ((equal area "double-size-characters")
-                                      (vttest-double-size-driver:make-manifest backend))
+                                      (vttest-double-size-driver:make-manifest backend scale))
                                      ((equal area "keyboard")
                                       (vttest-keyboard-driver:make-manifest backend))
-                                     (t (vttest-screen-driver:make-manifest backend)))
+                                     (t (vttest-screen-driver:make-manifest backend scale)))
                       path (concatenate 'string directory "MANIFEST.sexp"))
                 (vttest-cursor-driver::put path manifest)
                 (multiple-value-setq (manifest hash) (read-data path))))
-          (validate-manifest manifest area backend)
+          (validate-manifest manifest area backend scale)
+          ;; Native producers inherit exactly the validated scale.
+          (setf scale-exported t)
+          (sb-posix:setenv "LISPTERM_VTTEST_SCALE" (princ-to-string scale) 1)
           (setf count (getf manifest :required-count))
           (if (getf manifest :native-driver)
               (cond ((equal area "screen") (vttest-screen-driver:validate manifest))
@@ -441,11 +475,12 @@ Returns status, reasoned per-scenario records. Fixture success is :FIXTURE-PASS.
           (when (getf driver-evidence :native-failed) (setf outcome :fail))
           (setf exit (if (eq outcome :pass) 0 (if (eq outcome :fail) 1 3))
                 reason (if (eq outcome :pass) :complete :incomplete-or-failed)))
+          (when scale-exported (restore-scale-environment prior-scale)))
       (gate-problem (e) (setf exit (problem-code e) reason (problem-reason e)))
       (error (e) (format *error-output* "vttest-area input/IO condition: ~a~%" e)
         (setf exit 2 reason :invalid-input-or-io)))
     (let ((result (list :kind :vttest-area-result :version 1 :gate :vttest-area
-                        :area area :backend backend :manifest-path path :manifest-sha256 hash
+                        :area area :backend backend :scale scale :manifest-path path :manifest-sha256 hash
                         :source-head head :source-tree tree :required-count count
                         :observed-count (if (member area '("screen" "character-sets" "double-size-characters" "keyboard") :test #'equal)
                                             (getf (getf driver-evidence :counts) :captured)

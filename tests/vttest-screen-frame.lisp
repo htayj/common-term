@@ -43,14 +43,17 @@
     (error () nil)))
 
 (defun validate-frame (before ready pre final native &key pause target blink-content
-                                                       endpoint ack-output surface-id)
+                                                        endpoint ack-output surface-id
+                                                        (scale 1))
   "Return T or signal FRAME-REFUSAL. No field normalization or capture retries.
-ENDPOINT is independently derived or NIL; NIL cannot establish byte proof."
+ENDPOINT is independently derived or NIL; NIL cannot establish byte proof.
+SCALE is the run's selected output scale, 1 or 2; NATIVE :SCALE must equal it."
   (let ((reasons nil))
     (flet ((need (test reason) (unless test (push reason reasons))))
       (handler-case
           (progn
             (need (and (integerp pause) (<= 1 pause 15)) :pause)
+            (need (and (integerp scale) (member scale '(1 2))) :selected-scale)
             (need (natural-p target) :target)
             (need (boolean-p blink-content) :expected-content-boolean)
             (loop for status in (list before ready pre final) do
@@ -107,7 +110,7 @@ ENDPOINT is independently derived or NIL; NIL cannot establish byte proof."
               (need (eq (required-value native :custody) t) :custody)
               (need (eql (required-value native :capture-count) 1) :capture-count)
               (need (eql (required-value native :capture-exit) 0) :capture-exit)
-              (need (eql (required-value native :scale) 1) :scale)
+              (need (eql (required-value native :scale) scale) :scale)
               (if (eq backend :x11)
                   (need (equal (required-value native :window-id) (required-value g :window-id)) :window)
                   (need (and (integerp surface-id) (plusp surface-id)
