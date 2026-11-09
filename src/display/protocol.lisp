@@ -61,6 +61,7 @@
     (handler-case
         (progn
           (setf (display-font display) (load-font font-path font-size))
+          (record-loaded-font (display-font display) title)
           (resize-display display
                           (* columns (font-width (display-font display)))
                           (* rows (font-height (display-font display))))

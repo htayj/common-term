@@ -1,4 +1,4 @@
-;;;; Independent cleanup integration; byte/pixel/timing policy is unchanged.
+;;;; Independent cleanup and timing integration; pixels are linked claims.
 (in-package #:vttest-keyboard-driver)
 
 (defun native-cleanup (root backend record)
@@ -20,16 +20,22 @@
   (find-if (lambda (k) (and (equal (getf k :scenario) label) (equal (getf k :capture) capture)))
            (getf record :checks)))
 
-(defun pixel-status (identity check original)
-  "Unlinked positive claims cannot prove pixels."
+(defun pixel-status (identity check original &optional timing)
+  "Native-main's pixel claim, trusted only when linked: identity :PASS, the check names
+ORIGINAL, and TIMING-STATUS over the recomputed case TIMING is :PASS. The summary
+cannot recompute pixels without the run's live font proof."
   (cond ((eq identity :fail) :fail)
+        ((null original) :unverified)
         ((null check) :unverified)
         ((not (equal (getf check :name) original)) :fail)
         ((eq (getf check :pixels) :fail) :fail)
+        ((and (eq (getf check :pixels) :pass)
+              (eq (timing-status identity check original timing) :pass))
+         :pass)
         (t :unverified)))
 
 (defun summarize-native (manifest record process-exit &optional root)
-  "Reconcile cleanup independently; pixels and timing still need linked proof."
+  "Reconcile cleanup and timing independently; pixels pass only as linked claims."
   (let ((receipt-error nil) (dir (and root (concatenate 'string root +recorder+))))
     (handler-case (when record (validate-receipt record (getf manifest :backend) root))
       (error (e) (setf receipt-error (princ-to-string e) record nil)))
@@ -45,14 +51,17 @@
                 (if dir (case-identity label dir) :unverified)
               (incf captured (count-if (lambda (c) (handler-case (safe-image-p (artifact dir (cdr c) ".png")) (error () nil)))
                                        originals))
-              (push (list :label label :bytes bytes :identity identity
-                          :byte-errors (subseq errors 0 (min 8 (length errors))))
+              (multiple-value-bind (case-state timing-errors) (case-timing label dir bytes +timing-scale+)
+              (push (list :label label :bytes bytes :identity identity :timing case-state
+                          :byte-errors (subseq errors 0 (min 8 (length errors)))
+                          :timing-errors (subseq timing-errors 0 (min 8 (length timing-errors))))
                     cases)
               (dolist (c (getf s :captures))
                 (let* ((id (getf c :id)) (check (check-for record label id))
                        (pixels (pixel-status identity check
-                                             (cdr (assoc id originals :test #'equal))))
-                       (timing (if (eq (getf check :timing) :fail) :fail :unverified))
+                                             (cdr (assoc id originals :test #'equal)) case-state))
+                       (timing (timing-status identity check
+                                              (cdr (assoc id originals :test #'equal)) case-state))
                        (states (list pixels bytes timing cleanup)))
                   (cond ((member :fail states) (incf failed))
                         ((member :unverified states) (incf unverified))
@@ -62,7 +71,7 @@
                                           (eq (getf record :status) :pass)
                                           (eq cleanup :pass) (eq bytes :pass) t)
                               :fixture nil :pixels pixels :bytes bytes :timing timing)
-                        observations)))))))
+                        observations))))))))
       (values (nreverse observations)
               (list :native-exit process-exit :native-record record :receipt-error receipt-error
                     :native-failed (and (or (and process-exit (not (member process-exit '(0 3))))

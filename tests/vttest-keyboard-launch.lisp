@@ -50,7 +50,9 @@
                             "XDG_CONFIG_HOME" "config" "XDG_DATA_HOME" "data"
                             "TMPDIR" "tmp") by #'cddr
          collect (format nil "~a=~a~a" key root name))
-   (list (format nil "LISPTERM_FONT=~a" font) (format nil "VTTEST=~a" binary)
+   (list (format nil "LISPTERM_FONT=~a" font)
+         (format nil "LISPTERM_FONT_EVIDENCE=~afont-evidence/" root)
+         (format nil "VTTEST=~a" binary)
          (format nil "LISPTERM_SBCL=~a" runtime)
          "LISPTERM_VTTEST_EXACT_LABELS=keyboard-cursor,keyboard-keypad"
          "LISPTERM_VTTEST_MODE=record" "LISPTERM_VTTEST_SCALE=1"
@@ -83,7 +85,10 @@
 (load (merge-pathnames "vttest-keyboard-child.lisp" *load-truename*))
 
 (defun launch-keyboard-gate (backend root request-path)
-  "Return frozen launch PLIST, independently joined exit PLIST, diagnostics."
+  "Return frozen launch PLIST, independently joined exit PLIST, diagnostics, and an
+internal font transport PLIST (:directory :pinned-truename :expected-title) for the
+run-level verifier. A nil :expected-title means no preclose title was observed, which
+must refuse font proof."
   (multiple-value-bind (font binary runtime) (native-runtime)
     (let* ((hash (digest request-path))
            (env (keyboard-gate-environment backend root request-path font binary runtime))
@@ -91,7 +96,7 @@
                        (or *keyboard-test-gate* (namestring (truename "tests/vttest-gate.sh")))
                        backend))
            (errors nil) (expected nil) (actual-gate-exit nil))
-      (dolist (name '("home" "cache" "config" "data" "tmp"))
+      (dolist (name '("home" "cache" "config" "data" "tmp" "font-evidence"))
         (sb-posix:mkdir (native-path root name) #o700))
       (when (equal backend "wayland")
         (sb-posix:mkdir (native-path root "wayland-artifacts") #o700))
@@ -125,4 +130,6 @@
           (unless start (push :missing-gate-start errors))
           (unless title (push :missed-preclose-title errors))
           (unless actual-gate-exit (push :missing-gate-exit errors))))
-      (values expected actual-gate-exit errors))))
+      (values expected actual-gate-exit errors
+              (list :directory (native-path root "font-evidence/") :pinned-truename font
+                    :expected-title (getf expected :title))))))

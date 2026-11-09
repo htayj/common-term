@@ -1,5 +1,7 @@
-;;;; Closed native adapter. Missing visual/timing consumers force incomplete.
+;;;; Closed native adapter. Timing and pixel evidence come from native-evidence.
 (in-package #:vttest-keyboard-driver)
+(unless (fboundp 'native-evidence)
+  (load (merge-pathnames "vttest-keyboard-native-evidence.lisp" *load-truename*)))
 
 (defun native-arguments (backend run manifest-path)
   "Validate before any request, stream or child is created."
@@ -28,24 +30,9 @@
               :keyboard-launch-receipt)
         (push :missing-launch-receipt missing))
     missing))
-(defun native-evidence (root)
-  "Derive accepted-byte and original-name evidence from the existing consumers."
-  (let ((checks nil) (evidence nil) (failed nil))
-    (dolist (case +cases+)
-      (let ((label (first case)) (dir (native-path root +recorder+)))
-        (multiple-value-bind (bytes reasons) (case-bytes label dir)
-          (multiple-value-bind (identity originals) (case-identity label dir)
-            (when (or (eq bytes :fail) (eq identity :fail)) (setf failed t))
-            (push (list :label label :bytes bytes :identity identity
-                        :reasons (subseq reasons 0 (min 8 (length reasons)))) evidence)
-            (dolist (original originals)
-              (when (and (not (eq identity :fail)) (member (car original) (capture-ids label) :test #'equal)
-                         (vttest-area::identifier-p (cdr original)))
-                (push (list :scenario label :capture (car original) :name (cdr original)
-                            :pixels :unverified :timing :unverified) checks)))))))
-    (values (nreverse checks) failed (nreverse evidence))))
 (defun native-main (backend run manifest-path)
-  "Internal CLI entry. No consumer of pixels or timing is installed here."
+  "Internal CLI entry. Exit 0 only for :PASS: every check's timing and pixels, both
+aggregates, cleanup and linkage pass with no error. FAIL exits 1, incomplete 3."
   (let ((root nil) (manifest nil) (hash nil))
     ;; All argument/manifest failures are rejected before launch with exit 2.
     (handler-case
@@ -59,7 +46,8 @@
           (request (native-path root "launch-request.sexp"))
           (original nil) (request-hash nil)
           (cleanup nil) (cleanup-state :unverified)
-          (checks nil) (cases nil) (failed nil))
+          (checks nil) (cases nil) (failed nil) (transport nil) (font-proof nil)
+          (scratch nil) (timing :unverified) (pixels :unverified) (status :incomplete))
       (handler-case
           (progn
             (native-put request
@@ -67,7 +55,7 @@
                     :manifest-sha256 hash :exact-labels '("keyboard-cursor" "keyboard-keypad")))
             (setf original (vttest-cursor-driver::bytes request)
                   request-hash (digest request))
-            (multiple-value-setq (expected actual-gate-exit errors)
+            (multiple-value-setq (expected actual-gate-exit errors transport)
               (launch-keyboard-gate backend root request))
             ;; Numeric failure classification is separate from the actual record.
             (when (or (and actual-gate-exit (not (eql (getf actual-gate-exit :exit-code) 0)))
@@ -78,6 +66,18 @@
           (unless (= 3 (vttest-area:problem-code e)) (setf failed t))
           (push (princ-to-string e) errors))
         (error (e) (setf failed t) (push (princ-to-string e) errors)))
+      ;; One lazy font closure per run; it verifies only when a case first calls it.
+      (handler-case
+          (if (fboundp 'make-font-proof)
+              (when transport (setf font-proof (make-font-proof transport root)))
+              (push :missing-font-consumer errors))
+        (error (e) (push (princ-to-string e) errors)))
+      ;; Owned pixel scratch: without it no pixel work runs, never a default directory.
+      (handler-case
+          (let ((dir (native-path root "pixel-scratch/")))
+            (sb-posix:mkdir dir #o700)
+            (setf scratch dir))
+        (error (e) (push (list :pixel-scratch (princ-to-string e)) errors)))
       ;; Independent guards preserve both linkage and original-request diagnostics.
       (when original
         (handler-case
@@ -98,11 +98,26 @@
                 (setf cleanup-state state cleanup projection errors (append errors reasons)))
               (push :missing-cleanup-consumer errors))
         (error (e) (setf failed t) (push (princ-to-string e) errors)))
-      (multiple-value-bind (c bad e) (native-evidence root)
-        (setf checks c failed (or failed bad) cases e))
-      (when (eq cleanup-state :fail) (setf failed t))
+      (multiple-value-bind (c bad e x) (guarded-native-evidence root font-proof scratch)
+        (setf checks c failed (or failed bad) cases e errors (append errors x)))
+      (setf timing (timing-aggregate checks)
+            pixels (handler-case
+                       (if (fboundp 'pixel-aggregate)
+                           (pixel-aggregate (mapcar (lambda (k) (list :label (getf k :scenario)
+                                                                      :id (getf k :capture)
+                                                                      :pixels (getf k :pixels)))
+                                                    checks)
+                                            26)
+                           :unverified)
+                     (error (e) (push (princ-to-string e) errors) :unverified)))
+      (when (or (eq cleanup-state :fail) (eq timing :fail) (eq pixels :fail)) (setf failed t))
+      (setf status (cond (failed :fail)
+                         ((and (null errors) (eq cleanup-state :pass)
+                               (eq timing :pass) (eq pixels :pass))
+                          :pass)
+                         (t :incomplete)))
       (let ((record (list :kind :vttest-keyboard-native :version 1 :backend backend
-                          :manifest-sha256 hash :status (if failed :fail :incomplete)
+                          :manifest-sha256 hash :status status
                           :checks checks)))
         (when cleanup (setf (getf record :cleanup) cleanup))
         (handler-case
@@ -112,8 +127,8 @@
                           (list :gate-exit actual-gate-exit
                                 :errors (subseq errors 0 (min 16 (length errors)))
                                 :cleanup cleanup-state :cases cases
-                                :pixels :unverified :timing :unverified))
+                                :pixels pixels :timing timing))
               (native-put (native-path root +receipt+) record))
           (error (e) (format *error-output* "keyboard-native receipt: ~a~%" e)
             (return-from native-main 1)))
-        (if failed 1 3)))))
+        (cond (failed 1) ((eq status :pass) 0) (t 3))))))

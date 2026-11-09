@@ -23,6 +23,7 @@
 
 (load (merge-pathnames "vttest-keyboard-native-contract.lisp" *load-truename*))
 (load (merge-pathnames "vttest-keyboard-artifacts.lisp" *load-truename*))
+(load (merge-pathnames "vttest-keyboard-timing.lisp" *load-truename*))
 (load (merge-pathnames "vttest-keyboard-manifest.lisp" *load-truename*))
 
 (load (merge-pathnames "vttest-keyboard-cleanup.lisp" *load-truename*))

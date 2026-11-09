@@ -503,7 +503,7 @@ Return readiness and a diagnostic keyword. No display or recorder is loaded."
              (equal png (list (getf external :pixel-width) (getf external :pixel-height)))))
     (error () nil)))
 
-(defun capture-errors (label output events dir desired-scale)
+(defun capture-errors (label output events dir desired-scale &key (barriers nil barriers-p))
   (let ((errors nil) (pauses nil))
     (flet ((bad (control &rest args) (push (apply #'format nil control args) errors)))
       (dolist (e events)
@@ -512,7 +512,9 @@ Return readiness and a diagnostic keyword. No display or recorder is loaded."
                  (safe (and (stringp name) (every (lambda (c) (or (find c "-_0123456789") (and (char>= c #\a) (char<= c #\z)))) name))))
             (if (not safe) (bad "Unsafe/missing capture name")
                 (let* ((s (read-value (merge-pathnames (cat name ".status.sexp") dir)))
-                       (barrier (read-value (merge-pathnames (cat name ".barrier.sexp") dir)))
+                       (barrier (if barriers-p
+                                    (cdr (assoc name barriers :test #'equal))
+                                    (read-value (merge-pathnames (cat name ".barrier.sexp") dir))))
                        (target (getf barrier :target-output))
                        (cols (and (integerp target) (<= 0 target (length output)) (requested-columns output target))))
                   (unless (and cols (eql cols (getf s :columns))

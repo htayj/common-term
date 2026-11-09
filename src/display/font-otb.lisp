@@ -19,19 +19,25 @@
   cmap-offset
   eblc
   ebdt
-  (cache (make-hash-table)))
+  (cache (make-hash-table))
+  ;; Namestring READ-OTB opened, or nil for a font built directly.
+  (path nil))
 
 (defun font-width (f) (bitmap-font-width f))
 
 (defun font-height (f) (bitmap-font-height f))
 
 (defun read-otb (path)
-  (let* ((v
+  (let ((v
           (with-open-file (in path :element-type '(unsigned-byte 8))
             (let ((v (make-array (file-length in) :element-type '(unsigned-byte 8))))
               (read-sequence v in)
-              v)))
-         (tables (make-hash-table :test 'equal)))
+              v))))
+    (parse-otb v path)))
+
+(defun parse-otb (v &optional path)
+  "Decode the OTB octets V, kept as the font's bytes. PATH, if given, is recorded."
+  (let* ((tables (make-hash-table :test 'equal)))
     (dotimes (i (be16 v 4))
       (let ((p (+ 12 (* i 16))))
         (setf (gethash (map 'string #'code-char (subseq v p (+ p 4))) tables)
@@ -42,7 +48,8 @@
           (when (= 4 (be16 v o)) (setf cmap o))))
       (unless cmap (error "Font requires a format 4 Unicode cmap"))
       (make-bitmap-font :bytes v :width (aref v (+ s 18)) :height (aref v (+ s 45)) :ascent
-       (signed8 (aref v (+ s 16))) :cmap-offset cmap :eblc b :ebdt (gethash "EBDT" tables)))))
+       (signed8 (aref v (+ s 16))) :cmap-offset cmap :eblc b :ebdt (gethash "EBDT" tables)
+       :path (and path (namestring path))))))
 
 (defun font-glyph-index (font code)
   (let* ((v (bitmap-font-bytes font))
