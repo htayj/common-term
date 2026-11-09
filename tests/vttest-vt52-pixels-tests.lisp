@@ -1,0 +1,135 @@
+;;;; Synthetic tests for tests/vttest-vt52-pixels.lisp; not native acceptance.
+;;;; Run: .build/deps/bin/sbcl --no-userinit --no-sysinit --non-interactive \
+;;;;        --load tests/vttest-vt52-pixels-tests.lisp
+(load (merge-pathnames "vttest-vt52-sha256.lisp" *load-truename*))
+(load (merge-pathnames "vttest-vt52-pixels.lisp" *load-truename*))
+
+(defpackage #:vttest-vt52-pixels-tests
+  (:use #:cl #:vttest-vt52-pixels)
+  (:local-nicknames (#:o #:vttest-vt52-oracle) (#:s #:vttest-screen-oracle)))
+(in-package #:vttest-vt52-pixels-tests)
+
+(defvar *checks* 0)
+(defvar *failures* 0)
+(defmacro check (name form)
+  `(progn (incf *checks*)
+          (unless (ignore-errors ,form)
+            (incf *failures*) (format t "FAIL ~a~%" ,name))))
+(defmacro refused (name field form)
+  `(check ,name (handler-case (progn ,form nil)
+                  (pixel-refusal (c) (eq ,field (pixel-refusal-field c))))))
+
+(defparameter *font-path*
+  (merge-pathnames "../.build/deps/share/fonts/terminus/ter-u16n.otb" *load-truename*))
+(defparameter *font* (vttest-cursor-oracle:read-bytes *font-path*))
+(defparameter *sha* (vttest-vt52-sha256:sha256-hex *font*))
+(defparameter *snapshot* (o:vt52-snapshot))
+
+(defun raster (scale &key (phase t))
+  (expected-rgba *snapshot* *font* :font-sha256 *sha* :scale scale :blink-phase phase))
+(defun compare (expected actual scale) (compare-frames *snapshot* expected actual :scale scale))
+(defun put-tile (image scale row column tile)
+  (let ((width (* 640 scale)))
+    (dotimes (y (* 16 scale) image)
+      (dotimes (x (* 8 scale))
+        (replace image tile
+                 :start1 (* 4 (+ (* (+ (* (1- row) 16 scale) y) width) (* (1- column) 8 scale) x))
+                 :start2 (* 4 (+ (* (floor y scale) 8) (floor x scale)))
+                 :end2 (+ 4 (* 4 (+ (* (floor y scale) 8) (floor x scale)))))))))
+(defun glyph (code) (vttest-charsets-oracle:admitted-glyph-rows *font* code))
+(defun named (result group) (getf result group))
+(defun failing (result group)
+  (loop for e in (named result group) unless (getf e :pass) collect (getf e :column)))
+(defun all-named-pass (result &rest except)
+  (loop for group in '(:graphics :left :right :above :below :comparison)
+        always (or (member group except) (null (failing result group)))))
+
+(check :font-pin (and (= +font-length+ (length *font*)) (equal +font-sha256+ *sha*)))
+(let ((groups (named-groups *snapshot*)))
+  (check :group-sizes (equal '(32 1 1 34 34 32)
+                             (loop for g in '(:graphics :left :right :above :below :comparison)
+                                   collect (length (getf groups g)))))
+  (check :left-right (equal '((9 30 94) (9 63 32))
+                            (loop for g in '(:left :right) for e = (first (getf groups g))
+                                  collect (list (getf e :row) (getf e :column) (getf e :code)))))
+  (check :comparison-ascii (loop for e in (getf groups :comparison) for byte from #x5f
+                                 always (and (= 4 (getf e :row)) (= byte (getf e :byte) (getf e :code))))))
+;; Normative blank #x5F: U+0020 at row 9 column 31, an empty glyph.
+(let ((g (first (o:graphics-cells *snapshot*))))
+  (check :blank-5f (and (equal '(#x5f 9 31 32) (list (getf g :byte) (getf g :row)
+                                                      (getf g :column) (getf g :code)))
+                        (every #'zerop (glyph 32)))))
+
+(dolist (scale '(1 2))
+  (let* ((expected (raster scale)) (good (compare expected (copy-seq expected) scale)))
+    (check (list :pass scale) (and (getf good :pass) (zerop (getf good :different-pixels))
+                                   (= (* 640 384 scale scale) (getf good :compared-pixels))
+                                   (all-named-pass good) (= 32 (length (named good :graphics)))))
+    (check (list :opaque scale) (loop for p from 3 below (length expected) by 4
+                                      always (= 255 (aref expected p))))
+    ;; Graphics glyph #x60 replaced by the pinned ASCII #x60 glyph, after proving they differ.
+    (let ((graphics-code (s:cell-code (o:snapshot-cell *snapshot* 9 32)))
+          (bad (copy-seq expected)))
+      (check (list :distinguishable scale) (not (equalp (glyph graphics-code) (glyph #x60))))
+      (put-tile bad scale 9 32 (s:cell-rgba (s:make-cell :code #x60) (glyph #x60) :blink-phase t))
+      (let ((r (compare expected bad scale)))
+        (check (list :glyph-fails scale)
+               (and (not (getf r :pass)) (equal '((9 32)) (getf r :different-cells))
+                    (equal '(32) (failing r :graphics)) (all-named-pass r :graphics)
+                    (zerop (getf r :outside-named-pixels))
+                    (= (getf r :different-pixels)
+                       (getf (find 32 (named r :graphics) :key (lambda (e) (getf e :column)))
+                             :different-pixels))))))
+    ;; One boundary pixel (left cell, row 9 column 30) and one unnamed pixel.
+    (let ((bad (copy-seq expected)) (p (* 4 (+ (* 8 16 scale 640 scale) (* 29 8 scale)))))
+      (setf (aref bad p) (logxor 1 (aref bad p)))
+      (let ((r (compare expected bad scale)))
+        (check (list :boundary-fails scale)
+               (and (not (getf r :pass)) (= 1 (getf r :different-pixels))
+                    (equal '(30) (failing r :left)) (all-named-pass r :left)))))
+    (let ((bad (copy-seq expected)) (p (* 4 (+ (* 19 16 scale 640 scale) (* 4 8 scale)))))
+      (setf (aref bad (1+ p)) (logxor 1 (aref bad (1+ p))))
+      (let ((r (compare expected bad scale)))
+        (check (list :outside-fails scale)
+               (and (not (getf r :pass)) (all-named-pass r)
+                    (= 1 (getf r :outside-named-pixels)) (equal '((20 5)) (getf r :different-cells))))))
+    ;; Expected coordinates shifted one column right on row 9.
+    (let ((shifted (copy-seq expected)) (width (* 640 scale 4)))
+      (dotimes (y (* 16 scale))
+        (let ((start (* width (+ (* 8 16 scale) y))))
+          (replace shifted expected :start1 (+ start (* 32 scale)) :end1 (+ start width)
+                                    :start2 start)))
+      (let ((r (compare shifted expected scale)))
+        (check (list :shift-fails scale)
+               (and (not (getf r :pass)) (member 31 (failing r :graphics))
+                    (member 30 (failing r :left))))))
+    (refused (list :short scale) :actual (compare expected (subseq expected 4) scale))
+    (let ((bad (copy-seq expected)))
+      (setf (aref bad 3) 254)
+      (refused (list :alpha scale) :actual (compare expected bad scale))
+      (refused (list :alpha-expected scale) :expected (compare bad expected scale)))))
+
+;; The cursor cell, row 12 column 14, is the only difference between phases.
+(let ((r (compare (raster 1 :phase t) (raster 1 :phase nil) 1)))
+  (check :cursor-cell (and (equal '((12 14)) (getf r :different-cells))
+                           (= 128 (getf r :different-pixels) (getf r :outside-named-pixels)))))
+(check :cursor-meta (equal '(12 14) (cursor-cell *snapshot*)))
+(let ((one (raster 1)))
+  (refused :scale3-compare :scale (compare one one 3))
+  (refused :scale-missing :scale (compare-frames *snapshot* one one))
+  (refused :scale2-wrong-size :expected (compare one one 2)))
+(refused :scale3-raster :scale (raster 3))
+(refused :phase-missing :blink-phase (expected-rgba *snapshot* *font* :font-sha256 *sha* :scale 1))
+(refused :font-sha :font-sha256 (expected-rgba *snapshot* *font* :font-sha256 "0" :scale 1
+                                                                 :blink-phase t))
+(refused :font-bytes :font (expected-rgba *snapshot* (subseq *font* 1) :font-sha256 *sha*
+                                                     :scale 1 :blink-phase t))
+(check :foreign-snapshot (handler-case
+                             (progn (expected-rgba (vttest-charsets-oracle:character-set-snapshot)
+                                                   *font* :font-sha256 *sha* :scale 1
+                                                   :blink-phase t) nil)
+                           (error () t)))
+
+(format t "VT52 pixel synthetic tests: ~d checks, ~d failures (not native acceptance)~%"
+        *checks* *failures*)
+(unless (zerop *failures*) (sb-ext:exit :code 1))
