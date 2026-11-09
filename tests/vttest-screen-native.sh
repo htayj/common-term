@@ -246,7 +246,7 @@ screen_native_main() {
     local root=/home/taylor/projects/lispterm
     cd "$root"
     # Pin precisely the source chain used by this single invocation, plus its manifest.
-    sha256sum -- "$manifest" tests/verify.sh tests/vttest-area.lisp tests/vttest-screen-driver.lisp tests/vttest-screen-manifest.lisp tests/vttest-screen-build.sh tests/vttest-screen-native.sh tests/vttest-screen-native-contract.lisp tests/vttest-screen-recorder.lisp tests/vttest-screen-frame.lisp tests/vttest-screen-oracle.lisp tests/vttest-screen-pixels.lisp tests/vttest-cursor-oracle.lisp tests/vttest-screen-wire.lisp tests/vttest-selection.lisp src/host.lisp src/window.lisp > "$native/execution-inputs.sha256"
+    sha256sum -- "$manifest" tests/verify.sh tests/vttest-area.lisp tests/vttest-screen-driver.lisp tests/vttest-screen-manifest.lisp tests/vttest-screen-build.sh tests/vttest-screen-native.sh tests/vttest-screen-native-contract.lisp tests/vttest-screen-blink-contract.lisp tests/vttest-screen-blink-native.lisp tests/vttest-screen-blink-selection.lisp tests/vttest-screen-blink-timing.lisp tests/vttest-screen-recorder.lisp tests/vttest-screen-frame.lisp tests/vttest-screen-oracle.lisp tests/vttest-screen-pixels.lisp tests/vttest-cursor-oracle.lisp tests/vttest-screen-wire.lisp tests/vttest-selection.lisp src/host.lisp src/window.lisp > "$native/execution-inputs.sha256"
     local bash=/nix/store/kwyi4bq5s2qgwbhz6cs4gjy57c2zdxws-bash-interactive-5.3p20/bin/bash
     local sbcl=/nix/store/rnyqmmrpp09r6rn7avh77bjkdaaxs0cm-sbcl-with-packages/bin/sbcl
     local archive=$root/.build/evidence/cursor-x11-first-screen-20261106-a/vttest-20251205.tgz

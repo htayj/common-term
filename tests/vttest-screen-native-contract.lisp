@@ -2,6 +2,7 @@
 ;;;; This module has no load-time process, desktop, or application effects.
 (require :sb-posix)
 (load (merge-pathnames "vttest-screen-frame.lisp" *load-truename*))
+(load (merge-pathnames "vttest-screen-blink-contract.lisp" *load-truename*))
 (defpackage :vttest-screen-native-contract
   (:use :cl)
   (:export :read-data :write-data :reference :validate-recorder :validate-native
@@ -10,21 +11,27 @@
 
 (defun need (test &optional (reason "Native contract refusal"))
   (unless test (error "~a" reason)))
-(defun tree (value)
-  "Bound the data before traversing a plist, including reader-label cycles."
+(defparameter *receipt-cons-limit* 65536)
+(defun tree (value &optional (limit *receipt-cons-limit*))
+  "Bound proper, unshared data before any plist, equality or frame traversal."
   (let ((seen (make-hash-table :test 'eq)) (nodes 0))
     (labels ((walk (x depth)
-               (need (and (< (incf nodes) 65536) (< depth 128)) "Receipt too large")
+               (need (< depth 128) "Receipt too deep")
                (typecase x
-                 (cons (need (not (gethash x seen)) "Shared/cyclic receipt")
-                       (setf (gethash x seen) t)
-                       (walk (car x) (1+ depth)) (walk (cdr x) (1+ depth)))
-                 (string (need (<= (length x) 65536)))
-                 ((or boolean keyword integer) nil)
+                 (cons
+                  (loop for tail = x then (cdr tail) while (consp tail) do
+                    (need (<= (incf nodes) limit) "Receipt too large")
+                    (need (not (gethash tail seen)) "Shared/cyclic receipt")
+                    (setf (gethash tail seen) t)
+                    (walk (car tail) (1+ depth))
+                    finally (need (null tail) "Improper receipt list")))
+                 (string (need (<= (length x) 65536) "Oversize receipt string"))
+                 ((or boolean keyword integer ratio) nil)
                  (t (error "Unsupported receipt object")))))
       (walk value 0)))
   value)
 (defun properties (value allowed &optional (required allowed))
+  (tree value)
   (need (and (listp value) (evenp (length value))) "Improper properties")
   (let ((seen nil))
     (loop for key in value by #'cddr do
@@ -172,6 +179,7 @@ scale exported in the environment must name the same scale."
 SCALE is the manifest-selected run scale. Version 2 records carry :SCALE and
 physical :WIDTH/:HEIGHT; native receipt dimensions are logical. Legacy version 1
 records, without :SCALE, are accepted only at scale 1."
+  (tree check)
   (let* ((n (getf check :pause)) (stem (format nil "recorder/pause-~2,'0d-" n))
          (r (read-data (local-path root (getf (getf check :comparison) :path))))
          (logical-width (if (member n '(3 5)) 1056 640))
@@ -202,6 +210,11 @@ records, without :SCALE, are accepted only at scale 1."
               do (check-reference ref root (concatenate 'string stem suffix)))
         (destructuring-bind (before ready pre final native)
             (mapcar (lambda (ref) (read-data (local-path root (getf ref :path)))) bracket)
+          (dolist (status (list before ready pre final))
+            (tree status 4096)
+            (need (and (listp status) (evenp (length status))) "Malformed status plist")
+            (when (<= 13 n 15)
+              (need (vttest-screen-blink-selection:well-formed-p status) "Malformed blink status")))
           (need (equal native (getf check :native)) "Comparison native mismatch")
           (when (eql 2 version)
             (need (and (eql scale (getf native :scale)) (eql logical-width (getf native :width))
@@ -210,7 +223,33 @@ records, without :SCALE, are accepted only at scale 1."
           (need (and (member :phase r) (eq (getf r :phase) (getf ready :blink-phase))) "Comparison phase mismatch")
           (let* ((request (read-data (local-path root (concatenate 'string stem "request.sexp"))))
                  (target (getf request :target)))
+            (let ((status (getf request :status)))
+              (tree status 4096)
+              (need (and (listp status) (evenp (length status))) "Malformed request status")
+              (when (<= 13 n 15)
+                (need (vttest-screen-blink-selection:well-formed-p status) "Malformed request blink status")))
             (need (and (equal ready (getf request :status)) (eql n (getf request :pause))) "Comparison request mismatch")
+            ;; Replay original blink sidecars before lower frame/timing traversal.
+            (multiple-value-bind (phase required)
+                (vttest-screen-blink-native:expected-blink-phase n)
+              (when required
+                (need (and (member :phase r) (eq phase (getf r :phase)))
+                      "Required blink comparison phase mismatch")
+                (flet ((sidecar (suffix)
+                         (let ((name (format nil "pause-~2,'0d-~a" n suffix))
+                               (*receipt-cons-limit* 1048576))
+                           (need (and (listp (getf check :evidence))
+                                      (member name (getf check :evidence) :test #'equal))
+                                 "Unlisted blink evidence")
+                           (read-data (local-path root (concatenate 'string "recorder/" name))))))
+                  (multiple-value-bind (ok errors)
+                      (vttest-screen-blink-contract:validate-blink-capture
+                       n :selection (sidecar "blink-selection.sexp")
+                         :chain (and (= n 15) (sidecar "blink-chain.sexp"))
+                         :ready ready :pre pre :final final :target target
+                         :comparison-phase (getf r :phase)
+                         :comparison-phase-present (and (member :phase r) t))
+                    (need ok (format nil "Blink proof refusal ~s" errors))))))
             (vttest-screen-frame:validate-frame before ready pre final native :pause n :target target
               :blink-content (if (>= n 13) t nil) :endpoint nil :ack-output (getf request :ack-output)
               :surface-id (getf request :surface-id) :scale scale))))
@@ -275,6 +314,10 @@ records, without :SCALE, are accepted only at scale 1."
         (check-reference (getf c :comparison) root
                          (format nil "recorder/pause-~2,'0d-comparison.sexp" (getf c :pause)))
         (when root (validate-comparison c root scale)))
+      ;; A blink pause's stored PASS stands only once its original records are replayed.
+      (when (and (<= 13 (getf c :pause) 15)
+                 (or (eq :pass (getf c :timing)) (eq :pass (getf c :pixels))))
+        (need (and root (eq :pass (getf c :pixels))) "Blink PASS without replayed proof"))
       (when (member :target c) (need (eq :recognized-navigation-only (getf c :target))))
       (when (member :reason c) (need (stringp (getf c :reason))))
       (when (getf c :native)
@@ -492,6 +535,7 @@ records, without :SCALE, are accepted only at scale 1."
       (properties u '(:path :ownership))
       (need (and (stringp (getf u :path)) (eq :unestablished (getf u :ownership)))))
     (when (eq :pass (getf record :status))
+      (need root "Native PASS without original proof replay")
       (need (and (null abort) (eq :complete (getf f :state)) (eql 0 (getf f :client-exit))
                  (eq :pass (getf record :cleanup)) (eq :pass (getf record :build))
                  (= 15 (getf record :attempted) (getf record :reached) (getf record :captured))

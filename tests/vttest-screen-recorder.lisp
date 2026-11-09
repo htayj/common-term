@@ -6,6 +6,7 @@
 (load (merge-pathnames "vttest-screen-oracle.lisp" *load-truename*))
 (load (merge-pathnames "vttest-screen-native-contract.lisp" *load-truename*))
 (load (merge-pathnames "vttest-screen-pixels.lisp" *load-truename*))
+(load (merge-pathnames "vttest-screen-blink-native.lisp" *load-truename*))
 (defpackage #:vttest-screen-recorder (:use #:cl))
 (in-package #:vttest-screen-recorder)
 (defparameter *root* (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_VTTEST_RUN_ROOT")))
@@ -159,6 +160,15 @@
         :blink-phase (getf status :blink-phase) :blink-on-required (= n 14)
         :blink-phase-match (or (/= n 14) (eq t (getf status :blink-phase)))))
 
+(defun checked-poll-status (status n stage)
+  "Refuse malformed poll trees before traversal; no phase or freshness requirement."
+  (unless (and (vttest-screen-blink-selection::finite-tree-p status 4096)
+               (consp status)
+               (vttest-screen-frame::proper-plist-p status)
+               (vttest-screen-frame::proper-plist-p (getf status :geometry)))
+    (error "Malformed status poll at pause ~d stage ~s" n stage))
+  status)
+
 (defun await-target (host snapshot n stage)
   ;; Each saved component comes from the SAME candidate evaluation that supplied
   ;; the predicate result. Status, grid and cursor reads are sequential, not atomic.
@@ -169,7 +179,8 @@
                      :edge edge candidate))))
       (await host
         (lambda ()
-          (let* ((status (lispterm:status host)) (actual (grid host))
+          (let* ((status (checked-poll-status (lispterm:status host) n stage))
+                 (actual (grid host))
                  (session (lispterm::host-session host))
                  (cursor (sb-thread:with-mutex ((lispterm::session-lock session))
                            (let ((screen (lispterm::session-screen session)))
@@ -367,17 +378,97 @@
 (defun send (host text) (event :driver :bytes (map 'vector #'char-code text)) (lispterm:send-input host text))
 (defun pause-name (pause suffix) (format nil "pause-~2,'0d-~a" pause suffix))
 
+(defun blink-status-fn (host)
+  "Raw status polls for blink selection; native failure and host errors still abort."
+  (lambda () (check-native-failure) (check-host host) (lispterm:status host)))
+
+(defun await-blink-target (host snapshot)
+  "Wait for the settled grid at the recorder's independently counted output target."
+  (let ((text (expected-text snapshot)))
+    (await host (lambda ()
+                  (let ((target *output*) (st (lispterm:status host)))
+                    (and (vttest-screen-blink-selection:well-formed-p st)
+                         (vttest-screen-frame:settled-p st)
+                         (eql target *output*) (eql target (getf st :bytes-received))
+                         (eql 0 (getf st :input-pending))
+                         (string= text (grid host)) target))))))
+
+(defun select-capture-phase (host snapshot n)
+  "For a pause with a required blink phase, return its selection plist, else NIL.
+At the chain pause, select a fresh S0 of any phase and collect the toggle chain seeded
+with it. Then select a fresh S1 of the required phase just before BEFORE and READY.
+Every raw poll is kept in the sidecars; any refusal signals and is never retried."
+  (multiple-value-bind (phase required-p) (vttest-screen-blink-native:expected-blink-phase n)
+    (when required-p
+      (let ((status-fn (blink-status-fn host))
+            (target (await-blink-target host snapshot))
+            (chain nil))
+        (when (eql n vttest-screen-blink-native:*chain-pause*)
+          (multiple-value-bind (s0 s0-polls)
+              (vttest-screen-blink-native:select-fresh-phase status-fn :any target)
+            (let ((statuses (vttest-screen-blink-native:collect-blink-chain status-fn :seed s0)))
+              (setf chain (vttest-screen-blink-native:blink-chain-record n s0-polls statuses))
+              (save (pause-name n "blink-chain.sexp") chain))))
+        (multiple-value-bind (s1 s1-polls)
+            (vttest-screen-blink-native:select-fresh-phase status-fn phase target)
+          (let ((selection (vttest-screen-blink-native:blink-selection-record n phase target s1-polls)))
+            (save (pause-name n "blink-selection.sexp") selection)
+            (list :phase phase :target target :selected s1 :selection selection :chain chain)))))))
+
+(defun read-blink-sidecar (n suffix expected)
+  "The stored sidecar, refused unless it reads back EQUAL to the recorded value."
+  (let ((stored (read-value (pause-name n suffix))))
+    ;; Bound the complete sidecar before EQUAL; status validators impose their
+    ;; separate 4096-cons bound on each receipt. Raw poll histories are larger.
+    (unless (and (vttest-screen-blink-selection::finite-tree-p stored 1048576)
+                 (equal stored expected))
+      (error "Blink sidecar ~a differs from its recorded value" (pause-name n suffix)))
+    stored))
+
+(defun validate-blink-capture (n blink ready pre final)
+  "Refuse the capture unless READY, PRE and FINAL hold the required phase and the stored
+selection, and at the chain pause the stored chain, prove it against the original READY."
+  (unless (every #'vttest-screen-blink-selection:well-formed-p (list ready pre final))
+    (error "Malformed blink capture status at pause ~d" n))
+  (let ((phase (getf blink :phase)) (target (getf blink :target))
+        (selection (read-blink-sidecar n "blink-selection.sexp" (getf blink :selection))))
+    (multiple-value-bind (ok errors)
+        (vttest-screen-blink-timing:blink-capture-ready-p ready pre final :phase phase)
+      (unless ok (error "Blink capture refusal at pause ~d: ~s" n errors)))
+    (multiple-value-bind (selected errors)
+        (vttest-screen-blink-native:validate-selection-record selection n ready target)
+      (unless selected (error "Blink selection refusal at pause ~d: ~s" n errors)))
+    (when (eql n vttest-screen-blink-native:*chain-pause*)
+      (multiple-value-bind (ok errors)
+          (vttest-screen-blink-native:validate-blink-proof
+           n (read-blink-sidecar n "blink-chain.sexp" (getf blink :chain)) selection ready target)
+        (unless ok (error "Blink proof refusal at pause ~d: ~s" n errors))))))
+
+(defun blink-evidence (n blink)
+  "Blink sidecar names for a check's :EVIDENCE."
+  (when blink
+    (cons (pause-name n "blink-selection.sexp")
+          (when (getf blink :chain) (list (pause-name n "blink-chain.sexp"))))))
+
 (defun capture-hold (host n snapshot)
   (let* ((text (expected-text snapshot))
          (content (getf (vttest-screen-oracle:snapshot-metadata snapshot) :blink-visible))
+         (blink (select-capture-phase host snapshot n))
          (before (await-target host snapshot n :capture-hold))
-         (target (getf before :bytes-received)) (ready nil) (pre nil) (final nil) (native nil))
+         (target (if blink (getf blink :target) (getf before :bytes-received)))
+         (ready nil) (pre nil) (final nil) (native nil))
+    (when (and blink (not (vttest-screen-blink-selection:well-formed-p before)))
+      (error "Malformed blink BEFORE at pause ~d" n))
     (save (pause-name n "grid.sexp") (grid host))
     (save (pause-name n "before.sexp") before)
+    (when (and blink (not (eql target (getf before :bytes-received))))
+      (error "BEFORE target differs from the blink selection target"))
     (event :source-endpoint :status :unverified :reason :full-session-wire-not-yet-admitted)
     (lispterm:invalidate host)
     (setf ready (await host (lambda ()
                              (let ((st (lispterm:status host)))
+                               (when (and blink (not (vttest-screen-blink-selection:well-formed-p st)))
+                                 (error "Malformed blink READY poll at pause ~d" n))
                                (when (> (getf st :frames) (1+ (getf before :frames)))
                                  (error "More than one fresh frame"))
                                (and (= (getf st :frames) (1+ (getf before :frames)))
@@ -392,6 +483,8 @@
                  (eql 0 (getf ready :input-pending))
                  (string= text (grid host)) (cursor-matches-p host snapshot))
       (error "Fresh READY target/phase/content/settlement refusal"))
+    (when (and blink (not (vttest-screen-blink-native:ready-linked-p (getf blink :selected) ready)))
+      (error "Blink selection S1 is not linked to the original READY"))
     (let* ((g (getf ready :geometry))
            (window (if (eq *backend* :x11) (getf g :window-id) *surface*)))
       (publish-request-value (pause-name n "request.sexp")
@@ -411,6 +504,8 @@
                      (eql window (getf receipt (if (eq *backend* :x11) :window-id :surface-id))))
           (error "Native READY identity/geometry refusal")))
       (setf pre (lispterm:status host))
+      (when (and blink (not (vttest-screen-blink-selection:well-formed-p pre)))
+        (error "Malformed blink PRE at pause ~d" n))
       (save (pause-name n "pre.sexp") pre)
       (unless (and (equal ready pre) (= target *output*) (string= text (grid host))
                    (cursor-matches-p host snapshot)
@@ -419,6 +514,8 @@
       (touch (pause-name n "go"))
       (await host (lambda () (probe-file (path (pause-name n "done")))))
       (setf final (lispterm:status host))
+      (when (and blink (not (vttest-screen-blink-selection:well-formed-p final)))
+        (error "Malformed blink FINAL at pause ~d" n))
       (save (pause-name n "final.sexp") final)
       (setf native (read-value (pause-name n "native.sexp"))))
     (vttest-screen-frame:validate-frame before ready pre final native
@@ -427,13 +524,21 @@
     (unless (and (= target *output*) (string= text (grid host)) (cursor-matches-p host snapshot)
                  (or (eq *backend* :x11) (completed-wayland-frame-p final target)))
       (error "Final source target changed"))
+    (when blink (validate-blink-capture n blink ready pre final))
     (let ((comparison (vttest-screen-pixels:compare-capture
                        (namestring *root*) n snapshot before ready pre final native target *ack* *surface*
                         :scale *scale*)))
+      (when blink
+        (multiple-value-bind (key phase)
+            (get-properties (vttest-screen-native-contract:read-data (path (pause-name n "comparison.sexp")))
+                            '(:phase))
+          (unless (and key (eq phase (getf blink :phase)))
+            (error "Comparison phase differs from the required blink phase at pause ~d" n))))
       (list :pause n :pixels :pass :bytes :unverified :timing :pass
             :frame :pass :target :recognized-navigation-only :native native :comparison comparison
-            :evidence (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp" "presentation.sexp")
-                            collect (pause-name n suffix))))))
+            :evidence (append (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp" "native.sexp" "presentation.sexp")
+                                    collect (pause-name n suffix))
+                              (blink-evidence n blink))))))
 
 (defun raw (name)
   (with-open-file (s (path name) :element-type '(unsigned-byte 8))
