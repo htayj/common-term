@@ -114,6 +114,18 @@ reap_direct_children() {
     wait_direct_child "$pid" 2>/dev/null || true
   done
 }
+# Every mode: one line per direct child with its saved wait. Status 127, no wait
+# or a conflicting identity is unknown and fails cleanup.
+log_direct_child_waits() {
+  local pid result unknown=0
+  for pid in "${!direct_children[@]}"; do
+    result=waited
+    if [[ ! -v reaped[$pid] || ${reaped[$pid]} == 127 || -v identity_conflicts[$pid] ]]; then result=unknown unknown=1; fi
+    printf 'WAIT role=%s pid=%s start=%s status=%s result=%s\n' "${roles[$pid]:-unlabeled}" "$pid" \
+      "${owned[$pid]:-unknown}" "${reaped[$pid]:-none}" "$result" >> "$art/cleanup.log" || unknown=1
+  done
+  ((unknown == 0))
+}
 sexp_string() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
 sexp_string_or_nil() { if [[ -n $1 ]]; then sexp_string "$1"; else printf nil; fi; }
 # Runtime directory left after close: none, removed or retained.
@@ -413,6 +425,9 @@ cleanup() {
     if private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
   fi
   if [[ $stopped == 1 && $backend == x11 ]] && private_runtime "$runtime"; then rm -rf -- "$runtime"; fi
+  # Every mode: wait exited direct children once and log each saved status.
+  reap_direct_children
+  log_direct_child_waits || { code=1; echo 'Direct child wait status unknown' >&2; }
   # Adapter mode only: after close, reaping and runtime cleanup, before hashing.
   if [[ -n $artifact_root ]] && ! fixture_cleanup_receipt "$stop_status"; then
     code=1; echo 'Cleanup receipt not written or cleanup not verified' >&2
