@@ -169,6 +169,35 @@
     (error "Malformed status poll at pause ~d stage ~s" n stage))
   status)
 
+(defun render-state (host status)
+  "Sample pending render causes and cursor under the session lock.
+The status frame and published geometry must belong to this same rendered
+candidate. SETTLED-P separately checks geometry readiness."
+  (let ((session (lispterm::host-session host)))
+    (sb-thread:with-mutex ((lispterm::session-lock session))
+      (let* ((screen (lispterm::session-screen session))
+             (cursor (list (lispterm.engine:cursor-row screen)
+                           (lispterm.engine:cursor-column screen)
+                           (nerimux/terminal:screen-cursor-visible screen)))
+             (frames (lispterm::session-frames session))
+             (forced (lispterm::session-force-frame session))
+             (dirty (lispterm.engine:dirty-p screen))
+             (cursor-current (equal cursor (lispterm::session-last-cursor session)))
+             (frame-current (eql frames (getf status :frames)))
+             (rid (getf (getf status :geometry) :request-id))
+             (egen (getf status :engine-geometry-generation))
+             (generation (lispterm::session-geometry-generation session))
+             (geometry-current
+               (and (integerp rid) (eql rid egen) (eql egen generation)
+                    (equal (getf status :geometry)
+                           (lispterm::session-geometry-status session)))))
+        (list :render-quiescent (and (not forced) (not dirty) cursor-current frame-current geometry-current)
+              :render-frames frames :render-forced forced :render-dirty dirty
+              :render-cursor-current cursor-current :render-frame-current frame-current
+              :render-geometry-request rid :render-engine-generation egen
+              :render-session-generation generation :render-geometry-current geometry-current
+              :cursor (list :row (1+ (first cursor)) :column (1+ (second cursor))))))))
+
 (defun await-target (host snapshot n stage)
   ;; Each saved component comes from the SAME candidate evaluation that supplied
   ;; the predicate result. Status, grid and cursor reads are sequential, not atomic.
@@ -181,18 +210,15 @@
         (lambda ()
           (let* ((status (checked-poll-status (lispterm:status host) n stage))
                  (actual (grid host))
-                 (session (lispterm::host-session host))
-                 (cursor (sb-thread:with-mutex ((lispterm::session-lock session))
-                           (let ((screen (lispterm::session-screen session)))
-                             (list :row (1+ (lispterm.engine:cursor-row screen))
-                                   :column (1+ (lispterm.engine:cursor-column screen))))))
-                 (details (predicate-details text actual
+                 (render (render-state host status))
+                 (cursor (getf render :cursor))
+                 (details (append render (predicate-details text actual
                             (getf (vttest-screen-oracle:snapshot-metadata snapshot) :cursor) cursor
                             (getf (vttest-screen-oracle:snapshot-metadata snapshot) :blink-visible)
-                            status n stage))
+                            status n stage)))
                  (matches (if (eq stage :grid-wait) (getf details :grid-match)
                               (every (lambda (key) (getf details key))
-                                     '(:grid-match :cursor-match :settled :output-match :input-empty
+                                     '(:render-quiescent :grid-match :cursor-match :settled :output-match :input-empty
                                        :blink-content-match :frame-complete :blink-phase-match)))))
             (setf candidate (append (list :candidate-result (not (null matches))
                                          :candidate-ticks (get-internal-real-time)
@@ -466,12 +492,17 @@ selection, and at the chain pause the stored chain, prove it against the origina
     (event :source-endpoint :status :unverified :reason :full-session-wire-not-yet-admitted)
     (lispterm:invalidate host)
     (setf ready (await host (lambda ()
-                             (let ((st (lispterm:status host)))
+                             (let* ((st (lispterm:status host))
+                                     (render (render-state host st)))
+                                (apply #'observe-once
+                                       (list :predicate n :ready (getf render :render-quiescent))
+                                       :predicate :stage :ready render)
                                (when (and blink (not (vttest-screen-blink-selection:well-formed-p st)))
                                  (error "Malformed blink READY poll at pause ~d" n))
                                (when (> (getf st :frames) (1+ (getf before :frames)))
                                  (error "More than one fresh frame"))
                                (and (= (getf st :frames) (1+ (getf before :frames)))
+                                    (getf render :render-quiescent)
                                     (or (eq *backend* :x11) (completed-wayland-frame-p st target)) st)))))
     (save (pause-name n "ready.sexp") ready)
     (save (pause-name n "presentation.sexp") (list :ack-output *ack* :witness *presentation-witness*))
