@@ -114,5 +114,13 @@
         (check (eq :refuse (getf (gate o e) :state))))
       (let* ((o (bytes *outer*)) (e (wires o (list (length o)) 99)))
         (check (eq :refuse (getf (gate o e 1) :state))))
+      (let* ((o (bytes (format nil "The screen should be cleared, and have a centered~%rectangle of \"*\"s with \"!\"s on the inside to the~%left and right. Only this, and~%Push <RETURN>")))
+             (n (length o)))
+        (state :ready o :first-hold)
+        (loop for cut from 1 below n do
+          (check (eq :ready (getf (gate o (wires o (list cut n)) 0 :first-hold) :state))))
+        (loop for end from 0 below n do (state :pending (subseq o 0 end) :first-hold))
+        (state :pending (reverse o) :first-hold)
+        (check (eq :refuse (getf (gate o (wires o (list n) 99) 0 :first-hold) :state))))
       (format t "~D navigation checks passed.~%" checks)
       checks)))

@@ -52,7 +52,7 @@ A pending result never authorizes input. Invalid evidence refuses."
                (list :state state :reasons reasons :stage stage :start start
                      :markers (reverse markers)))
              (refuse (reason) (result :refuse (list reason))))
-      (unless (and (member stage '(:outer-hold :main-menu))
+      (unless (and (member stage '(:first-hold :outer-hold :main-menu))
                    (integerp owned-child) (plusp owned-child)
                    (octets-p output) (<= (length output) 1048576)
                    (integerp start) (<= 0 start (length output)))
@@ -82,14 +82,21 @@ A pending result never authorizes input. Invalid evidence refuses."
               (setf offset b))))
         (unless (and (null tail) (= offset (length output)))
           (return-from vt52-navigation-check (refuse :wire-coverage))))
-      (let* ((spec (if (eq stage :outer-hold)
-                       '((:identify . "Test of terminal response to IDENTIFY command")
-                         (:response . "Response was ")
-                         (:ok . " -- OK (means VT100 emulating VT52)")
-                         (:prompt . "Push <RETURN>"))
-                       '((:menu . "Choose test type:")
-                         (:vt52 . "7. Test of VT52 mode")
-                         (:choice . "Enter choice number (0 - 12): "))))
+      (let* ((spec (case stage
+                       (:first-hold
+                        '((:cleared . "The screen should be cleared, and have a centered")
+                          (:rectangle . "rectangle of \"*\"s with \"!\"s on the inside to the")
+                          (:sides . "left and right. Only this, and")
+                          (:prompt . "Push <RETURN>")))
+                       (:outer-hold
+                        '((:identify . "Test of terminal response to IDENTIFY command")
+                          (:response . "Response was ")
+                          (:ok . " -- OK (means VT100 emulating VT52)")
+                          (:prompt . "Push <RETURN>")))
+                       (:main-menu
+                        '((:menu . "Choose test type:")
+                          (:vt52 . "7. Test of VT52 mode")
+                          (:choice . "Enter choice number (0 - 12): ")))))
              (position start)
              (probe (and (eq stage :outer-hold)
                          (search (map 'vector #'char-code
