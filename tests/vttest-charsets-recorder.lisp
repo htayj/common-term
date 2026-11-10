@@ -362,7 +362,7 @@ No pause ordering beyond equality with the recorder's current pause is inferred.
         (with-open-file (s (path (if outp "output.raw" "input.raw")) :direction :output
                            :element-type '(unsigned-byte 8) :if-exists :append :if-does-not-exist :create)
           (write-sequence bytes s))
-        (if (and outp (eq *profile* :vt52))
+          (if (eq *profile* :vt52)
             ;; READ-PTY comes from this actual PTY-READ invocation, not global PID state.
             (let* ((process (and read-pty (lispterm.pty:pty-process read-pty)))
                    (pid (and process (lispterm.pty:process-pid process))))
@@ -463,7 +463,7 @@ No pause ordering beyond equality with the recorder's current pause is inferred.
                   (lambda (n &rest more)
                     (let ((returned (get-internal-real-time)))
                       (when (plusp n)
-                        (multiple-value-bind (seq start end) (wire :wire-in (subseq bytes 0 n) *write-source*)
+                          (multiple-value-bind (seq start end) (wire :wire-in (subseq bytes 0 n) *write-source* pty)
                           (when *primary-write*
                             (observe-once :primary-accepted :primary-reply-accepted
                                           :write-entry-ticks entry :write-return-ticks returned
@@ -744,12 +744,13 @@ No pause ordering beyond equality with the recorder's current pause is inferred.
       (lambda ()
         (multiple-value-bind (output events current) (vt52-output-snapshot)
           (let ((proof (vttest-vt52-navigation:vt52-navigation-check
-                         output events (getf checkpoint :start) (getf current :child-pid) :main-menu)))
+                          output events (getf checkpoint :start) (getf current :child-pid) :first-hold)))
             (when (eq :refuse (getf proof :state))
-              (error 'native-abort :reason "VT52 first-hold provenance refused")))
+              (error 'native-abort :reason "VT52 first-hold provenance refused"))
           (let ((position (getf checkpoint :start)) (text (grid host))
                 (status (observed-status host)))
-            (and (eql (getf checkpoint :child-pid) (getf current :child-pid))
+              (and (eq :ready (getf proof :state))
+                   (eql (getf checkpoint :child-pid) (getf current :child-pid))
                  (every (lambda (marker)
                           (destructuring-bind (row column string) marker
                             (let* ((raw (map 'vector #'char-code string))
@@ -762,9 +763,10 @@ No pause ordering beyond equality with the recorder's current pause is inferred.
                  (vttest-screen-frame:settled-p status)
                  (eql (getf current :start) (getf status :bytes-received))
                  (eql 0 (getf status :input-pending))
-                 (list :stage :first-hold :checkpoint (copy-list checkpoint)
-                       :end (length output) :event (getf current :event)
-                       :markers (copy-tree markers) :status status))))))))
+                   (append proof (list :checkpoint (copy-list checkpoint)
+                        :end (length output) :event (getf current :event)
+                        :input (getf current :input) :child-pid (getf current :child-pid)
+                        :ticks (getf current :ticks)))))))))))
 (defun run-main ()
   (when (probe-file *art*) (error "Recorder directory already exists"))
   (ensure-directories-exist (path ".reserve"))
