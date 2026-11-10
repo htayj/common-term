@@ -33,6 +33,7 @@
         (list (cons "recorder/pause-02-actual.png" a::*png-bytes*)
           (cons "recorder/RESULT.sexp" (a::controlled-record r))
           (cons "recorder/observations.sexp" (a::controlled-record obs))
+          (cons "recorder/input.raw" (input-bytes events))
           (cons "recorder/output.raw" output)
           (cons "recorder/events.sexp"
             (a::bytes (format nil "~{~a~}"

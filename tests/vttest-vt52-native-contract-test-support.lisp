@@ -12,6 +12,9 @@
 (defvar *serial* 0)
 (defvar *checks* 0)
 (defun check (name x) (incf *checks*) (unless x (error "FAILED ~s" name)))
+(defun input-bytes (events)
+  (coerce (loop for e in events when (eq :wire-in (getf e :kind))
+    append (coerce (getf e :bytes) 'list)) '(vector (unsigned-byte 8))))
 (defun fixture-limit (path)
   ;; Original manifest and source-checksum protocol records use the production 1 MiB bound.
   (if (member path '("MANIFEST.sexp" "native/execution-inputs.sha256"
