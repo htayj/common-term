@@ -229,6 +229,11 @@ screen_cleanup() {
 }
 screen_native_main() {
     [[ $# == 3 && ( $1 == x11 || $1 == wayland ) && $2 == /* && -d $2 && ! -L $2 && -O $2 && $3 == /* && -f $3 && ! -L $3 ]] || return 2
+    # Bind every helper, build, recorder and archive path to this script's own tree.
+    local script root
+    script=$(readlink -f -- "${BASH_SOURCE[0]}") || return 2
+    root=${script%/tests/vttest-screen-native.sh}
+    [[ $root != "$script" && -d $root/tests && $(readlink -f -- "$root/tests/vttest-screen-native.sh") == "$script" ]] || return 2
     backend=$1; run=${2%/}/; manifest=$3; native=$run/native; recorder=$run/recorder
     [[ $manifest == "${run}MANIFEST.sexp" ]] || return 2
     # Selected scale arrives explicitly through env -i; X11 is scale 1 only.
@@ -240,16 +245,15 @@ screen_native_main() {
     attempted=0; reached=0; captured=0; reason=preparation; binary=; server=; client=
     endpoints=(); finalized=NIL; finalization=:not-started; client_exit=NIL
     n=0; native_stage=placement
-    contract_helper=/home/taylor/projects/lispterm/tests/vttest-screen-native-contract.lisp
+    contract_helper="$root/tests/vttest-screen-native-contract.lisp"
     : > "$native/stage-events.sexp"; : > "$native/unowned-endpoints.txt"
     trap screen_cleanup EXIT
-    local root=/home/taylor/projects/lispterm
     cd "$root"
     # Pin precisely the source chain used by this single invocation, plus its manifest.
     sha256sum -- "$manifest" tests/verify.sh tests/vttest-area.lisp tests/vttest-screen-driver.lisp tests/vttest-screen-manifest.lisp tests/vttest-screen-build.sh tests/vttest-screen-native.sh tests/vttest-screen-native-contract.lisp tests/vttest-screen-blink-contract.lisp tests/vttest-screen-blink-native.lisp tests/vttest-screen-blink-selection.lisp tests/vttest-screen-blink-timing.lisp tests/vttest-screen-recorder.lisp tests/vttest-screen-frame.lisp tests/vttest-screen-oracle.lisp tests/vttest-screen-pixels.lisp tests/vttest-cursor-oracle.lisp tests/vttest-screen-wire.lisp tests/vttest-selection.lisp src/host.lisp src/window.lisp > "$native/execution-inputs.sha256"
     local bash=/nix/store/kwyi4bq5s2qgwbhz6cs4gjy57c2zdxws-bash-interactive-5.3p20/bin/bash
     local sbcl=/nix/store/rnyqmmrpp09r6rn7avh77bjkdaaxs0cm-sbcl-with-packages/bin/sbcl
-    local archive=$root/.build/evidence/cursor-x11-first-screen-20261106-a/vttest-20251205.tgz
+    local archive="$root/.build/evidence/cursor-x11-first-screen-20261106-a/vttest-20251205.tgz"
     reason=build
     local build_run=${run%/}
     printf '%q ' "$bash" --noprofile --norc "$root/tests/vttest-screen-build.sh" "$build_run" "$archive" > "$native/build.command"; printf '\n' >> "$native/build.command"
