@@ -417,6 +417,9 @@ candidate. SETTLED-P separately checks geometry readiness."
                          (vttest-screen-frame:settled-p st)
                          (eql target *output*) (eql target (getf st :bytes-received))
                          (eql 0 (getf st :input-pending))
+                         (getf (render-state host st) :render-quiescent)
+                         (eq (getf st :blink-visible)
+                             (getf (vttest-screen-oracle:snapshot-metadata snapshot) :blink-visible))
                          (string= text (grid host)) target))))))
 
 (defun select-capture-phase (host snapshot n)
