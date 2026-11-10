@@ -8,8 +8,8 @@
              (refused (thunk)
                (handler-case (progn (funcall thunk) nil)
                  (vttest-area:gate-problem () t)))
-             ;; Mock-only version-3 receipt with placeholder references. It proves
-             ;; protocol shape against the unrooted validator, never pixels or timing.
+             ;; Mock-only unrooted receipts with placeholder references test PASS
+             ;; refusal and non-PASS imports, never native pixels or timing.
              (native-record (backend &optional (status :pass))
                (let ((origin (list :path "recorder/RESULT.sexp" :sha256 (make-string 64 :initial-element #\a))))
                  (list :kind :vttest-screen-run :version 3 :backend backend
@@ -49,11 +49,25 @@
                (with-open-file (s (concatenate 'string root path) :direction :output
                                   :if-exists :error :if-does-not-exist :create)
                  (write-string text s)))
+             ;; MOCK-ONLY epoch 1 starts at 10 s, with half-second toggles.
+             ;; Synthetic receipts, never native timing observations.
+             (blink-gen (n g)
+               (list :id 1 :frames (* 2 g) :bytes-received (+ 100 n)
+                     :blink-phase (evenp g) :blink-visible t :blink-epoch 1 :blink-epoch-at 10
+                     :blink-toggles g :blink-toggled-at (+ 10 (/ g 2))
+                     :blink-previous-at (+ 10 (/ (1- g) 2)) :blink-toggle-frame (* 2 g)))
              (fixture-status (bk n frames)
-               (let ((cols (if (member n '(3 5)) 132 80)))
+               (let* ((cols (if (member n '(3 5)) 132 80))
+                      (receipt (when (>= n 13) (blink-gen n (case n (13 5) (14 4) (15 6))))))
                  (list :id 1 :child-pid 2 :backend bk :frames frames :bytes-received (+ 100 n)
                        :rows 24 :columns cols :pty-rows 24 :pty-columns cols
-                       :blink-phase (= n 14) :blink-visible (>= n 13) :input-pending 0 :error-count 0
+                       :blink-phase (and (member n '(14 15)) t) :blink-visible (>= n 13)
+                       :blink-epoch (if receipt 1 0) :blink-epoch-at (getf receipt :blink-epoch-at)
+                       :blink-toggles (if receipt (getf receipt :blink-toggles) 0)
+                       :blink-toggled-at (getf receipt :blink-toggled-at)
+                       :blink-previous-at (getf receipt :blink-previous-at)
+                       :blink-toggle-frame (getf receipt :blink-toggle-frame)
+                       :input-pending 0 :error-count 0
                        :process-state :running :transport-state :open
                        :geometry (append (list :phase :settled :request-id 1 :display-epoch 1 :epoch 1
                                                :actual-width (* cols 8) :actual-height 384
@@ -61,7 +75,7 @@
                                                :target-presentation 2 :rows 24 :columns cols :window-id 7)
                                          (when (eq bk :wayland)
                                            (list :frame-pending-p nil :commit-generation 1 :frame-generation 1))))))
-             (rooted-record (root backend exit)
+             (rooted-record (root backend exit &optional tamper)
                ;; Mock-only invocation tree for real rooted validation. Exit 0 gets a
                ;; complete fabricated PASS tree with placeholder PNG and zero RGBA
                ;; bytes; exits 1 and 3 get valid records that never started native.
@@ -82,13 +96,25 @@
                             (rgba (concatenate 'string root stem "actual.rgba"))
                             (commands nil))
                        (loop for suffix in '("before.sexp" "ready.sexp" "pre.sexp" "final.sexp")
-                             for frames in '(1 2 2 2)
+                             for frames in '(20 21 21 21)
                              do (fixture-put root (concatenate 'string stem suffix) (fixture-status bk n frames)))
                        (fixture-put root (concatenate 'string stem "native.sexp") native)
                        (fixture-put root (concatenate 'string stem "request.sexp")
-                                    (list :status (fixture-status bk n 2) :pause n :target (+ 100 n)
+                                    (list :status (fixture-status bk n 21) :pause n :target (+ 100 n)
                                           :ack-output ack :surface-id 9))
-                       (fixture-text root (concatenate 'string stem "request") "Mock-only request binding.")
+                        (when (>= n 13)
+                          (let ((g (case n (13 5) (14 4) (15 6))))
+                            (fixture-put root (concatenate 'string stem "blink-selection.sexp")
+                                         (vttest-screen-blink-native:blink-selection-record
+                                          n (and (member n '(14 15)) t) (+ 100 n)
+                                         (list (blink-gen n (1- g)) (blink-gen n g))))))
+                        (when (= n 15)
+                          (fixture-put root (concatenate 'string stem "blink-chain.sexp")
+                                       (vttest-screen-blink-native:blink-chain-record
+                                        n (list (blink-gen n 1) (blink-gen n 2))
+                                        (loop for g from 2 to 5
+                                              collect (blink-gen n (if (and tamper (= g 5)) 6 g))))))
+                        (fixture-text root (concatenate 'string stem "request") "Mock-only request binding.")
                        (fixture-put root (concatenate 'string stem "capture.exit") 0)
                        (fixture-text root (concatenate 'string stem "actual.png") "Mock-only placeholder, not a capture.")
                        (with-open-file (s rgba :direction :output :if-exists :error :if-does-not-exist :create
@@ -108,7 +134,7 @@
                                       commands))
                        (fixture-put root (concatenate 'string stem "comparison.sexp")
                                     (list :version 1 :pause n :png (fixture-ref root (concatenate 'string stem "actual.png"))
-                                          :phase (= n 14) :width width :height 384
+                                          :phase (and (member n '(14 15)) t) :width width :height 384
                                           :font (list :path "/nix/store/9qvd27vg12177prxcl778rdhxh4lk2mi-terminus-font-4.49.1/share/fonts/terminus/ter-u16n.otb"
                                                       :sha256 "0d11d8ed0889a412fb6903710804643ad85858cc56905286cedae392a57255ca")
                                           :decoder (list :path decoder
@@ -123,7 +149,10 @@
                                                             :masked-pixels 0)))
                        (push (list :pause n :pixels :pass :bytes :unverified :timing :pass :frame :pass
                                    :target :recognized-navigation-only :native native
-                                   :comparison (fixture-ref root (concatenate 'string stem "comparison.sexp")))
+                                    :comparison (fixture-ref root (concatenate 'string stem "comparison.sexp"))
+                                    :evidence (when (>= n 13)
+                                                (append (list (format nil "pause-~2,'0d-blink-selection.sexp" n))
+                                                        (when (= n 15) (list "pause-15-blink-chain.sexp")))))
                              checks)
                        (push (list :pause n :request (fixture-ref root (concatenate 'string stem "request"))
                                    :invoked t :completed t :capture-exit 0
@@ -187,13 +216,7 @@
           (ok (refused (lambda ()
                         (vttest-area:validate-manifest
                          (append (list :backend backend) manifest) "screen" backend))))
-          (multiple-value-bind (observations evidence)
-              (vttest-screen-driver:summarize-native manifest (native-record backend) 0)
-            (ok (null (getf evidence :receipt-error)))
-            (ok (getf evidence :native-record))
-            (ok (= (length observations) 15))
-            (ok (eq (vttest-area:aggregate-observations (getf manifest :scenarios) observations) :pass))
-            (ok (= (getf (getf evidence :counts) :passed) 15)))
+          (refused-receipt manifest (native-record backend))
           (multiple-value-bind (observations evidence)
               (vttest-screen-driver:summarize-native manifest nil nil)
             (ok (eq (vttest-area:aggregate-observations (getf manifest :scenarios) observations) :unverified))
@@ -217,13 +240,28 @@
               (ok (= (getf (getf evidence :counts) :failed) 1))
               (ok (getf evidence :native-failed))))
           (dolist (bad '( :duplicate :backend :pause :status :count))
-            (let ((record (native-record backend)))
+            (let ((record (native-record backend :fail)))
+              (setf (getf (first (getf record :checks)) :pixels) :fail)
+              ;; Establish an accepted baseline before changing exactly one invariant.
+              (multiple-value-bind (observations evidence)
+                  (vttest-screen-driver:summarize-native manifest record 3)
+                (declare (ignore observations))
+                (ok (null (getf evidence :receipt-error))))
               (case bad
-                (:duplicate (push (copy-list (first (getf record :checks))) (getf record :checks)))
+                (:duplicate (setf (car (last (getf record :checks))) (copy-list (first (getf record :checks)))))
                 (:backend (setf (getf record :backend) "other"))
                 (:pause (setf (getf (first (getf record :checks)) :pause) 16))
                 (:status (setf (getf (first (getf record :checks)) :bytes) :ready))
                 (:count (setf (getf record :attempted) -1)))
+              (multiple-value-bind (observations evidence)
+                  (vttest-screen-driver:summarize-native manifest record 3)
+                (declare (ignore observations))
+                (ok (search (case bad
+                              ((:duplicate :pause) "Duplicate/bad pause")
+                              (:backend "Native identity")
+                              (:status "Bad check status")
+                              (:count "Missing/invalid count"))
+                            (getf evidence :receipt-error))))
               (refused-receipt manifest record)))))
       (dolist (args '(("--area" "screen" "--area" "screen")
                       ("--area" "screen" "--backend" "X11")
@@ -296,30 +334,33 @@
       (let ((original (symbol-function 'vttest-screen-driver:invoke-native)))
         (unwind-protect
              (dolist (backend '("x11" "wayland"))
-               (dolist (exit '(0 1 3))
+                (dolist (control '((0 nil) (1 nil) (3 nil) (0 t)))
+                 (destructuring-bind (exit tamper) control
                 (setf (symbol-function 'vttest-screen-driver:invoke-native)
                       (lambda (selected root path)
                         (ok (equal selected backend)) (ok (probe-file path))
-                        (fixture-put root "SCREEN-RUN.sexp" (rooted-record root backend exit))
+                         (fixture-put root "SCREEN-RUN.sexp" (rooted-record root backend exit tamper))
                         exit))
                 (let ((out (make-string-output-stream)) (err (make-string-output-stream)))
                   (let* ((*standard-output* out) (*error-output* err)
                          (actual (vttest-area:main (list "--area" "screen" "--backend" backend))))
-                    (ok (= actual exit))
+                    (ok (= actual (if tamper 1 exit)))
                     (let* ((text (get-output-stream-string out))
                            (start (+ 7 (search "RESULT " text)))
                            (end (position #\Newline text :start start))
                            (result (vttest-area:read-data (subseq text start end)))
                            (evidence (getf result :driver-evidence)))
-                      (ok (= (getf result :exit) exit))
+                      (ok (= (getf result :exit) (if tamper 1 exit)))
                       (ok (= (getf evidence :native-exit) exit))
                       (ok (= (getf (getf result :counts) :required) 15))
-                      (ok (eq (getf result :outcome) (case exit (0 :pass) (1 :fail) (t :unverified))))
-                      (ok (null (getf evidence :receipt-error)))
+                      (ok (eq (getf result :outcome) (if tamper :fail (case exit (0 :pass) (1 :fail) (t :unverified)))))
+                      (ok (if tamper
+                              (search "Blink proof refusal" (getf evidence :receipt-error))
+                              (null (getf evidence :receipt-error))))
                       (ok (null (getf evidence :receipt-read-error)))
-                      (ok (getf evidence :native-record))
-                      (ok (if (eql exit 1) (getf evidence :native-failed) (null (getf evidence :native-failed))))
-                      (ok (eql (getf (getf result :counts) :passed) (if (zerop exit) 15 0))))))))
+                      (ok (if tamper (null (getf evidence :native-record)) (getf evidence :native-record)))
+                      (ok (if (or tamper (eql exit 1)) (getf evidence :native-failed) (null (getf evidence :native-failed))))
+                      (ok (eql (getf (getf result :counts) :passed) (if (and (zerop exit) (not tamper)) 15 0)))))))))
           (setf (symbol-function 'vttest-screen-driver:invoke-native) original)))
       ;; Scale export lifetime: MAIN restores the prior LISPTERM_VTTEST_SCALE, or
       ;; unsets it, after normal, erroring and non-local native exits.
