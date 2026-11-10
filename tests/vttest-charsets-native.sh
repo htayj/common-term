@@ -323,7 +323,7 @@ charsets_native_main() {
             tests/vttest-keyboard-cleanup-status.lisp
             tests/vttest-screen-blink-{native,selection,timing,contract}.lisp
             tests/vttest-vt52-{oracle,pixels,sha256,admission,native-check,png-adapter,capture-adapter,navigation}.lisp
-            tests/vttest-vt52-{driver,manifest}.lisp tests/vttest-vt52-native-{io,root,lifecycle,contract,provenance,clock,navigation}.lisp)
+            tests/vttest-vt52-{driver,manifest,source-pins}.lisp tests/vttest-vt52-native-{io,root,lifecycle,contract,provenance,clock,navigation,trace}.lisp)
         sha256sum -- "$manifest" > "$native/manifest-pre.sha256" || return 1
     fi
     # Created before execution, verified after cleanup; no distinct source precheck.

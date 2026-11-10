@@ -1,11 +1,17 @@
 ;;;; Real manifest declarations versus the shell's actual expanded operands.
 (load (merge-pathnames "vttest-vt52-source-input-test-support.lisp" *load-truename*))
+(load (merge-pathnames "vttest-vt52-source-pins.lisp" *load-truename*))
 (in-package :vttest-vt52-source-input-tests)
 (defun replace-one (text old new)
   (let ((at (or (search old text) (error "Missing mutation target"))))
     (concatenate 'string (subseq text 0 at) new (subseq text (+ at (length old))))))
 (let* ((pins (manifest-paths)) (paths (shell-paths)) (text (shell-text)) (checks 0))
   (flet ((check (value) (incf checks) (assert value)))
+    (check (vttest-vt52-source-pins:expected-p pins))
+    (check (= (length pins) (length (remove-duplicates pins :test #'equal))))
+    (dolist (p '("tests/vttest-vt52-source-pins.lisp" "tests/vttest-vt52-native-trace.lisp"))
+      (check (= 1 (count p pins :test #'equal)))
+      (check (= 1 (count p paths :test #'equal))))
     (check (null (missing-pins)))
     ;; Every real declaration must match the exact checksum operand spelling.
     (dolist (pin pins) (check (member pin paths :test #'equal)))

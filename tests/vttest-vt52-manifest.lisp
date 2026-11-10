@@ -19,6 +19,7 @@
       "tests/vttest-vt52-native-lifecycle.lisp" "tests/vttest-vt52-native-contract.lisp"
       "tests/vttest-vt52-native-provenance.lisp" "tests/vttest-vt52-native-clock.lisp"
       "tests/vttest-vt52-native-navigation.lisp"
+      "tests/vttest-vt52-source-pins.lisp" "tests/vttest-vt52-native-trace.lisp"
       "tests/vttest-screen-blink-native.lisp" "tests/vttest-screen-blink-selection.lisp"
       "tests/vttest-screen-blink-timing.lisp" "tests/vttest-screen-blink-contract.lisp"
       "tests/vttest-double-size-driver.lisp"
