@@ -147,3 +147,23 @@
   (unless (uiop:symbol-call :cl-weave :run-all :reporter :spec :max-workers 1
                            :pass-with-no-tests nil)
     (error "lispterm engine suite failed")))
+
+
+(defsystem "lispterm/gpu"
+  :description "Offscreen ES3 renderer, Lisp-authored shaders and explicit driver lifetime"
+  :license "MIT" :depends-on ("cffi") :serial t
+  :components ((:module "src/gpu" :serial t :components (
+    (:file "package") (:file "conditions")
+    (:file "egl") (:file "gles") (:file "gbm") (:file "context")
+    (:file "shader-dsl") (:file "shaders")
+    (:file "atlas") (:file "instances")
+    (:file "renderer") (:file "readback")))))
+
+(defsystem "lispterm/gpu-tests"
+  :license "MIT" :depends-on ("lispterm/gpu") :serial t
+  :components ((:module "tests/gpu" :serial t :components (
+    (:file "registry") (:file "language-tests") (:file "delivery-tests")
+    (:file "foundation-tests")
+    (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
+    (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
+    (:file "wayland-dmabuf-tests")))))

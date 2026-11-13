@@ -11,6 +11,8 @@ if [[ -d $root/.build/test-tools/bin ]]; then
 fi
 gate=${1:-}; shift "$(( $# > 0 ? 1 : 0 ))"
 case $gate in
+ gpu-shader|gpu-probe|gpu-software-control|gpu-atlas|gpu-offscreen|gpu-evidence|gpu-wayland-dmabuf|gpu-language|gpu-delivery|gpu-foundation)
+  exec scripts/sbcl --script tests/run-gpu-tests.lisp "$gate" "$@" ;;
  deps) exec scripts/sbcl --non-interactive --load scripts/bootstrap.lisp \
   --eval '(dolist (name (quote ("sb-bsd-sockets" "babel" "cffi" "bordeaux-threads" "alexandria" "fiveam" "zpng" "cl-weave" "xclhb" "struct+"))) (asdf:load-system name) (format t "DEPENDENCY ~A OK~%" name))' ;;
  unit|self-check)

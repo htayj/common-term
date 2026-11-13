@@ -1,0 +1,100 @@
+#+title: GPU migration foundation and ownership
+
+* Status and dependency direction
+The CPU baseline is 56ca10b1367177b20d649f8144280a2fa20f3b02.
+This step adds loadable interfaces and fail-closed verification dispatch.
+Driver creation, shaders, model storage and GPU rendering are pending.
+
+All GPU symbols are in =lispterm.gpu= (no nickname). The system
+=lispterm/gpu= depends only on CFFI, not on display or engine systems.
+Later the display system may depend on GPU; GPU must not depend on display.
+No libraries are loaded and no context is created merely by loading GPU.
+=src/gpu/package.lisp= and =lispterm.asd= have single integrator ownership.
+Export additional symbols from the owning component with =export= if needed;
+report additions so the integrator can consolidate package declarations later.
+
+* Independent packages
+- A owns =src/gpu/{egl,gles,gbm,context}.lisp=, dependency/wrapper wiring,
+  =tests/gpu/{probe,software-control}-tests.lisp=. Create an ES3 context
+  with =open-context :software nil :device nil=, interrogate real driver
+  metadata via =context-info=, and implement owner/thread/process validation
+  and =close-context=. Reject software unless explicitly requested. Driver
+  calls must mask floating traps, unwind cleanly and avoid asynchronous
+  timeout interruption. Destroy resources before checkpoint/fork. GPU tests
+  may create offscreen contexts but never use inherited desktop endpoints.
+- B owns =src/gpu/{shader-dsl,shaders}.lisp= and
+  =tests/gpu/shader-tests.lisp=. =shader-form :vertex|:fragment= returns
+  Lisp data; =emit-shader form= returns generated GLSL ES3 text in memory.
+  B defines and documents the concrete AST. Coordinate record layout with D
+  before final attribute declarations. Invalid forms/stages must signal.
+- C owns =src/display/{package,protocol,framebuffer}.lisp=,
+  =src/launcher.lisp=, and =tests/run-display-tests.lisp=. Build CPU-only
+  renderer selection/seams first, retaining shared cache/damage decisions.
+  Keep existing default behavior until the real renderer is verified.
+  Use the neutral GPU renderer generic interface below, not GPU references
+  to display structs. C may add the one-way display-to-GPU ASDF dependency;
+  coordinate that single shared-file edit with the integrator.
+- D owns =src/gpu/{atlas,instances}.lisp= and =tests/gpu/atlas-tests.lisp=.
+  =make-atlas :tile-width :tile-height :capacity :max-capacity= returns a
+  pure model. =atlas-begin-frame atlas keys= protects the entire new frame's
+  glyph set before eviction. =atlas-ensure-glyph atlas key mask= returns
+  slot, epoch, upload-needed-p. Keys are immutable EQUAL grapheme/bold/span
+  lists; masks are row-major UB8 tile values (0 or 255, one byte per texel).
+  Epoch increases on eviction/growth, requiring a full instance rebuild.
+  =make-instance-buffer :columns :rows=, =instance-buffer-write= and
+  =instance-buffer-octets= own the actual packed layout. Validate coordinate,
+  slot and driver capacity limits; the proposed 16-byte layout is provisional.
+  D documents final layout/constants for B and the subsequent renderer agent.
+
+* Renderer contracts for C and subsequent E
+=make-renderer :context :width :height :cell-width :cell-height= uses positive
+logical pixel sizes. =renderer-resize= takes these four sizes positionally.
+=renderer-write-cell renderer column row= accepts =:glyph-key :mask
+:foreground :background :bold :underline :hidden :span :line-size=.
+Colors are final #xRRGGBB after inverse/cursor/reverse-screen parity. Coordinates
+are nonnegative, span is 1 or 2; line-size uses the existing display keywords
+=:single :double-width :double-height-top :double-height-bottom=.
+Mask data is glyph input, never a composed CPU frame. Atlas slot packing is D's
+responsibility. Define clipping/remainder handling before connecting GPU draw.
+=renderer-draw= performs uploads/draw. =renderer-readback= synchronizes pending
+state and returns top-left-origin row-major UB32 #xAARRGGBB. This is output for
+presentation/capture, not composition input. =renderer-metrics= reports measured
+counters; =renderer-close= releases resources before =close-context=.
+Only the display owner thread may create/use/close renderer/context resources.
+Record process identity too; a checkpoint must contain no active driver state.
+
+* Verification registration
+=lispterm/gpu-tests= loads the registry, language/delivery/foundation checks,
+and all per-agent test components. Each agent registers its implemented check
+with =lispterm.gpu.tests:register-check= in its assigned tests file.
+The no-argument function must assert real evidence and return exactly T.
+Unknown names, missing registrations, errors and non-T results fail the runner.
+No gate is implemented by a successful placeholder. =gpu-foundation= verifies
+only the scaffold and failure controls. The nine mission gates have early
+=tests/verify.sh= dispatch.
+
+=gpu-language= includes committed, staged, unstaged and nonignored untracked
+migration paths. New code must be Lisp/.asd; docs may be .org/.md. Only the
+specified existing shell/Nix glue may change; adding shell/native/shader/Python
+source is rejected. Review actual glue diffs for minimal wiring.
+
+=gpu-delivery= reads outer =preservation.sexp= and verifies preserved bytes,
+sizes, modes and exact dirty status; it requires clean tested tree HEAD equal
+to outer main HEAD. It then requires outer =independent-review.sexp= containing
+=:revision= (final hash), =:role :independent-review=, =:status :passed=,
+=:reviewer= (nonempty identity), =:evidence-path= (absolute real review artifact)
+and =:evidence-blob= (Git blob hash of that artifact). The primary authenticates
+independent review provenance before supplying that receipt. These external
+receipts avoid embedding a commit's own hash into that commit. No review receipt
+exists at foundation time. Delivery must fail until final review and integration.
+
+* Worktree and evidence
+All authored changes belong in outer =.build/gpu-migration/tree/=, not main.
+Outer =preservation.sexp= records initial HEAD/status plus path/mode/size/blob
+for all 21 pre-existing edits. Outer =preserved/= contains complete byte copies
+(647649 bytes total). No stash/reset/clean or dependency-tree hashing was used.
+Tree .build dependency/tool symlinks point at the same immutable closures as main.
+Run application fixtures only on verified private headless Xvfb/Sway endpoints.
+Signed local commits must use Taylor <htayj@users.noreply.github.com> as both
+author and committer. No remote, config, history rewrite, push or main integration
+belongs to the foundation step.
