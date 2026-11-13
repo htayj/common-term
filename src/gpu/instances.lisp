@@ -1,13 +1,104 @@
 (in-package #:lispterm.gpu)
 
-(defun make-instance-buffer (&key columns rows)
-  "Allocate cell records. Packed byte layout is intentionally not frozen yet."
-  (declare (ignore columns rows))
-  (unavailable 'make-instance-buffer))
+(defconstant +instance-stride+ 32)
+(defconstant +instance-bold+ 1)
+(defconstant +instance-underline+ 2)
+(defconstant +instance-hidden+ 4)
+
+(defclass cell-instance-buffer ()
+  ((columns :initarg :columns :reader instance-buffer-columns)
+   (rows :initarg :rows :reader instance-buffer-rows)
+   (slot-limit :initarg :slot-limit :reader instance-buffer-slot-limit)
+   (octets :initarg :octets :reader instance-buffer-octets)
+   (dirty :initarg :dirty :reader instance-buffer-dirty)))
+
+(defun make-instance-buffer (&key columns rows (max-instances #xffffffff)
+                                 (slot-limit #x100000000))
+  "Allocate row-major 32-byte records. Limits are supplied from device queries.
+SLOT-LIMIT is exclusive. OCTETS is borrowed read-only storage for GPU upload."
+  (model-positive-integer columns :columns)
+  (model-positive-integer rows :rows)
+  (model-positive-integer max-instances :max-instances)
+  (model-positive-integer slot-limit :slot-limit #x100000000)
+  (let ((count (* columns rows)))
+    (unless (and (<= count max-instances)
+                 (< (* count +instance-stride+) array-total-size-limit))
+      (error "Instance grid exceeds configured or Lisp capacity"))
+    (make-instance 'cell-instance-buffer :columns columns :rows rows :slot-limit slot-limit
+                   :octets (make-array (* count +instance-stride+)
+                                       :element-type '(unsigned-byte 8) :initial-element 0)
+                   :dirty (make-array count :element-type 'bit :initial-element 1))))
+
+(defun instance-line-size-code (line-size)
+  (or (position line-size '(:single :double-width :double-height-top :double-height-bottom))
+      (error "Invalid instance line size: ~S" line-size)))
+
+(defun instance-unsigned (value maximum name)
+  (unless (and (integerp value) (<= 0 value maximum))
+    (error "Invalid ~A: expected integer in [0,~D]" name maximum))
+  value)
+
+(defun instance-put-u32 (octets offset value)
+  (dotimes (byte 4) (setf (aref octets (+ offset byte)) (ldb (byte 8 (* byte 8)) value))))
+
 (defgeneric instance-buffer-write (buffer column row &key slot foreground background
-                                                       bold underline hidden span line-size)
-  (:documentation "Colors are final #xRRGGBB integers; coordinates and slot are nonnegative.
-SPAN is 1 or 2. LINE-SIZE uses the display's existing :SINGLE, :DOUBLE-WIDTH,
-:DOUBLE-HEIGHT-TOP and :DOUBLE-HEIGHT-BOTTOM keywords."))
-(defgeneric instance-buffer-octets (buffer)
-  (:documentation "Return specialized UB8 storage; the validated layout belongs to this module."))
+                                                        bold underline hidden span line-size))
+(defmethod instance-buffer-write ((buffer cell-instance-buffer) column row
+                                 &key (slot 0) (foreground 0) (background 0)
+                                   bold underline hidden (span 1) (line-size :single))
+  "Validate the complete record before mutation; dirty only changed records.
+Fields: column,row,slot,flags,fg,bg,span,line-code, all little-endian uint32."
+  (instance-unsigned column (1- (instance-buffer-columns buffer)) :column)
+  (instance-unsigned row (1- (instance-buffer-rows buffer)) :row)
+  (instance-unsigned slot (1- (instance-buffer-slot-limit buffer)) :slot)
+  (instance-unsigned foreground #xffffff :foreground)
+  (instance-unsigned background #xffffff :background)
+  (unless (every (lambda (v) (member v '(nil t))) (list bold underline hidden))
+    (error "Instance flags must be boolean"))
+  (unless (member span '(1 2)) (error "Instance span must be 1 or 2"))
+  (let* ((line-code (instance-line-size-code line-size))
+         (flags (logior (if bold +instance-bold+ 0) (if underline +instance-underline+ 0)
+                        (if hidden +instance-hidden+ 0)))
+         (index (+ column (* row (instance-buffer-columns buffer))))
+         (offset (* index +instance-stride+))
+         (octets (instance-buffer-octets buffer))
+         (values (list column row slot flags foreground background span line-code))
+         (changed nil))
+    (loop for value in values for field from 0
+          do (dotimes (byte 4)
+               (unless (= (aref octets (+ offset (* field 4) byte))
+                          (ldb (byte 8 (* byte 8)) value))
+                 (setf changed t))))
+    (when changed
+      (loop for value in values for field from 0
+            do (instance-put-u32 octets (+ offset (* field 4)) value))
+      (setf (sbit (instance-buffer-dirty buffer) index) 1))
+    changed))
+
+(defun instance-buffer-dirty-ranges (buffer)
+  "Return merged half-open byte intervals. Retain dirty bits until upload succeeds."
+  (let ((bits (instance-buffer-dirty buffer)) (start nil) (ranges nil))
+    (loop for index from 0 below (length bits)
+          do (if (= 1 (sbit bits index))
+                 (unless start (setf start index))
+                 (when start
+                   (push (list (* start +instance-stride+) (* index +instance-stride+)) ranges)
+                   (setf start nil))))
+    (when start (push (list (* start +instance-stride+) (* (length bits) +instance-stride+)) ranges))
+    (nreverse ranges)))
+
+(defun instance-buffer-dirty-rows (buffer)
+  (loop with bits = (instance-buffer-dirty buffer)
+        with columns = (instance-buffer-columns buffer)
+        for row below (instance-buffer-rows buffer)
+        when (position 1 bits :start (* row columns) :end (* (1+ row) columns)) collect row))
+
+(defun instance-buffer-clear-dirty (buffer)
+  "Acknowledge successful upload of all reported ranges on the owner thread."
+  (fill (instance-buffer-dirty buffer) 0)
+  buffer)
+
+(export '(+instance-stride+ +instance-bold+ +instance-underline+ +instance-hidden+
+          instance-buffer-columns instance-buffer-rows instance-buffer-slot-limit
+          instance-buffer-dirty-ranges instance-buffer-dirty-rows instance-buffer-clear-dirty
+          instance-line-size-code))

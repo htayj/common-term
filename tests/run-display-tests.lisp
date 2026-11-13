@@ -5,3 +5,4 @@
  (load (merge-pathnames (format nil "../src/display/~a.lisp" n) *load-truename*)))
 (load (merge-pathnames "display-tests.lisp" *load-truename*))
 (load (merge-pathnames "wayland-buffer-lifecycle-tests.lisp" *load-truename*))
+(load (merge-pathnames "gpu/display-seam-tests.lisp" *load-truename*))

@@ -21,7 +21,10 @@
 
 (defstruct display
   (epoch (next-display-epoch))
-  backend backend-state name title configuration font framebuffer damage
+  backend backend-state name title configuration font framebuffer-storage damage
+  (renderer-request :cpu) (renderer-kind :cpu) renderer-context renderer-state
+  renderer-fallback-reason (renderer-pending-p nil) (readback-pending-p nil)
+  (process-id (sb-unix:unix-getpid))
   (columns 80) (rows 24) (width 0) (height 0) (open-p nil)
   geometry-request (geometry-epoch 0) (presentation-generation 0) (metric-generation 0)
   (cleanup-pending-p nil)
@@ -39,13 +42,100 @@
 
 (defun assert-owner (display)
   (unless (eq (display-owner display) sb-thread:*current-thread*)
-    (error 'display-error :detail "Display must be used on its owning thread")))
+    (error 'display-error :detail "Display must be used on its owning thread"))
+  (unless (= (display-process-id display) (sb-unix:unix-getpid))
+    (error 'display-error :detail "Display resources cannot be inherited across fork")))
 
 (declaim (ftype (function (t t t) t) resize-display))
 (declaim (ftype (function (display) display) close-display))
 
+(define-condition renderer-unavailable (display-error) ())
+
+(defun gpu-interface (name)
+  "Resolve an explicitly loaded GPU interface. Never load packages implicitly."
+  (let* ((package (find-package "LISPTERM.GPU"))
+         (symbol (and package (find-symbol name package))))
+    (unless (and symbol (fboundp symbol))
+      (error 'renderer-unavailable :detail (format nil "GPU interface ~A is unavailable" name)))
+    (symbol-function symbol)))
+
+(defun gpu-call (name &rest arguments)
+  (apply (gpu-interface name) arguments))
+
+(defun gpu-unavailable-p (condition)
+  (let* ((package (find-package "LISPTERM.GPU"))
+         (type (and package (find-symbol "GPU-UNAVAILABLE" package))))
+    (or (typep condition 'renderer-unavailable)
+        (and type (find-class type nil) (typep condition type)))))
+
+(defun close-display-renderer (display)
+  "Keep each resource handle until its own retryable close succeeds."
+  (assert-owner display)
+  (when (display-renderer-state display)
+    (gpu-call "RENDERER-CLOSE" (display-renderer-state display))
+    (setf (display-renderer-state display) nil))
+  (when (display-renderer-context display)
+    (gpu-call "CLOSE-CONTEXT" (display-renderer-context display))
+    (setf (display-renderer-context display) nil))
+  (setf (display-renderer-pending-p display) nil
+        (display-readback-pending-p display) nil))
+
+(defun initialize-display-renderer (display)
+  (assert-owner display)
+  (unless (eq (display-renderer-request display) :cpu)
+    (handler-case
+        (progn
+          (setf (display-renderer-context display) (gpu-call "OPEN-CONTEXT"))
+          (setf (display-renderer-state display)
+                (gpu-call "MAKE-RENDERER" :context (display-renderer-context display)
+                          :width (display-width display) :height (display-height display)
+                          :cell-width (font-width (display-font display))
+                          :cell-height (font-height (display-font display)))
+                (display-renderer-kind display) :gpu
+                (display-renderer-pending-p display) t
+                (display-readback-pending-p display) t))
+      (error (condition)
+        (close-display-renderer display)
+        (if (and (eq (display-renderer-request display) :auto)
+                 (gpu-unavailable-p condition))
+            (setf (display-renderer-kind display) :cpu
+                  (display-renderer-fallback-reason display) (princ-to-string condition)
+                  (display-framebuffer-storage display)
+                  (make-array (* (display-width display) (display-height display))
+                              :element-type '(unsigned-byte 32) :initial-element #xff1d2021))
+            (error condition)))))
+  display)
+
+(defun synchronize-display-renderer (display)
+  (assert-owner display)
+  (when (display-renderer-pending-p display)
+    (gpu-call "RENDERER-DRAW" (display-renderer-state display))
+    (setf (display-renderer-pending-p display) nil)))
+
+(defun display-framebuffer (display)
+  "Synchronize GPU output lazily for wire presentation and capture on its owner."
+  (when (eq (display-renderer-kind display) :gpu)
+    (assert-owner display)
+    (synchronize-display-renderer display)
+    (when (display-readback-pending-p display)
+      (let ((pixels (gpu-call "RENDERER-READBACK" (display-renderer-state display))))
+        (unless (and (typep pixels '(simple-array (unsigned-byte 32) (*)))
+                     (= (length pixels) (* (display-width display) (display-height display))))
+          (error 'display-error :detail "GPU readback has invalid dimensions or pixel type"))
+        (setf (display-framebuffer-storage display) pixels
+              (display-readback-pending-p display) nil))))
+  (display-framebuffer-storage display))
+
+(defun (setf display-framebuffer) (pixels display)
+  (when (eq (display-renderer-kind display) :gpu)
+    (assert-owner display))
+  (setf (display-framebuffer-storage display) pixels))
+
 (defun open-display (&key (backend :auto) display-name (title "Lispterm")
-                          (columns 80) (rows 24) font-path (font-size 16))
+                          (columns 80) (rows 24) font-path (font-size 16)
+                          (renderer :cpu))
+  (unless (member renderer '(:cpu :gpu :auto))
+    (error 'display-error :detail "Renderer must be :cpu, :gpu, or :auto"))
   (check-type columns (integer 1 10000))
   (check-type rows (integer 1 10000))
   (let* ((backend (if (eq backend :auto)
@@ -53,11 +143,11 @@
                       backend))
          (display
            (make-display
-            :backend backend :name display-name :title title
+            :backend backend :name display-name :title title :renderer-request renderer
             :columns columns :rows rows :owner sb-thread:*current-thread*
             :configuration (list :backend backend :display-name display-name
                                  :title title :columns columns :rows rows
-                                 :font-path font-path :font-size font-size))))
+                                 :font-path font-path :font-size font-size :renderer renderer))))
     (handler-case
         (progn
           (setf (display-font display) (load-font font-path font-size))
@@ -69,6 +159,8 @@
           (setf (display-cleanup-pending-p display) t)
           ;; Broken local transports must not hold the caller indefinitely.
           (sb-ext:with-timeout 10 (backend-open backend display))
+          ;; GPU initialization is not subject to asynchronous transport timeouts.
+          (initialize-display-renderer display)
           (setf (display-open-p display) t
                 (display-cleanup-pending-p display) nil)
           display)
@@ -91,6 +183,7 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
           (display-open-p display) nil)
     (cancel-size-request display)
     (setf (display-epoch display) (next-display-epoch))
+    (close-display-renderer display)
     (backend-close (display-backend display) display)
     (setf (display-cleanup-pending-p display) nil))
   display)
@@ -132,7 +225,13 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
                 :width (display-width display) :height (display-height display)
                 :cell-width (font-width (display-font display))
                 :cell-height (font-height (display-font display))
-                :backend (display-backend display))
+                :backend (display-backend display)
+                :renderer-request (display-renderer-request display)
+                :renderer (display-renderer-kind display)
+                :renderer-fallback-reason (display-renderer-fallback-reason display))
+          (when (eq (display-renderer-kind display) :gpu)
+            (assert-owner display)
+            (gpu-call "RENDERER-METRICS" (display-renderer-state display)))
           (backend-metrics (display-backend display) display)))
 
 ;; Immutable request values are replaced, never modified after publication.

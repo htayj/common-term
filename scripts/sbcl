@@ -6,6 +6,13 @@ runtime=${LISPTERM_RUNTIME:-$root/.build/deps}
 if [[ -d $runtime ]]; then
  export LISPTERM_FONT=${LISPTERM_FONT:-$runtime/share/fonts/terminus/ter-u16n.otb}
  export LISPTERM_XKBCOMMON_LIBRARY=${LISPTERM_XKBCOMMON_LIBRARY:-$runtime/lib/libxkbcommon.so.0}
+ export LISPTERM_GPU_RUNTIME="$runtime"
+ export __EGL_VENDOR_LIBRARY_FILENAMES=$(realpath "$runtime/share/glvnd/egl_vendor.d/50_mesa.json")
+ export LIBGL_DRIVERS_PATH="$runtime/lib/dri"
+ export GBM_BACKENDS_PATH="$runtime/lib/gbm"
+ # Driver selection is a context API decision, never inherited desktop state.
+ unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE EGL_PLATFORM DRI_PRIME
+ unset __EGL_VENDOR_LIBRARY_DIRS LD_LIBRARY_PATH LD_PRELOAD
 fi
 # A Nix SBCL wrapper supplies its own registry. Do not append an inherited
 # wrapper registry, which can contain a second ASDF inherit marker.

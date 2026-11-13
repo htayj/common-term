@@ -6,6 +6,8 @@ root=$PWD
 runtime=$(realpath "${LISPTERM_RUNTIME:-$root/.build/deps}")
 [[ -x $runtime/bin/sbcl ]] || { echo 'Run scripts/bootstrap-deps first' >&2; exit 1; }
 [[ -f $runtime/share/fonts/terminus/ter-u16n.otb && -f $runtime/lib/libxkbcommon.so.0 ]]
+[[ -f $runtime/lib/libEGL.so.1 && -f $runtime/lib/libGLESv2.so.2 && -f $runtime/lib/libgbm.so.1 ]]
+[[ -f $runtime/share/glvnd/egl_vendor.d/50_mesa.json && -d $runtime/lib/dri && -f $runtime/lib/gbm/dri_gbm.so ]]
 mkdir -p .build/evidence
 sandbox=$(mktemp -d "$root/.build/packaging.XXXXXX")
 trap 'rm -rf "$sandbox"' EXIT
@@ -22,6 +24,11 @@ env -i PATH="$PATH" HOME="$sandbox/home" XDG_CONFIG_HOME="$sandbox/config" \
  LISPTERM_RUNTIME="$runtime" LISPTERM_SBCL="$runtime/bin/sbcl" \
  "$sandbox/checkout/scripts/sbcl" --non-interactive --load "$sandbox/checkout/scripts/bootstrap.lisp" \
  --eval '(asdf:load-system "lispterm/launcher")' \
+ --eval '(asdf:load-system "lispterm/gpu")' \
+ --eval '(assert (null lispterm.gpu::*native-libraries*))' \
+ --eval '(assert (null lispterm.gpu::*live-contexts*))' \
+ --eval '(assert (lispterm.gpu:ensure-native-libraries))' \
+ --eval '(assert (null lispterm.gpu::*live-contexts*))' \
  --eval '(assert (probe-file (uiop:getenv "LISPTERM_FONT")))' \
  --eval '(assert (lispterm.display::load-font nil 16))' \
  --eval '(assert (lispterm.display.wayland::ensure-xkb-library))' \

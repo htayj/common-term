@@ -1,6 +1,95 @@
+;;;; Maintained shader programs are Lisp syntax trees, never GLSL bodies.
 (in-package #:lispterm.gpu)
 
+(defparameter *cell-vertex-form*
+  '(:shader :vertex
+    (:input :uvec4 :a-cell 0)
+    (:input :uvec4 :a-style 1)
+    (:uniform :ivec2 :u-target-size)
+    (:uniform :ivec2 :u-cell-size)
+    (:output :ivec2 :v-origin 0 :flat)
+    (:output :uvec4 :v-meta 1 :flat)
+    (:output :ivec2 :v-shape 2 :flat)
+    (:main
+     (:let :int :line (:cast :int (:swizzle :a-style :w)))
+     (:let :int :sx (:choose (:= :line 0) 1 2))
+     (:let :int :cw (:swizzle :u-cell-size :x))
+     (:let :int :ch (:swizzle :u-cell-size :y))
+     (:let :int :columns (:/ (:swizzle :u-target-size :x) :cw))
+     (:set :columns (:choose (:< :columns 1) 1 :columns))
+     (:let :int :logical-columns (:/ :columns :sx))
+     (:set :logical-columns (:choose (:< :logical-columns 1) 1 :logical-columns))
+     (:let :int :right (:* (:* :cw :sx) :logical-columns))
+     (:set :right (:choose (:< :right (:swizzle :u-target-size :x))
+                          :right (:swizzle :u-target-size :x)))
+     (:set :v-origin (:ivec2 (:* (:* (:cast :int (:swizzle :a-cell :x)) :cw) :sx)
+                            (:* (:cast :int (:swizzle :a-cell :y)) :ch)))
+     (:set :v-meta (:uvec4 (:swizzle :a-cell :z) (:swizzle :a-cell :w)
+                          (:swizzle :a-style :x) (:swizzle :a-style :y)))
+     (:set :v-shape (:ivec2 (:cast :int (:swizzle :a-style :z)) :line))
+     ;; Two triangles: (0,0) (1,0) (0,1), (0,1) (1,0) (1,1).
+     (:let :int :corner-x (:choose (:or (:= :vertex-id 1) (:>= :vertex-id 4)) 1 0))
+     (:let :int :corner-y (:choose (:or (:and (:>= :vertex-id 2) (:<= :vertex-id 3))
+                                       (:= :vertex-id 5)) 1 0))
+     (:let :int :px (:+ (:swizzle :v-origin :x)
+                       (:* (:* (:* :corner-x (:swizzle :v-shape :x)) :cw) :sx)))
+     (:set :px (:choose (:< :px :right) :px :right))
+     (:let :int :py (:+ (:swizzle :v-origin :y) (:* :corner-y :ch)))
+     (:set :position
+      (:vec4 (:- (:* (:/ (:cast :float :px) (:cast :float (:swizzle :u-target-size :x)))
+                      (:float 2)) (:float 1))
+             (:- (:float 1) (:* (:/ (:cast :float :py) (:cast :float (:swizzle :u-target-size :y)))
+                                (:float 2)))
+             (:float 0) (:float 1))))))
+
+(defparameter *cell-fragment-form*
+  '(:shader :fragment
+    (:uniform :ivec2 :u-target-size)
+    (:uniform :ivec2 :u-cell-size)
+    (:uniform :int :u-atlas-columns)
+    (:uniform :sampler2d :u-atlas)
+    (:input :ivec2 :v-origin 0 :flat)
+    (:input :uvec4 :v-meta 1 :flat)
+    (:input :ivec2 :v-shape 2 :flat)
+    (:output :vec4 :o-color 0)
+    (:main
+     (:let :int :cw (:swizzle :u-cell-size :x))
+     (:let :int :ch (:swizzle :u-cell-size :y))
+     (:let :int :line (:swizzle :v-shape :y))
+     (:let :int :sx (:choose (:= :line 0) 1 2))
+     (:let :int :dx (:- (:cast :int (:swizzle :fragment-coordinate :x)) (:swizzle :v-origin :x)))
+     (:let :int :dy (:- (:- (:- (:swizzle :u-target-size :y) 1)
+                               (:cast :int (:swizzle :fragment-coordinate :y)))
+                          (:swizzle :v-origin :y)))
+     (:let :int :gx (:/ :dx :sx))
+     (:let :int :gy (:choose (:>= :line 2)
+                            (:/ (:+ :dy (:choose (:= :line 3) :ch 0)) 2) :dy))
+     (:let :int :slot (:cast :int (:swizzle :v-meta :x)))
+     (:let :uint :flags (:swizzle :v-meta :y))
+     (:let :ivec2 :tile (:ivec2 (:* (:% :slot :u-atlas-columns) :cw)
+                                (:* (:/ :slot :u-atlas-columns) :ch)))
+     (:let :bool :ink :false)
+     ;; Guard each fetch: bold may extend one source pixel beyond a tile.
+     (:if (:and (:>= :gx 0) (:< :gx :cw))
+      ((:set :ink (:> (:cast :int (:* (:swizzle (:texel-fetch :u-atlas
+                                                     (:+ :tile (:ivec2 :gx :gy)) 0) :x)
+                                      (:float 255))) 0))))
+     (:if (:and (:/= (:bit-and :flags (:uint 1)) (:uint 0))
+                (:and (:> :gx 0) (:<= :gx :cw)))
+      ((:set :ink (:or :ink (:> (:cast :int (:* (:swizzle (:texel-fetch :u-atlas
+                                                        (:+ :tile (:ivec2 (:- :gx 1) :gy)) 0) :x)
+                                         (:float 255))) 0)))))
+     (:set :ink (:and (:or :ink (:and (:/= (:bit-and :flags (:uint 2)) (:uint 0))
+                                     (:= :gy (:- :ch 2))))
+                      (:= (:bit-and :flags (:uint 4)) (:uint 0))))
+     (:let :uint :rgb (:choose :ink (:swizzle :v-meta :z) (:swizzle :v-meta :w)))
+     (:set :o-color
+      (:vec4 (:/ (:cast :float (:bit-and (:shift-right :rgb (:uint 16)) (:uint 255))) (:float 255))
+             (:/ (:cast :float (:bit-and (:shift-right :rgb (:uint 8)) (:uint 255))) (:float 255))
+             (:/ (:cast :float (:bit-and :rgb (:uint 255))) (:float 255))
+             (:float 1))))))
+
 (defun shader-form (stage)
-  "Return the authored Lisp form for :VERTEX or :FRAGMENT. Unknown stages are errors."
-  (unless (member stage '(:vertex :fragment)) (error "Unknown shader stage ~S" stage))
-  (unavailable 'shader-form))
+  "Return a fresh editable syntax tree. Legal stages are :VERTEX and :FRAGMENT."
+  (copy-tree (case stage (:vertex *cell-vertex-form*) (:fragment *cell-fragment-form*)
+                   (otherwise (shader-invalid stage "Unknown shader stage")))))

@@ -1,3 +1,25 @@
 (in-package #:lispterm.gpu)
 
-;;; Native GBM bindings belong here. Loading the system must not open a driver.
+(define-driver-function gbm-create-device :gbm "gbm_create_device" :pointer (fd :int))
+(define-driver-function gbm-device-destroy :gbm "gbm_device_destroy" :void (device :pointer))
+(define-driver-function gbm-device-get-backend-name :gbm "gbm_device_get_backend_name" :string (device :pointer))
+
+(defun open-render-node (path)
+  (unless (and (stringp path)
+               (uiop:absolute-pathname-p path)
+               (equal (namestring (uiop:pathname-directory-pathname path)) "/dev/dri/")
+               (uiop:string-prefix-p "renderD" (file-namestring path)))
+    (unavailable 'open-context "DEVICE must name /dev/dri/renderD*"))
+  (let ((fd (with-driver-call (cffi:foreign-funcall "open" :string path :int #x80002 :int))))
+    (when (minusp fd) (unavailable 'open-context (format nil "Cannot open DRM render node ~A" path)))
+    fd))
+
+(defun close-render-node (fd)
+  (when (and fd (not (minusp fd)))
+    (with-driver-call (cffi:foreign-funcall "close" :int fd :int))))
+
+(defun discover-render-nodes ()
+  (sort (loop for path in (uiop:directory-files #p"/dev/dri/")
+              for name = (file-namestring path)
+              when (uiop:string-prefix-p "renderD" name) collect (namestring path))
+        #'string<))
