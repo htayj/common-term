@@ -75,7 +75,7 @@
 (defsystem "lispterm/display-wayland" :depends-on ("lispterm/display" "cffi")
  :serial t :components ((:file "src/display/wayland-wire") (:file "src/display/wayland-protocol")
                        (:file "src/display/wayland-shm") (:file "src/display/xkb")
-                       (:file "src/display/wayland")))
+                        (:file "src/display/wayland") (:file "src/gpu/dmabuf")))
 
 (defsystem "lispterm/launcher" :depends-on ("lispterm")
  :components ((:file "src/launcher")))
@@ -167,4 +167,4 @@
     (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
     (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
     (:file "native-tests") (:file "lifecycle-tests")
-    (:file "wayland-dmabuf-tests")))))
+    (:file "direct-compositor") (:file "dmabuf-tests")))))

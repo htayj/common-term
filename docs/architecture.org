@@ -6,8 +6,11 @@
 - =lispterm/pty=: Linux x86-64 glibc PTY operations, posix_spawn shell launch,
   bounded nonblocking I/O, resize, status and reaping. Transport-only saver
   detach is distinct from process-owner close.
-- =lispterm/display=: CPU ARGB32 cell renderer, damage tracking, Terminus OTB
-  parser and normalized terminal keyboard input.
+- =lispterm/gpu=: EGL/GBM OpenGL ES 3 context, bounded glyph-mask atlas,
+  instanced renderer and Lisp-generated shaders. See [[file:gpu-foundation.org][GPU reference]].
+- =lispterm/display=: GPU/CPU renderer selection, damage tracking, Terminus OTB
+  parser and normalized terminal keyboard input. GPU readback provides ARGB32
+  pixels for native transport and capture; CPU mode composes those pixels in Lisp.
 - =lispterm/display-x11=: native xclhb socket protocol, TrueColor transfer and
   X11 keyboard/window events.
 - =lispterm/display-wayland=: native Lisp/CFFI Unix transport and fd passing,
@@ -25,6 +28,9 @@ A view can be closed and reopened while retaining the session. Quiescence
 joins the owner before a saver fork. Parent resume reconstructs ephemeral
 window state; saver detach closes inherited transports without signaling or
 waiting for a process owned by the parent.
+GPU contexts and renderers also record their creating process and thread.
+Quiescence closes them before checkpoint fork; the GPU save hook rejects live
+contexts. Resume creates new driver resources rather than restoring handles.
 
 For live renderer changes, redefine Lisp functions in the running image and
 request a redraw/reopen through the host API. Source files are the persistence

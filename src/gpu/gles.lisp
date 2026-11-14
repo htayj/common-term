@@ -47,6 +47,10 @@
 (define-driver-function gl-bind-framebuffer :gles "glBindFramebuffer" :void (target :unsigned-int) (framebuffer :unsigned-int))
 (define-driver-function gl-framebuffer-texture-2d :gles "glFramebufferTexture2D" :void (target :unsigned-int) (attachment :unsigned-int) (texture-target :unsigned-int) (texture :unsigned-int) (level :int))
 (define-driver-function gl-check-framebuffer-status :gles "glCheckFramebufferStatus" :unsigned-int (target :unsigned-int))
+(define-driver-function gl-blit-framebuffer :gles "glBlitFramebuffer" :void
+  (sx0 :int) (sy0 :int) (sx1 :int) (sy1 :int)
+  (dx0 :int) (dy0 :int) (dx1 :int) (dy1 :int)
+  (mask :unsigned-int) (filter :unsigned-int))
 (define-driver-function gl-gen-buffers :gles "glGenBuffers" :void (count :int) (names :pointer))
 (define-driver-function gl-delete-buffers :gles "glDeleteBuffers" :void (count :int) (names :pointer))
 (define-driver-function gl-bind-buffer :gles "glBindBuffer" :void (target :unsigned-int) (buffer :unsigned-int))

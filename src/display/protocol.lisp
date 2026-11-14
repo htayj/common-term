@@ -193,8 +193,9 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
           (display-open-p display) nil)
     (cancel-size-request display)
     (setf (display-epoch display) (next-display-epoch))
-    (close-display-renderer display)
+    ;; Disconnect compositor references and release export targets before context.
     (backend-close (display-backend display) display)
+    (close-display-renderer display)
     (setf (display-cleanup-pending-p display) nil))
   display)
 
@@ -216,8 +217,14 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
 (defun present (display)
   (assert-owner display)
   (when (and (display-open-p display) (display-damage display))
+    (when (eq (display-renderer-kind display) :gpu)
+      (synchronize-display-renderer display))
     (backend-blit (display-backend display) display
-                  (display-framebuffer display) (display-damage display))
+                  ;; Wayland negotiates direct GPU presentation before readback.
+                  (unless (and (eq (display-backend display) :wayland)
+                               (eq (display-renderer-kind display) :gpu))
+                    (display-framebuffer display))
+                  (display-damage display))
     (setf (display-damage display) nil))
   display)
 

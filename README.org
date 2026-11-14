@@ -23,6 +23,14 @@ Use =--display NAME=, =--rows N=, =--columns N= and =--title TITLE= to customize
 the window. The pinned runtime includes Terminus OTB and libxkbcommon. See
 [[file:docs/packaging.org][packaging]] for overrides and the installed Autolith dependency closure.
 
+Renderer selection is independent of the window backend. The default
+=--renderer auto= tries hardware GPU rendering, then uses the CPU renderer if
+GPU initialization is unavailable and cleanup succeeds. Use =--renderer gpu=
+to require hardware, or =--renderer cpu= to select CPU rendering explicitly.
+An explicit GPU request reports unavailability instead of silently selecting
+CPU. GPU rendering requires OpenGL ES 3 and an EGL context associated with an
+accessible DRM render node. See [[file:docs/gpu-foundation.org][GPU architecture and verification]].
+
 * Use inside Autolith
 Load this repository's =scripts/bootstrap.lisp=, then
 =(asdf:load-system "lispterm/autolith")= in the existing image. Invoke

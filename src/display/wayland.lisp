@@ -1,5 +1,10 @@
 (in-package #:lispterm.display.wayland)
 
+;; GPU module installs these hooks after the display system is loaded.
+(defvar *direct-present-hook* nil)
+(defvar *direct-close-hook* nil)
+(defvar *direct-metrics-hook* nil)
+
 (defstruct wayland-window protocol events (pending-frame-p nil))
 (defun window-protocol (display)
   (wayland-window-protocol (lispterm.display:display-backend-state display)))
@@ -38,14 +43,21 @@
   (let ((window (lispterm.display:display-backend-state display)))
     (when window
       (protocol-close (wayland-window-protocol window))
+        (when *direct-close-hook* (funcall *direct-close-hook* display))
       (setf (lispterm.display:display-backend-state display) nil))))
 (defun flush-window (display window)
-  (when (and (wayland-window-pending-frame-p window)
-             (protocol-present (wayland-window-protocol window)
-                               (lispterm.display:display-framebuffer display)
-                               (lispterm.display:display-width display)
-                               (lispterm.display:display-height display)))
-    (setf (wayland-window-pending-frame-p window) nil)))
+  (when (wayland-window-pending-frame-p window)
+    ;; A negotiated direct presenter returns :unsupported, :busy, or :presented.
+    ;; Only the unsupported case is allowed to request a CPU readback buffer.
+    (let ((direct (if *direct-present-hook* (funcall *direct-present-hook* display)
+                      :unsupported)))
+      (when (or (eq direct :presented)
+                (and (eq direct :unsupported)
+                     (protocol-present (wayland-window-protocol window)
+                                       (lispterm.display:display-framebuffer display)
+                                       (lispterm.display:display-width display)
+                                       (lispterm.display:display-height display))))
+        (setf (wayland-window-pending-frame-p window) nil)))))
 (defmethod lispterm.display:backend-blit ((backend (eql :wayland)) display framebuffer rectangles)
   (declare (ignore backend framebuffer rectangles))
   (let ((window (lispterm.display:display-backend-state display)))
@@ -99,7 +111,9 @@
           :frame-pending-p (wayland-state-frame-pending-p state)
           :buffer-scale (wayland-state-scale state)
           :configured-p (wayland-state-configured-p state)
-          :native-wayland-p t)))
+          :native-wayland-p t
+          :direct-presentation (when *direct-metrics-hook*
+                                 (funcall *direct-metrics-hook* state)))))
 
 (defmethod lispterm.display:backend-request-size ((backend (eql :wayland)) display request)
   (declare (ignore backend))

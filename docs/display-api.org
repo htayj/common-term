@@ -1,14 +1,18 @@
-#+title: Display interface, frozen Batch A
+#+title: Display interface
 
 * Ownership
 Package LISPTERM.DISPLAY (nickname LTD). Backends LISPTERM.DISPLAY.X11 and
 LISPTERM.DISPLAY.WAYLAND. Caller-thread-only operations. No terminal engine types.
-The shared core owns a CPU ARGB32 framebuffer, damage tracking, glyph cache and
-box drawing. Backends own transport, window handles and input translation.
+The shared core owns renderer selection, damage tracking and glyph masks.
+GPU mode composes in OpenGL ES 3; CPU mode uses an ARGB32 framebuffer.
+Backends own transport, window handles and input translation.
 
 * Public operations
 - open-display &key backend display-name title columns rows font-path font-size
-  returns a display. :auto selects native Wayland when available, otherwise X11.
+  renderer returns a display. Backend :auto selects native Wayland when
+  available, otherwise X11. Renderer defaults to :auto: try hardware GPU, then
+  CPU on clean initialization unavailability. :gpu requires hardware and :cpu
+  selects CPU explicitly. Cleanup failures propagate even in :auto mode.
 - close-display display is idempotent; display-open-p display returns a boolean.
 - reopen-display display returns a new display with the saved configuration.
 - poll-events display &key timeout returns a list of events (timeout seconds).
@@ -55,7 +59,7 @@ Exported mutable accessors are =display-backend-state=, =display-width=,
 =display-name=, =display-title=, =display-backend= and =display-configuration=.
 Each backend stores its own state structure in =display-backend-state=.
 Call =(resize-display display pixel-width pixel-height)= after native configure;
-it allocates the framebuffer and cell cache, marks full damage and returns a
+it resizes renderer storage and the cell cache, marks full damage and returns a
 =resize-event= to include in the backend event list. The session must redraw
 its grid after a resize. Preserve no references to the old framebuffer.
 
@@ -74,3 +78,8 @@ foreign event loop. Native input arrives as normalized event structures.
 Event predicates and accessors follow DEFSTRUCT conventions; constructors take
 keyword slot arguments. X11 =backend-metrics= also reports =:window-id=,
 =:depth= and =:bits-per-pixel=. Use the native window ID for external diagnostics.
+
+In GPU mode, =display-framebuffer= synchronizes pending composition and lazily
+reads pixels back for capture or readback-based transport. See
+[[file:gpu-foundation.org][GPU architecture and renderer API]] for context ownership, presentation and
+verification commands.

@@ -1,100 +1,116 @@
-#+title: GPU migration foundation and ownership
+#+title: Common Lisp GPU renderer
 
-* Status and dependency direction
-The CPU baseline is 56ca10b1367177b20d649f8144280a2fa20f3b02.
-This step adds loadable interfaces and fail-closed verification dispatch.
-Driver creation, shaders, model storage and GPU rendering are pending.
+* Selection and dependencies
+Use =bin/lispterm --renderer auto|gpu|cpu= independently of
+=--backend auto|x11|wayland=. The default =auto= requests hardware first.
+It selects CPU only for initialization unavailability after successful cleanup.
+An explicit =gpu= request propagates unavailability; cleanup errors propagate
+in either mode. Renderer choice does not change explicit backend selection.
 
-All GPU symbols are in =lispterm.gpu= (no nickname). The system
-=lispterm/gpu= depends only on CFFI, not on display or engine systems.
-Later the display system may depend on GPU; GPU must not depend on display.
-No libraries are loaded and no context is created merely by loading GPU.
-=src/gpu/package.lisp= and =lispterm.asd= have single integrator ownership.
-Export additional symbols from the owning component with =export= if needed;
-report additions so the integrator can consolidate package declarations later.
+The =lispterm/gpu= system and =lispterm.gpu= package contain the renderer,
+CFFI driver bindings, shader generation and pure atlas/instance models.
+The display system depends on GPU, not the reverse. Loading the system creates
+no context. Renderer, bindings, shaders and GPU tests are Common Lisp;
+existing shell/Nix files provide launch, dependency and verification glue.
 
-* Independent packages
-- A owns =src/gpu/{egl,gles,gbm,context}.lisp=, dependency/wrapper wiring,
-  =tests/gpu/{probe,software-control}-tests.lisp=. Create an ES3 context
-  with =open-context :software nil :device nil=, interrogate real driver
-  metadata via =context-info=, and implement owner/thread/process validation
-  and =close-context=. Reject software unless explicitly requested. Driver
-  calls must mask floating traps, unwind cleanly and avoid asynchronous
-  timeout interruption. Destroy resources before checkpoint/fork. GPU tests
-  may create offscreen contexts but never use inherited desktop endpoints.
-- B owns =src/gpu/{shader-dsl,shaders}.lisp= and
-  =tests/gpu/shader-tests.lisp=. =shader-form :vertex|:fragment= returns
-  Lisp data; =emit-shader form= returns generated GLSL ES3 text in memory.
-  B defines and documents the concrete AST. Coordinate record layout with D
-  before final attribute declarations. Invalid forms/stages must signal.
-- C owns =src/display/{package,protocol,framebuffer}.lisp=,
-  =src/launcher.lisp=, and =tests/run-display-tests.lisp=. Build CPU-only
-  renderer selection/seams first, retaining shared cache/damage decisions.
-  Keep existing default behavior until the real renderer is verified.
-  Use the neutral GPU renderer generic interface below, not GPU references
-  to display structs. C may add the one-way display-to-GPU ASDF dependency;
-  coordinate that single shared-file edit with the integrator.
-- D owns =src/gpu/{atlas,instances}.lisp= and =tests/gpu/atlas-tests.lisp=.
-  =make-atlas :tile-width :tile-height :capacity :max-capacity= returns a
-  pure model. =atlas-begin-frame atlas keys= protects the entire new frame's
-  glyph set before eviction. =atlas-ensure-glyph atlas key mask= returns
-  slot, epoch, upload-needed-p. Keys are immutable EQUAL grapheme/bold/span
-  lists; masks are row-major UB8 tile values (0 or 255, one byte per texel).
-  Epoch increases on eviction/growth, requiring a full instance rebuild.
-  =make-instance-buffer :columns :rows=, =instance-buffer-write= and
-  =instance-buffer-octets= own the actual packed layout. Validate coordinate,
-  slot and driver capacity limits; the proposed 16-byte layout is provisional.
-  D documents final layout/constants for B and the subsequent renderer agent.
+* Context and ownership
+=open-context &key software device= creates an offscreen OpenGL ES 3 context
+through EGL and GBM. Hardware selection checks the EGL device's association
+with the opened DRM render node and rejects =EGL_MESA_device_software=.
+=context-info= returns driver, EGL, device and runtime metadata. Explicit
+=:software t= is for the software-control test, not normal hardware selection.
 
-* Renderer contracts for C and subsequent E
-=make-renderer :context :width :height :cell-width :cell-height= uses positive
-logical pixel sizes. =renderer-resize= takes these four sizes positionally.
-=renderer-write-cell renderer column row= accepts =:glyph-key :mask
-:foreground :background :bold :underline :hidden :span :line-size=.
-Colors are final #xRRGGBB after inverse/cursor/reverse-screen parity. Coordinates
-are nonnegative, span is 1 or 2; line-size uses the existing display keywords
-=:single :double-width :double-height-top :double-height-bottom=.
-Mask data is glyph input, never a composed CPU frame. Atlas slot packing is D's
-responsibility. Define clipping/remainder handling before connecting GPU draw.
-=renderer-draw= performs uploads/draw. =renderer-readback= synchronizes pending
-state and returns top-left-origin row-major UB32 #xAARRGGBB. This is output for
-presentation/capture, not composition input. =renderer-metrics= reports measured
-counters; =renderer-close= releases resources before =close-context=.
-Only the display owner thread may create/use/close renderer/context resources.
-Record process identity too; a checkpoint must contain no active driver state.
+Create, use and close contexts and renderers on their owner thread in their
+creating process. =assert-context-owner= checks both identities and binds the
+context. Driver calls mask supported SBCL floating-point traps and protect
+native calls against asynchronous interruption. Close the renderer before
+=close-context=. Checked cleanup retains handles needed for retry.
 
-* Verification registration
-=lispterm/gpu-tests= loads the registry, language/delivery/foundation checks,
-and all per-agent test components. Each agent registers its implemented check
-with =lispterm.gpu.tests:register-check= in its assigned tests file.
-The no-argument function must assert real evidence and return exactly T.
-Unknown names, missing registrations, errors and non-T results fail the runner.
-No gate is implemented by a successful placeholder. =gpu-foundation= verifies
-only the scaffold and failure controls. The nine mission gates have early
-=tests/verify.sh= dispatch.
+The SBCL save hook refuses a heap with live GPU contexts. The host lifecycle
+quiesces the window owner and destroys graphical resources before checkpoint
+fork; reopening constructs fresh resources from logical session state.
 
-=gpu-language= includes committed, staged, unstaged and nonignored untracked
-migration paths. New code must be Lisp/.asd; docs may be .org/.md. Only the
-specified existing shell/Nix glue may change; adding shell/native/shader/Python
-source is rejected. Review actual glue diffs for minimal wiring.
+* Composition
+The display layer supplies raw glyph masks and resolved foreground/background
+colors. The bounded R8 atlas stores binary masks, keyed by copied
+grapheme/bold/span values. =atlas-begin-frame= protects the new frame's glyphs
+before eviction. Slot epochs invalidate stale instance mappings; successful
+uploads acknowledge pending atlas changes.
 
-=gpu-delivery= reads outer =preservation.sexp= and verifies preserved bytes,
-sizes, modes and exact dirty status; it requires clean tested tree HEAD equal
-to outer main HEAD. It then requires outer =independent-review.sexp= containing
-=:revision= (final hash), =:role :independent-review=, =:status :passed=,
-=:reviewer= (nonempty identity), =:evidence-path= (absolute real review artifact)
-and =:evidence-blob= (Git blob hash of that artifact). The primary authenticates
-independent review provenance before supplying that receipt. These external
-receipts avoid embedding a commit's own hash into that commit. No review receipt
-exists at foundation time. Delivery must fail until final review and integration.
+Each packed instance is 32 bytes: eight little-endian unsigned 32-bit words
+for column, row, atlas slot, flags, foreground, background, span and line code.
+Flags represent bold, underline and hidden text; line codes cover single,
+double-width and the two double-height halves. Lisp shader ASTs from
+=shader-form= are emitted by =emit-shader= as transient GLSL ES 3 strings.
+Instanced triangles sample masks and compose into an RGBA8 framebuffer.
+Overlapping wide cells retain uncovered fragments through scissored draws.
+Dirty atlas and instance ranges determine uploads.
 
-* Worktree and evidence
-All authored changes belong in outer =.build/gpu-migration/tree/=, not main.
-Outer =preservation.sexp= records initial HEAD/status plus path/mode/size/blob
-for all 21 pre-existing edits. Outer =preserved/= contains complete byte copies
-(647649 bytes total). No stash/reset/clean or dependency-tree hashing was used.
-Tree .build dependency/tool symlinks point at the same immutable closures as main.
-Run application fixtures only on verified private headless Xvfb/Sway endpoints.
-Signed local commits must use Taylor <htayj@users.noreply.github.com> as both
-author and committer. No remote, config, history rewrite, push or main integration
-belongs to the foundation step.
+* Renderer interface
+- =make-renderer :context :width :height :cell-width :cell-height= creates a
+  renderer using positive logical pixel sizes. The caller owns the context.
+- =renderer-resize renderer width height cell-width cell-height= changes sizes.
+- =renderer-write-cell renderer column row= accepts =:glyph-key :mask
+  :foreground :background :bold :underline :hidden :span :line-size=.
+  Colors are resolved =#xRRGGBB=; span is 1 or 2. Line sizes are =:single=,
+  =:double-width=, =:double-height-top= and =:double-height-bottom=.
+- =renderer-draw= uploads dirty data and executes pending GPU composition.
+- =renderer-readback= draws pending state and returns top-left-origin,
+  row-major unsigned 32-bit =#xAARRGGBB= pixels for presentation or capture.
+- =renderer-copy-target renderer target-fbo width height &key invert-y=
+  copies the rendered image entirely on the GPU to a distinct complete caller
+  framebuffer of matching dimensions. It can reverse destination Y and restores
+  read/draw framebuffer bindings and scissor state.
+- =renderer-metrics= returns operation and transfer counters.
+  =renderer-close= releases renderer resources before the caller closes context.
+
+* Presentation
+Hardware composition and window-buffer transport are separate choices.
+X11 transfers GPU-readback pixels using PutImage. Wayland supports the
+GPU-readback path through shared-memory buffers. Capture requests also use
+readback; the display caches it until the next pending frame change.
+
+The public Wayland presentation path exports dedicated EGLImage targets when
+linux-dmabuf capabilities permit import of their plane descriptors, formats and
+modifiers. Lisp Unix transport passes the file descriptors. Targets receive
+GPU copies with vertical inversion and checked completion, and remain reserved
+until compositor release. Unsupported capabilities use GPU-readback SHM.
+=gpu-wayland-dmabuf= verifies public presentation with zero readbacks, exact
+compositor pixels, release/reuse, resize, reopen and checked close/retry.
+
+A headless Sway fixture using pixman can display pixels composed by Lispterm's
+hardware GPU. That compositor choice is not proof of direct GPU buffer import.
+Direct-buffer verification requires a capable GLES compositor fixture.
+
+* Verification
+Run from the repository root after =scripts/bootstrap-deps --tests=.
+GPU checks use the pinned =scripts/sbcl= runtime. For example:
+
+#+begin_src sh
+tests/verify.sh gpu-probe
+tests/verify.sh gpu-software-control
+tests/verify.sh gpu-shader
+tests/verify.sh gpu-atlas
+tests/verify.sh gpu-first-frame
+tests/verify.sh gpu-offscreen
+tests/verify.sh gpu-evidence
+tests/verify.sh gpu-x11
+tests/verify.sh gpu-wayland
+tests/verify.sh gpu-lifecycle
+tests/verify.sh gpu-wayland-dmabuf
+tests/verify.sh gpu-language
+#+end_src
+
+=gpu-probe= checks real device-associated hardware and a draw/readback.
+=gpu-software-control= draws on an explicitly selected software device and
+checks hardware-policy rejection. First-frame/offscreen checks compare GPU
+pixels with the CPU reference. Evidence checks inspect actual uploads/draws
+and a shader negative control. Native gates use private displays; fixtures
+must not attach applications to inherited desktop endpoints.
+
+The Lisp test registry rejects unknown names, missing checks, errors and
+non-T results. =gpu-language= checks migration source types and the limited
+shell/Nix glue allowlist. =gpu-preservation= checks the original main-tree
+snapshot; =gpu-delivery= additionally requires final signed/integrated revision
+and authenticated independent-review evidence. These delivery receipts are
+separate from individual renderer checks.

@@ -42,8 +42,10 @@
 (defun registry-bind (state name interface version handler)
   (let* ((wire (wayland-state-wire state)) (id (wire-id wire interface handler)))
     (wire-send wire (wayland-state-registry state) 0 name (wl-string interface) version id) id))
+(defvar *protocol-global-hooks* nil)
 (defun bind-global (state name interface version)
   (let ((wire (wayland-state-wire state)))
+    (dolist (hook *protocol-global-hooks*) (funcall hook state name interface version))
     (cond
       ((and (string= interface "wl_compositor") (not (wayland-state-compositor state)))
        (when (< version 4) (wire-error "wl_compositor version 4 required" nil))
