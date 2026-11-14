@@ -10,9 +10,17 @@ if [[ -d $root/.build/test-tools/bin ]]; then
  export FASTFETCH=${FASTFETCH:-$root/.build/test-tools/bin/fastfetch}
 fi
 gate=${1:-}; shift "$(( $# > 0 ? 1 : 0 ))"
+# A gate whose Lisp runner is not written yet fails here, before any launch.
+run_lisp_gate() {
+ runner=$1; shift
+ [[ -f $runner ]] || { echo "Verification gate $gate is not implemented: missing $runner" >&2; exit 1; }
+ exec scripts/sbcl --script "$runner" "$@"
+}
 case $gate in
- gpu-shader|gpu-probe|gpu-software-control|gpu-atlas|gpu-offscreen|gpu-evidence|gpu-wayland-dmabuf|gpu-language|gpu-delivery|gpu-foundation|gpu-preservation|gpu-fixtures|gpu-first-frame|gpu-x11|gpu-wayland|gpu-lifecycle)
+ gpu-shader|gpu-probe|gpu-software-control|gpu-atlas|gpu-offscreen|gpu-evidence|gpu-wayland-dmabuf|gpu-language|gpu-delivery|gpu-foundation|gpu-preservation|gpu-fixtures|gpu-first-frame|gpu-x11|gpu-wayland|gpu-lifecycle|gpu-dma-release|gpu-wayland-first-resize)
   exec scripts/sbcl --script tests/run-gpu-tests.lisp "$gate" "$@" ;;
+ launcher) run_lisp_gate tests/run-launcher-tests.lisp "$@" ;;
+ real-wayland-launch) run_lisp_gate tests/run-real-wayland-launch.lisp "$@" ;;
  deps) exec scripts/sbcl --non-interactive --load scripts/bootstrap.lisp \
   --eval '(dolist (name (quote ("sb-bsd-sockets" "babel" "cffi" "bordeaux-threads" "alexandria" "fiveam" "zpng" "cl-weave" "xclhb" "struct+"))) (asdf:load-system name) (format t "DEPENDENCY ~A OK~%" name))' ;;
  unit|self-check)

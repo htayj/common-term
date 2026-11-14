@@ -175,14 +175,85 @@
 
 (in-package #:lispterm.display.wayland)
 (defstruct dma-protocol id formats buffers disabled-reason
-  (exports 0) (imports 0) (presents 0) (releases 0) (reuses 0) (finishes 0))
+  (exports 0) (imports 0) (presents 0) (releases 0) (reuses 0) (finishes 0)
+  (late-releases 0) (retired nil))
 (defstruct dma-buffer id target generation params (params-created-p nil)
   (params-destroyed-p nil) (import-pending-p nil) (complete-p nil)
   (busy-p nil) (uses 0) (protocol-destroyed-p nil))
 (defvar *dma-protocols* (make-hash-table :test #'eq :weakness :key))
 (defvar *dma-force-unsupported* nil)
 
+;;; Opt-in lifecycle diagnostics. LISPTERM_DMA_TRACE names the output file.
+;;; A line holds object IDs, opcodes, integer sizes and state flags. Strings,
+;;; descriptors and byte vectors are reduced to counts; registry, seat,
+;;; keyboard and format traffic is not recorded at all.
+(defvar *dma-trace-stream* nil)
+(defvar *dma-trace-lines* 0)
+(defparameter *dma-trace-limit* 20000)
+(defvar *dma-trace-wires* (make-hash-table :test #'eq :weakness :key))
+(defvar *dma-trace-serials* (make-hash-table :test #'eq :weakness :key))
+(defvar *dma-trace-next-serial* 0)
+
+(defun dma-trace-serial (buffer)
+  "Stable per-process identity of BUFFER, independent of its protocol ID."
+  (or (gethash buffer *dma-trace-serials*)
+      (setf (gethash buffer *dma-trace-serials*) (incf *dma-trace-next-serial*))))
+
+(defun dma-trace-same-id (dma id)
+  "Pool buffers currently carrying protocol ID: (serial busy destroyed generation)."
+  (loop for b in (dma-protocol-buffers dma)
+        when (eql id (dma-buffer-id b))
+          collect (list (dma-trace-serial b) (dma-buffer-busy-p b)
+                        (dma-buffer-protocol-destroyed-p b) (dma-buffer-generation b))))
+
+(defmacro dma-trace (state kind &rest details)
+  ;; Keep diagnostic identity allocation and pool walks off the untraced path.
+  `(when (and *dma-trace-stream* (< *dma-trace-lines* *dma-trace-limit*))
+     (dma-trace-write ,state ,kind ,@details)))
+
+(defun dma-trace-write (state kind &rest details)
+  (let ((stream *dma-trace-stream*))
+    (when (and stream (< *dma-trace-lines* *dma-trace-limit*))
+      (incf *dma-trace-lines*)
+      (let ((*print-pretty* nil) (*print-readably* nil) (*print-length* 32))
+        (format stream "~S~%"
+                (append (list *dma-trace-lines* (get-internal-real-time) kind
+                              :depth *wire-dispatch-depth*)
+                        (when state
+                          (list :gen (wayland-state-generation state)
+                                :size (list (wayland-state-width state) (wayland-state-height state))
+                                :frame-pending (wayland-state-frame-pending-p state)))
+                        details)))
+      (when (= *dma-trace-lines* *dma-trace-limit*) (format stream "(:truncated)~%"))
+      (finish-output stream))))
+
+(defun dma-trace-wire (kind wire object opcode data)
+  (let ((interface (if (= object 1) :display (gethash object (wire-interfaces wire)))))
+    (unless (member interface '(:registry :keyboard "wl_seat" "zwp_linux_dmabuf_v1")
+                    :test #'equal)
+      (dma-trace (gethash wire *dma-trace-wires*) kind
+                 :object object :interface interface :opcode opcode
+                 :words (if (eq kind :send)
+                            (loop for a in data
+                                  collect (cond ((integerp a) a) ((consp a) :fd)
+                                                (t (list :bytes (length a)))))
+                            (if (member interface '(:display :callback :buffer :dma-params :surface
+                                                    :xdg-surface :xdg-toplevel))
+                                (loop for offset from 0 below (min 12 (* 4 (floor (length data) 4))) by 4
+                                      collect (bytes-u32 data offset))
+                                (list :bytes (length data))))))))
+
+(defun dma-trace-open (path)
+  (setf *dma-trace-stream* (open path :direction :output :if-exists :append
+                                      :if-does-not-exist :create)
+        *dma-trace-lines* 0
+        *wire-trace* #'dma-trace-wire))
+
+(let ((path (uiop:getenv "LISPTERM_DMA_TRACE")))
+  (when (and path (plusp (length path))) (dma-trace-open path)))
+
 (defun dma-global (state name interface version)
+  (when *dma-trace-stream* (setf (gethash (wayland-state-wire state) *dma-trace-wires*) state))
   (when (and (string= interface "zwp_linux_dmabuf_v1") (>= version 3))
     (let ((dma (make-dma-protocol)))
       (setf (gethash state *dma-protocols*) dma
@@ -207,9 +278,100 @@
         (wire-send (wayland-state-wire state) (dma-buffer-params buffer) 0))
       (setf (dma-buffer-params-destroyed-p buffer) t))))
 
+;;; wl_buffer event ownership. A server-allocated ID belongs to one buffer from
+;;; its created event until wl_buffer.destroy is sent. No delete_id follows for
+;;; such an ID, so a release already in flight can arrive after the destroy.
+
+(defun dma-release-transition (busy-p retired-p opcode payload-length)
+  "Pure decision for one wl_buffer event: :RELEASE, :LATE-RELEASE, or the protocol
+error text. RETIRED-P means wl_buffer.destroy was already sent for the buffer."
+  (cond ((not (and (eql opcode 0) (eql payload-length 0))) "invalid dma wl_buffer.release")
+        (retired-p :late-release)
+        (busy-p :release)
+        (t "duplicate dma release")))
+
+(defun dma-release-apply (dma buffer opcode payload-length)
+  "Apply one wl_buffer event to BUFFER; NIL stands for the tombstone of a retired ID."
+  (let ((decision (dma-release-transition
+                   (and buffer (dma-buffer-busy-p buffer))
+                   (or (null buffer) (dma-buffer-protocol-destroyed-p buffer))
+                   opcode payload-length)))
+    (case decision
+      (:release (setf (dma-buffer-busy-p buffer) nil)
+                (incf (dma-protocol-releases dma)))
+      (:late-release (incf (dma-protocol-late-releases dma)))
+      (t (wire-error decision nil)))
+    decision))
+
+(defun dma-live-owner (dma id)
+  "The pool buffer whose undestroyed wl_buffer carries ID, or NIL."
+  (find-if (lambda (b) (and (eql id (dma-buffer-id b))
+                            (not (dma-buffer-protocol-destroyed-p b))))
+           (dma-protocol-buffers dma)))
+
+(defun dma-bind-release (state wire dma buffer id)
+  "Hand server-allocated ID to BUFFER at its created event. Wire order makes every
+later wl_buffer event on ID belong to BUFFER, so a tombstone on ID is replaced."
+  (unless (<= #xff000000 id #xffffffff)
+    (wire-error "dma-buf created ID outside the server range" nil))
+  (when (dma-buffer-id buffer) (wire-error "duplicate dma-buf created event" nil))
+  (when (dma-live-owner dma id) (wire-error "dma-buf created reuses a live wl_buffer ID" nil))
+  (sb-sys:without-interrupts
+    (setf (dma-protocol-retired dma) (delete id (dma-protocol-retired dma))
+          (gethash id (wire-interfaces wire)) :buffer
+          (gethash id (wire-handlers wire))
+          (lambda (event-id opcode payload)
+            (dma-trace state :release :id event-id :opcode opcode
+                       :buffer (dma-trace-serial buffer) :buffer-id (dma-buffer-id buffer)
+                       :busy (dma-buffer-busy-p buffer) :uses (dma-buffer-uses buffer)
+                       :buffer-gen (dma-buffer-generation buffer)
+                       :destroyed (dma-buffer-protocol-destroyed-p buffer)
+                       :pooled (and (member buffer (dma-protocol-buffers dma)) t)
+                       :same-id (dma-trace-same-id dma event-id))
+            (dma-release-apply dma buffer opcode (length payload)))
+          (dma-buffer-id buffer) id))
+  buffer)
+
+(defun dma-retire-release (state wire dma buffer &optional disconnected)
+  "Record that BUFFER's wl_buffer is destroyed. While connected its ID keeps a
+tombstone that counts and discards releases still in flight; the tombstone
+holds neither BUFFER nor its target. At disconnect the entry is removed."
+  (let ((id (dma-buffer-id buffer))
+        ;; Capture only a scalar, never BUFFER, in the retired handler.
+        (serial (and *dma-trace-stream* (< *dma-trace-lines* *dma-trace-limit*)
+                     (dma-trace-serial buffer))))
+    (sb-sys:without-interrupts
+      (setf (dma-buffer-protocol-destroyed-p buffer) t)
+      (when (and id wire (not (and dma (dma-live-owner dma id))))
+        (cond ((or disconnected (null dma))
+               (remhash id (wire-handlers wire))
+               (remhash id (wire-interfaces wire))
+               (when dma (setf (dma-protocol-retired dma) (delete id (dma-protocol-retired dma)))))
+              (t
+               (pushnew id (dma-protocol-retired dma))
+               (setf (gethash id (wire-handlers wire))
+                     (lambda (event-id opcode payload)
+                       (dma-trace state :release :id event-id :opcode opcode :buffer serial
+                                  :tombstone t :destroyed t
+                                  :same-id (dma-trace-same-id dma event-id))
+                       (dma-release-apply dma nil opcode (length payload))))))))
+    buffer))
+
+(defun dma-present-current-p (state display buffer generation width height)
+  "True while the values DMA-PRESENT captured still describe STATE, DISPLAY and BUFFER."
+  (let ((target (dma-buffer-target buffer)))
+    (and (= generation (wayland-state-generation state) (dma-buffer-generation buffer))
+         (= width (lispterm.display:display-width display) (lispterm.gpu:dma-target-width target))
+         (= height (lispterm.display:display-height display)
+            (lispterm.gpu:dma-target-height target)))))
+
 (defun dma-buffer-destroy (state buffer &optional disconnected)
   ;; An interrupted roundtrip may leave the server-created buffer ID in
   ;; flight. Retain this owner until its callback records that ID or failure.
+  (dma-trace state :destroy :buffer (dma-trace-serial buffer) :id (dma-buffer-id buffer)
+             :busy (dma-buffer-busy-p buffer) :buffer-gen (dma-buffer-generation buffer)
+             :import-pending (dma-buffer-import-pending-p buffer)
+             :already-destroyed (dma-buffer-protocol-destroyed-p buffer) :disconnected disconnected)
   (when (and (dma-buffer-import-pending-p buffer) (not disconnected))
     (protocol-roundtrip state)
     (when (dma-buffer-import-pending-p buffer)
@@ -219,7 +381,8 @@
     (sb-sys:without-interrupts
       (unless (or disconnected (null (dma-buffer-id buffer)))
         (wire-send (wayland-state-wire state) (dma-buffer-id buffer) 0))
-      (setf (dma-buffer-protocol-destroyed-p buffer) t)))
+      (dma-retire-release state (wayland-state-wire state) (gethash state *dma-protocols*)
+                          buffer disconnected)))
   (lispterm.gpu:dma-destroy (dma-buffer-target buffer)))
 
 (defun dma-import (state dma target)
@@ -234,11 +397,18 @@
                     (lambda (id opcode payload)
                       (declare (ignore id))
                       (case opcode
-                        (0 (unless (= 4 (length payload)) (wire-error "invalid dma-buf created event" nil))
-                           (sb-sys:without-interrupts
-                             (setf (dma-buffer-id buffer) (bytes-u32 payload 0)
-                                   (dma-buffer-import-pending-p buffer) nil)))
-                        (1 (setf failed t (dma-buffer-import-pending-p buffer) nil)))))))
+                         (0 (unless (= 4 (length payload)) (wire-error "invalid dma-buf created event" nil))
+                            (dma-trace state :created :buffer (dma-trace-serial buffer)
+                                       :id (bytes-u32 payload 0)
+                                       :handler-present (and (gethash (bytes-u32 payload 0) (wire-handlers wire)) t)
+                                       :same-id (dma-trace-same-id dma (bytes-u32 payload 0)))
+                             ;; The ID changes hands here, in wire order, before any
+                             ;; later event of this dispatch can address it.
+                             (sb-sys:without-interrupts
+                               (dma-bind-release state wire dma buffer (bytes-u32 payload 0))
+                               (setf (dma-buffer-import-pending-p buffer) nil)))
+                         (1 (dma-trace state :failed :buffer (dma-trace-serial buffer))
+                            (setf failed t (dma-buffer-import-pending-p buffer) nil)))))))
       (setf (dma-buffer-params buffer) params)
       (unwind-protect
            (progn
@@ -257,18 +427,15 @@
                           (lispterm.gpu:dma-target-height target)
                           (lispterm.gpu:dma-target-fourcc target) 0)
                (setf (dma-buffer-import-pending-p buffer) t))
-             (protocol-roundtrip state)
-             (when (or failed (not (dma-buffer-id buffer))) (return-from dma-import nil))
-             (setf (gethash (dma-buffer-id buffer) (wire-interfaces wire)) :buffer
-                   (gethash (dma-buffer-id buffer) (wire-handlers wire))
-                   (lambda (id opcode payload)
-                     (declare (ignore id))
-                     (unless (and (= opcode 0) (zerop (length payload)))
-                       (wire-error "invalid dma wl_buffer.release" nil))
-                     (unless (dma-buffer-busy-p buffer) (wire-error "duplicate dma release" nil))
-                     (setf (dma-buffer-busy-p buffer) nil)
-                     (incf (dma-protocol-releases dma))))
-             (incf (dma-protocol-imports dma)))
+              (dma-trace state :import-roundtrip-enter :buffer (dma-trace-serial buffer)
+                         :buffer-gen (dma-buffer-generation buffer)
+                         :target (list (lispterm.gpu:dma-target-width target)
+                                       (lispterm.gpu:dma-target-height target)))
+              (protocol-roundtrip state)
+              (dma-trace state :import-roundtrip-exit :buffer (dma-trace-serial buffer)
+                         :id (dma-buffer-id buffer) :failed failed)
+              (when (or failed (not (dma-buffer-id buffer))) (return-from dma-import nil))
+              (incf (dma-protocol-imports dma)))
         (dma-params-destroy state buffer))
       (setf (dma-buffer-complete-p buffer) t)
       buffer)))
@@ -299,6 +466,9 @@
     (wire-send wire (wayland-state-surface state) 3 callback)
     (wire-send wire (wayland-state-surface state) 8 1)
     (wire-send wire (wayland-state-xdg-surface state) 3 0 0 width height)
+    (dma-trace state :attach-commit :buffer (dma-trace-serial buffer) :id (dma-buffer-id buffer)
+               :busy-before (dma-buffer-busy-p buffer) :buffer-gen (dma-buffer-generation buffer)
+               :uses (dma-buffer-uses buffer) :commit (list width height) :frame-callback callback)
     (wire-send wire (wayland-state-surface state) 1 (dma-buffer-id buffer) 0 0)
     (wire-send wire (wayland-state-surface state) 2 0 0 width height)
     (setf (dma-buffer-busy-p buffer) t)
@@ -316,6 +486,13 @@
           (wayland-state-redraw-p state) nil)))
 
 (defun dma-present (display)
+  (dma-trace (window-protocol display) :present-enter
+             :display (list (lispterm.display:display-width display)
+                            (lispterm.display:display-height display)))
+  (let ((result :unwound))
+    (unwind-protect
+         (setf result
+               (block dma-present
   (let* ((state (window-protocol display)) (dma (gethash state *dma-protocols*)))
     (unless (and (eq (lispterm.display::display-renderer-kind display) :gpu)
                  dma (not *dma-force-unsupported*)
@@ -329,6 +506,7 @@
     (let* ((context (lispterm.display::display-renderer-context display))
            (width (lispterm.display:display-width display))
            (height (lispterm.display:display-height display))
+             (generation (wayland-state-generation state))
            (current (remove-if-not (lambda (b) (= (dma-buffer-generation b)
                                                    (wayland-state-generation state)))
                                    (dma-protocol-buffers dma)))
@@ -358,9 +536,29 @@
                    (setf (dma-protocol-disabled-reason dma) :compositor-import-failed)
                     (return-from dma-present :unsupported)))
             (unless (find target (dma-protocol-buffers dma) :key #'dma-buffer-target)
-              (lispterm.gpu:dma-destroy target)))))
+               (lispterm.gpu:dma-destroy target))))
+          ;; The import roundtrip dispatches events. A configure there leaves the
+          ;; captured size and generation stale: the pool keeps the new buffer and
+          ;; the frame stays unpresented for the caller's next attempt.
+          (unless (dma-present-current-p state display buffer generation width height)
+            ;; The reentrant resize sink clears this flag. Requeue the frame
+            ;; explicitly so FLUSH-WINDOW retries after the stale import.
+            (setf (wayland-window-pending-frame-p
+                    (lispterm.display:display-backend-state display)) t)
+            (dma-trace state :present-stale :buffer (dma-trace-serial buffer)
+                       :id (dma-buffer-id buffer) :buffer-gen (dma-buffer-generation buffer)
+                       :captured (list generation width height)
+                       :display (list (lispterm.display:display-width display)
+                                      (lispterm.display:display-height display)))
+            (return-from dma-present :busy)))
       (when (dma-buffer-busy-p buffer) (wire-error "attempted in-flight dma overwrite" nil))
       (when (plusp (dma-buffer-uses buffer)) (incf (dma-protocol-reuses dma)))
+      (dma-trace state :copy :buffer (dma-trace-serial buffer) :id (dma-buffer-id buffer)
+                 :buffer-gen (dma-buffer-generation buffer) :captured (list width height)
+                 :display (list (lispterm.display:display-width display)
+                                (lispterm.display:display-height display))
+                 :target (list (lispterm.gpu:dma-target-width (dma-buffer-target buffer))
+                               (lispterm.gpu:dma-target-height (dma-buffer-target buffer))))
       (lispterm.gpu:renderer-copy-target (lispterm.display::display-renderer-state display)
                                        (lispterm.gpu:dma-target-framebuffer (dma-buffer-target buffer))
                                        width height :invert-y t)
@@ -370,7 +568,10 @@
       (incf (dma-protocol-finishes dma))
       (dma-commit state buffer width height)
       (incf (dma-buffer-uses buffer))
-      (incf (dma-protocol-presents dma)) :presented)))
+      (incf (dma-protocol-presents dma)) :presented))))
+      (dma-trace (window-protocol display) :present-exit :result result
+                 :display (list (lispterm.display:display-width display)
+                                (lispterm.display:display-height display))))))
 
 (defun dma-close-display (display)
   ;; Backend disconnect occurs first, invalidating every compositor reference.
@@ -381,6 +582,12 @@
       (loop while (dma-protocol-buffers dma) do
         (dma-buffer-destroy state (first (dma-protocol-buffers dma)) t)
         (pop (dma-protocol-buffers dma)))
+      (let ((wire (wayland-state-wire state)))
+        (when wire
+          (dolist (id (dma-protocol-retired dma))
+            (remhash id (wire-handlers wire))
+            (remhash id (wire-interfaces wire)))))
+      (setf (dma-protocol-retired dma) nil)
       (remhash state *dma-protocols*))))
 
 (defun dma-metrics (state)
@@ -388,6 +595,7 @@
     (when dma
       (list :exports (dma-protocol-exports dma) :imports (dma-protocol-imports dma)
             :presents (dma-protocol-presents dma) :releases (dma-protocol-releases dma)
+            :late-releases (dma-protocol-late-releases dma)
             :reuses (dma-protocol-reuses dma) :gpu-finishes (dma-protocol-finishes dma)
             :disabled-reason (dma-protocol-disabled-reason dma)
             :format-modifier-count (length (dma-protocol-formats dma))

@@ -27,7 +27,8 @@
   ;; Isolate dispatch controls from all real registrations.
   (let ((*checks* (make-hash-table :test #'equal)))
     (dolist (name '("gpu-probe" "gpu-preservation" "gpu-fixtures" "gpu-first-frame"
-                    "gpu-x11" "gpu-wayland" "gpu-lifecycle"))
+                    "gpu-x11" "gpu-wayland" "gpu-lifecycle"
+                    "gpu-dma-release" "gpu-wayland-first-resize"))
       (expect-error (lambda () (run-check name))))
     (expect-error (lambda () (run-check "unknown")))
     (expect-error (lambda () (register-check "unknown" (constantly t))))

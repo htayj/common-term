@@ -9,7 +9,8 @@
   '("gpu-shader" "gpu-probe" "gpu-software-control" "gpu-atlas"
     "gpu-offscreen" "gpu-evidence" "gpu-wayland-dmabuf"
     "gpu-language" "gpu-delivery" "gpu-foundation" "gpu-preservation"
-    "gpu-fixtures" "gpu-first-frame" "gpu-x11" "gpu-wayland" "gpu-lifecycle"))
+    "gpu-fixtures" "gpu-first-frame" "gpu-x11" "gpu-wayland" "gpu-lifecycle"
+    "gpu-dma-release" "gpu-wayland-first-resize"))
 
 (defun check (test format-control &rest args)
   (unless test (error (apply #'format nil format-control args)))

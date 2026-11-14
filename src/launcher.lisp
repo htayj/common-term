@@ -102,17 +102,56 @@
       (ignore-errors (lispterm.pty:close-pty pty))
       (cl:close diagnostics))))
 
+(defun display-failures (errors)
+  "The display and display-close entries of HOST-ERRORS output, oldest first.
+The window owner records them when it detaches after an error; a window the
+user closed and a child that exited record neither."
+  (reverse (remove-if-not (lambda (entry)
+                            (member (getf entry :operation) '(:display :display-close)))
+                          errors)))
+
+(defun failure-line (entry)
+  (format nil "lispterm: ~(~A~) error: ~A" (getf entry :operation) (getf entry :message)))
+
+(defun run-shell (options argv)
+  "Run ARGV in a window until it exits or the window goes away, then close the
+host and reap the child. Return the exit code: 1 after reporting display or
+close errors on *ERROR-OUTPUT*, otherwise 0."
+  (let* ((host (apply #'open :argv argv options))
+         (pty (session-pty (host-session host)))
+         (close-error nil))
+    (unwind-protect
+         (progn
+           (loop for status = (status host)
+                 until (or (member (getf status :state) '(:closed :detached))
+                           (member (getf status :process-state) '(:exited :signaled)))
+                 do (sleep .05))
+           (handler-case (close host)
+             ;; The host closed; input the child never read goes with the window.
+             (input-cancelled () nil)
+             (error (condition) (setf close-error condition)))
+           (let ((failures (display-failures (host-errors host))))
+             (dolist (entry failures)
+               (format *error-output* "~A~%" (failure-line entry)))
+             (when close-error
+               (format *error-output* "lispterm: close error: ~A~%" close-error))
+             (finish-output *error-output*)
+             (if (or failures close-error) 1 0)))
+      ;; A host whose display cannot close keeps its PTY and child. They are
+      ;; ours alone, so hang up, kill if needed, and reap before leaving.
+      (lispterm.pty:close-pty pty))))
+
 (defun main (&optional (arguments (uiop:command-line-arguments)))
-  "Start a graphical shell, or Autolith in the current SBCL image."
+  "Start a graphical shell, or Autolith in the current SBCL image.
+The shell ends this process with status 1 after a display or close error."
   (multiple-value-bind (options autolith-p argv) (launcher-options arguments)
     (unless (eq argv :help)
       (if autolith-p
           (launch-autolith options argv)
-          (let ((host (apply #'open :argv argv options)))
-            (unwind-protect
-                 (loop for status = (uiop:symbol-call :lispterm :status host)
-                       until (or (member (getf status :state) '(:closed :detached))
-                                 (member (getf status :process-state) '(:exited :signaled)))
-                       do (sleep .05))
-              (close host))))))
+          (let ((code (run-shell options argv)))
+            (unless (zerop code)
+              (finish-output *standard-output*)
+              ;; An owner whose display cannot close is still running: leave
+              ;; without waiting for it.
+              (sb-ext:exit :code code :abort t))))))
   nil)

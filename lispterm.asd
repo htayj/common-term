@@ -161,10 +161,11 @@
 
 (defsystem "lispterm/gpu-tests"
   :license "MIT" :depends-on ("lispterm/gpu" "lispterm") :serial t
-  :components ((:module "tests/gpu" :serial t :components (
-    (:file "registry") (:file "language-tests") (:file "delivery-tests")
-    (:file "foundation-tests") (:file "fixture-tests")
-    (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
-    (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
-    (:file "native-tests") (:file "lifecycle-tests")
-    (:file "direct-compositor") (:file "dmabuf-tests")))))
+  :components ((:module "tests/gpu" :serial t :components
+    ((:file "registry") (:file "language-tests") (:file "delivery-tests")
+     (:file "foundation-tests") (:file "fixture-tests")
+     (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
+     (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
+     (:file "native-tests") (:file "lifecycle-tests")
+     (:file "direct-compositor") (:file "dmabuf-tests")
+     (:file "dma-release-tests") (:file "first-resize-tests")))))

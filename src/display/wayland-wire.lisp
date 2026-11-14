@@ -69,9 +69,15 @@
     (incf (wire-next-id wire))
     (setf (gethash id (wire-interfaces wire)) interface
           (gethash id (wire-handlers wire)) handler) id))
+;; Opt-in diagnostics. The hook sees object IDs, opcodes and raw arguments;
+;; it alone decides what is safe to record.
+(defvar *wire-trace* nil
+  "NIL, or a function of (KIND WIRE OBJECT OPCODE DATA) called for :SEND and :EVENT.")
+(defvar *wire-dispatch-depth* 0)
 (defun wire-send (wire object opcode &rest arguments)
   "Arguments are 32-bit words, encoded byte vectors, or (:FD integer).
 SCM_RIGHTS does not occupy bytes in the protocol body."
+  (when *wire-trace* (funcall *wire-trace* :send wire object opcode arguments))
   (let* ((fds (loop for a in arguments when (consp a) collect (second a)))
          (body (apply #'concatenate '(vector (unsigned-byte 8))
                       (loop for a in arguments unless (consp a)
@@ -154,11 +160,14 @@ SCM_RIGHTS does not occupy bytes in the protocol body."
         do (unless (and (>= size 8) (zerop (mod size 4)))
              (wire-error "invalid message size" nil))
            (when (< (length bytes) size) (return))
-           (let ((handler (gethash object (wire-handlers wire))))
+           (let ((handler (gethash object (wire-handlers wire)))
+                 (payload (subseq bytes 8 size)))
+             (when *wire-trace* (funcall *wire-trace* :event wire object opcode payload))
              (unless handler (wire-error (format nil "unknown object ~D" object) nil))
              ;; Remove before dispatch. A handler may recursively pump during initialization.
              (setf (wire-bytes wire) (subseq bytes size))
-             (funcall handler object opcode (subseq bytes 8 size)))))
+             (let ((*wire-dispatch-depth* (1+ *wire-dispatch-depth*)))
+               (funcall handler object opcode payload)))))
 (defun wire-fd-pop (wire)
   (or (pop (wire-fds wire)) (wire-error "missing received file descriptor" nil)))
 (defun payload-string (payload offset)
