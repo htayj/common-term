@@ -95,17 +95,22 @@ case ${1:-run} in
   run) ;;
   *) echo 'Usage: tests/wayland-gate.sh [run | start DIR [SCALE] | stop DIR]' >&2; exit 2;;
 esac
-rm -f "$artifacts"/{ready,keys,resized,scale2,capture-requested,capture-ready,disconnect-requested,connection-lost,reopen-requested,passed}
+rm -f "$artifacts"/{ready,keyboard-ready,keys,resized,scale2,capture-requested,capture-ready,disconnect-requested,connection-lost,reopen-requested,passed}
 client=''
 art=$artifacts backend=wayland scale=1
 trap 'stop_owned; stop "$artifacts"' EXIT
 start "$artifacts"
 # shellcheck disable=SC1090
 source "$artifacts/env.sh"
+# Keep a real keyboard capability available while the client subscribes.
+# Its initial resize redraw may outlast a short-lived typing session.
+"$WTYPE" -s 180000 > "$artifacts/keyboard-holder.log" 2>&1 & keyboard_holder=$!
+remember "$keyboard_holder"
 "$root/scripts/sbcl" --script tests/run-wayland-tests.lisp > "$artifacts/client.log" 2>&1 & client=$!
 remember "$client"
 audit_client_tree || { stop_owned; exit 1; }
 wait_for "$artifacts/ready"
+wait_for "$artifacts/keyboard-ready"
 # wtype creates a real zwp_virtual_keyboard_v1 on this compositor, not synthetic client events.
 "$WTYPE" -s 300 -k a -k Up -M ctrl -k c -m ctrl -P b -s 900 -p b
 wait_for "$artifacts/keys"

@@ -53,8 +53,10 @@ case $gate in
  fastfetch-wayland) exec tests/fastfetch-gate.sh wayland ;;
  vttest-area) export LISPTERM_VTTEST_AREA_CLI=1; exec scripts/sbcl --script tests/vttest-area.lisp "$@" ;;
  vttest-area-controls) exec scripts/sbcl --script tests/run-vttest-area-tests.lisp "$@" ;;
- vttest-x11) exec tests/vttest-gate.sh x11 ;;
- vttest-wayland) exec tests/vttest-gate.sh wayland ;;
+ vttest-x11|vttest-wayland)
+  # These are acceptance gates. Use vttest-gate.sh directly for baseline recording.
+  export LISPTERM_VTTEST_MODE=accept LISPTERM_VTTEST_REQUIRE_GPU=1
+  exec tests/vttest-gate.sh "${gate#vttest-}" ;;
  vttest-check) exec scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$@" ;;
  vttest-harness) exec tests/vttest-harness-tests.sh ;;
  packaging) exec tests/packaging-gate.sh "$@" ;;

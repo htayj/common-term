@@ -2,6 +2,8 @@
 (load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
 (asdf:load-system "lispterm")
 (load (merge-pathnames "vttest-protocol.lisp" *load-truename*))
+(load (merge-pathnames "vttest-gpu.lisp" *load-truename*))
+(defparameter *require-gpu* (string= "1" (uiop:getenv "LISPTERM_VTTEST_REQUIRE_GPU")))
 ;; The shell preflights and pins this private snapshot before native startup.
 (load (merge-pathnames "vttest-selection.lisp"
         (uiop:ensure-directory-pathname (uiop:getenv "LISPTERM_VTTEST_ARTIFACTS"))))
@@ -381,7 +383,15 @@
                      when (expired-p end) do (error "Normal exit/hangup deadline") do (sleep .05))
                (unless (eql 0 (vttest-check:read-value (artifact (format nil "~a.exit" label))))
                  (error "Missing or nonzero vttest exit marker"))
-               (event :exit))
+               (event :exit)
+               (when *require-gpu*
+                 ;; OPEN above intentionally has no renderer override: exercise :AUTO.
+                 ;; Save actual metrics before asserting so failed evidence is retained.
+                 (let ((receipt (list :label label :backend backend :renderer-request :auto
+                                      :mode (if *accept* :accept :record)
+                                      :status (lispterm:status host))))
+                   (record-value (format nil "~a.gpu.sexp" label) receipt)
+                   (vttest-gpu:validate-receipt receipt label backend))))
            (error (c) (setf failure (princ-to-string c))
              (record-value (format nil "~a.failure.sexp" label) (list :phase *phase* :error failure))))
       (when host

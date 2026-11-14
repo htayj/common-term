@@ -56,6 +56,9 @@
                                (if (probe-file (artifact "disconnect-requested"))
                                    (progn (setf lost t) nil) (error c)))))
               (typecase event
+                (ltd:focus-event
+                 (when (ltd:focus-event-focused-p event)
+                   (marker "keyboard-ready")))
                 (ltd:key-event (push event keys)
                                (marker "keys" (mapcar (lambda (key)
                                                         (list (ltd:key-event-key key)

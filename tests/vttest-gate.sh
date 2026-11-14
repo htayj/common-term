@@ -369,6 +369,9 @@ export LISPTERM_VTTEST_SCALE=$scale
 mode=${LISPTERM_VTTEST_MODE:-record}
 [[ $mode == record || $mode == accept ]] || { echo 'Mode must be record or accept' >&2; exit 2; }
 export LISPTERM_VTTEST_MODE=$mode
+require_gpu=${LISPTERM_VTTEST_REQUIRE_GPU:-0}
+[[ $require_gpu == 0 || $require_gpu == 1 ]] || { echo 'REQUIRE_GPU must be 0 or 1' >&2; exit 2; }
+export LISPTERM_VTTEST_REQUIRE_GPU=$require_gpu
 export PATH="$root/.build/test-tools/bin:$PATH"
 export LISPTERM_SBCL=${LISPTERM_SBCL:-$root/.build/deps/bin/sbcl}
 # Validate the actual catalog/helper before fixtures, upstream or native startup.
@@ -445,7 +448,7 @@ trap cleanup EXIT
 trap 'fixture_error "$?" "${BASH_SOURCE[0]}" "$LINENO" "${FUNCNAME[0]:-main}"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/vttest-selection.lisp tests/verify.sh scripts/deps.nix "$art/"
+cp tests/vttest-gate.sh tests/vttest-gate.lisp tests/vttest-protocol.lisp tests/vttest-selection.lisp tests/vttest-gpu.lisp tests/verify.sh scripts/deps.nix "$art/"
 # Hashing in cleanup covers this actual launch dependency as well as its copy.
 if [[ $backend == wayland ]]; then cp tests/wayland-gate.sh "$art/"; fi
 # Optional area-driver receipt binds this new mktemp capture to its sole launch.
@@ -465,6 +468,7 @@ fi
   printf 'recorder-version=3\nmode=%s\nfilter=%s\nbackend=%s\ntitle=%s\n' "$mode" "${LISPTERM_VTTEST_FILTER:-all}" "$backend" "$LISPTERM_VTTEST_TITLE"
   printf 'exact-labels=%s\nselector-sha256=%s\nselector-snapshot=%s\n' "${LISPTERM_VTTEST_EXACT_LABELS:-}" "$selector_sha" "$art/vttest-selection.lisp"
   printf 'fixture-scale=%s\n' "$scale"
+  printf 'require-hardware-default-gpu=%s\n' "$require_gpu"
   printf 'on-phase-supplements=%s\n' "${LISPTERM_VTTEST_ON_PHASE:-0}"
   printf 'pinned-binary=%s\noverride=%s\n' "$(realpath "$pinned")" "$([[ $(realpath "$VTTEST") == "$(realpath "$pinned")" ]] && echo false || echo true)"
   printf 'binary=%s\nsbcl=%s\nfont=%s\n' "$(realpath "$VTTEST")" "$(realpath "$LISPTERM_SBCL")" "$LISPTERM_FONT"
@@ -686,4 +690,9 @@ fixture_wait_client; client=''
 [[ -f $art/finished.sexp ]]
 check_mode=measure; [[ $mode != accept ]] || check_mode=accept
 scripts/sbcl --script tests/vttest-protocol.lisp --vttest-check "$check_mode" "$art" > "$art/offline-check.log"
+if [[ $require_gpu == 1 ]]; then
+  scripts/sbcl --non-interactive --load tests/vttest-gpu.lisp \
+    --eval '(vttest-gpu:check-directory (sb-ext:posix-getenv "LISPTERM_VTTEST_ARTIFACTS"))' \
+    > "$art/gpu-check.log"
+fi
 echo "Recorder v3 $mode complete (mechanical checks only, visual acceptance separate)"
