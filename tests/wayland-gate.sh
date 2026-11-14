@@ -62,8 +62,8 @@ CONFIG
   fixture_outputs "$dir/outputs.json" || return 1
   printf 'fixture-scale=%s\n' "$scale" >> "$dir/isolation.txt"
   {
-    printf 'clear_session_endpoints\n'
-    printf 'unset DISPLAY\n'
+    printf 'for key in ${!DBUS_@}; do unset "$key"; done\n'
+    printf 'unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE\n'
     printf 'export XDG_RUNTIME_DIR=%q\nexport WAYLAND_DISPLAY=wayland-1\nexport SWAYSOCK=%q\n' "$runtime" "$socket"
     printf 'export LISPTERM_XKBCOMMON_LIBRARY=%q\n' "${LISPTERM_XKBCOMMON_LIBRARY:-}"
     printf 'export LISPTERM_SWAYMSG=%q\nexport LISPTERM_WTYPE=%q\nexport LISPTERM_GRIM=%q\n' "$SWAYMSG" "$WTYPE" "$GRIM"

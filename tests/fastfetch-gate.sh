@@ -99,6 +99,6 @@ if [[ -s $art/original-evidence.sha256 ]]; then
   sha256sum --check "$art/original-evidence.sha256"
 fi
 sha256sum "$art/transcript.raw" "$art/grid.txt" "$art/original.png" > "$art/provenance.sha256"
-printf '%s\n' "$art" > ".git/fastfetch-${backend}-latest"
+printf '%s\n' "$art" > "$root/.build/evidence/fastfetch-${backend}-latest"
 echo "Fastfetch $backend passed: $art"
 cat "$art/host.sexp"

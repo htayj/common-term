@@ -53,10 +53,12 @@ when the owner is supervising a display retained by failed startup."
       (error 'host-error :operation :join :host host :detail "Native display cleanup is pending"))
     (sb-thread:with-mutex ((host-lock host)) (setf (host-thread host) nil))))
 
-(defun open (&key argv pty (backend :auto) display-name (title "Lispterm") (rows 24) (columns 80))
+(defun open (&key argv pty (backend :auto) (renderer :auto) display-name (title "Lispterm") (rows 24) (columns 80))
   "Open a graphical PTY host. Supplying PTY adopts it without spawning a child."
   (unless (member backend '(:auto :x11 :wayland))
     (error 'host-error :operation :open :detail "Backend must be :auto, :x11, or :wayland"))
+  (unless (member renderer '(:auto :gpu :cpu))
+    (error 'host-error :operation :open :detail "Renderer must be :auto, :gpu, or :cpu"))
   (unless (and (typep rows '(integer 1 300)) (typep columns '(integer 1 500)))
     (error 'host-error :operation :open :detail "Grid exceeds 500 columns or 300 rows"))
   (when (and pty argv)
@@ -69,7 +71,7 @@ when the owner is supervising a display retained by failed startup."
          (pty (or pty (lispterm.pty:open-pty :rows rows :columns columns)))
          (host (%make-host :id (sb-thread:with-mutex (*hosts-lock*) (incf *next-host-id*))
                           :session (make-session pty rows columns)
-                          :configuration (list :backend backend :display-name display-name :title title)))
+                          :configuration (list :backend backend :renderer renderer :display-name display-name :title title)))
          (startup (make-host-command
                    :operation :startup
                    :argument (when created-p

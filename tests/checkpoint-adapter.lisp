@@ -17,6 +17,17 @@
   (loop repeat 100
         when (> (getf (lispterm:status host) :bytes-received) before) return t
         do (sleep .05)))
+(defun check-hardware (host)
+  (loop repeat 200
+        for metrics = (getf (lispterm:status host) :geometry)
+        when (plusp (or (getf metrics :draw-calls) 0)) do
+          (let ((driver (getf metrics :driver)))
+            (check (and (eq :gpu (getf metrics :renderer))
+                        (getf driver :device-associated-p) (not (getf driver :software-p))
+                        (plusp (getf metrics :readbacks))) "actual hardware GPU frame")
+            (return-from check-hardware metrics))
+        do (sleep .05)
+        finally (error "No actual GPU frame: ~S" (lispterm:host-errors host))))
 (defun make-backend (registry)
   (autolith::checkpoint-backend-create
    (autolith::configuration-create :defer-provider-validation-p t) nil :tool-registry registry))
@@ -44,6 +55,8 @@
     (unwind-protect
          (progn
            (setf second (shell-host))
+           (check-hardware first)
+           (check-hardware second)
            (lispterm.autolith:adopt-host second :runtime runtime)
            (lispterm.autolith:adopt-host first :runtime runtime)
            (check (eq owner (lispterm.autolith:register-runtime registry runtime)) "registration is idempotent")
@@ -53,11 +66,14 @@
              (validate backend)
              (check (not (getf (lispterm:status first) :worker-alive-p)) "validation joined first window owner")
              (check (not (getf (lispterm:status second) :worker-alive-p)) "validation joined second window owner")
+             (lispterm.gpu::require-no-live-contexts)
              (check (lispterm.pty:pty-open-p (lispterm::session-pty (lispterm::host-session first))) "parent master retained before fork")
              (resume-backend backend)
              (check (eq :attached (getf (lispterm:status first) :state)) "parent window resumed")
              (resume-backend backend)
              (check (getf (lispterm:status first) :worker-alive-p) "resume is idempotent"))
+           (check-hardware first)
+           (check-hardware second)
            ;; Failure after this owner succeeded must recover through the actual
            ;; backend's retained successful-tool list.
            (let ((failure (make-instance 'failing-tool :namespace "test" :name "fail"

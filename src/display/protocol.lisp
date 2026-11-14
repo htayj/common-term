@@ -63,10 +63,13 @@
   (apply (gpu-interface name) arguments))
 
 (defun gpu-unavailable-p (condition)
+  "Only initialization unavailability permits auto fallback, never retained resources."
   (let* ((package (find-package "LISPTERM.GPU"))
-         (type (and package (find-symbol "GPU-UNAVAILABLE" package))))
-    (or (typep condition 'renderer-unavailable)
-        (and type (find-class type nil) (typep condition type)))))
+         (type (and package (find-symbol "GPU-UNAVAILABLE" package)))
+         (cleanup (and package (find-symbol "GPU-CLEANUP-ERROR" package))))
+    (and (not (and cleanup (find-class cleanup nil) (typep condition cleanup)))
+         (or (typep condition 'renderer-unavailable)
+             (and type (find-class type nil) (typep condition type))))))
 
 (defun close-display-renderer (display)
   "Keep each resource handle until its own retryable close succeeds."
@@ -95,6 +98,13 @@
                 (display-renderer-pending-p display) t
                 (display-readback-pending-p display) t))
       (error (condition)
+        ;; OPEN-CONTEXT can fail after acquiring native state. Retain it for
+        ;; owner-thread cleanup, including when that cleanup itself fails.
+        (let* ((package (find-package "LISPTERM.GPU"))
+               (type (and package (find-symbol "GPU-CLEANUP-ERROR" package))))
+          (when (and type (find-class type nil) (typep condition type))
+            (setf (display-renderer-context display)
+                  (gpu-call "CLEANUP-ERROR-CONTEXT" condition))))
         (close-display-renderer display)
         (if (and (eq (display-renderer-request display) :auto)
                  (gpu-unavailable-p condition))
@@ -133,7 +143,7 @@
 
 (defun open-display (&key (backend :auto) display-name (title "Lispterm")
                           (columns 80) (rows 24) font-path (font-size 16)
-                          (renderer :cpu))
+                          (renderer :auto))
   (unless (member renderer '(:cpu :gpu :auto))
     (error 'display-error :detail "Renderer must be :cpu, :gpu, or :auto"))
   (check-type columns (integer 1 10000))

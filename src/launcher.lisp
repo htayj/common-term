@@ -2,7 +2,7 @@
 (in-package #:lispterm)
 
 (defun launcher-options (arguments)
-  (let ((options (list :backend :auto :rows 30 :columns 100))
+  (let ((options (list :backend :auto :renderer :auto :rows 30 :columns 100))
         (autolith-p nil) (argv nil))
     (labels ((value (name)
                (or (pop arguments) (error "Missing value after ~A" name)))

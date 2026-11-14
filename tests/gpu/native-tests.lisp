@@ -1,0 +1,82 @@
+(in-package #:lispterm.gpu.tests)
+
+(defun call-private-display (backend function)
+  "Start and verify an owned isolated server before connecting any application."
+  (dolist (name '("DISPLAY" "WAYLAND_DISPLAY" "WAYLAND_SOCKET"))
+    (check (not (uiop:getenv name)) "Inherited desktop endpoint ~A" name))
+  (let* ((directory (merge-pathnames (format nil ".build/gpu-native-~A-~D/" backend (get-internal-real-time)) *root*))
+         (process nil) (runtime nil) (pid nil))
+    (ensure-directories-exist directory)
+    (unwind-protect
+         (ecase backend
+           (:x11
+            (let ((number-file (merge-pathnames "number" directory)))
+              (setf process (uiop:launch-program
+                             (list "env" "-u" "DISPLAY" "-u" "WAYLAND_DISPLAY" "-u" "WAYLAND_SOCKET"
+                                   "-u" "XAUTHORITY" "Xvfb" "-displayfd" "1" "-screen" "0" "1280x800x24" "-nolisten" "tcp")
+                             :input nil :output number-file :error-output (merge-pathnames "server.log" directory))
+                    pid (uiop:process-info-pid process))
+              (fixture-wait (lambda () (check (uiop:process-alive-p process) "Xvfb exited")
+                                     (and (probe-file number-file) (plusp (length (fixture-read number-file))))) "owned Xvfb")
+              (let* ((number (parse-integer (fixture-read number-file)))
+                     (socket (format nil "/tmp/.X11-unix/X~D" number)))
+                (check (or (fixture-socket-owner-p pid socket)
+                           (fixture-socket-owner-p pid (concatenate 'string "@" socket))) "Unowned X11 socket")
+                (funcall function (format nil ":~D" number)))))
+           (:wayland
+            (fixture-command (list "tests/wayland-gate.sh" "start" (namestring directory)))
+            (setf runtime (fixture-read (merge-pathnames "runtime-path" directory))
+                  pid (parse-integer (fixture-read (merge-pathnames "compositor.pid" directory))))
+            (check (= #o700 (logand #o777 (sb-posix:stat-mode (sb-posix:stat runtime)))) "Runtime not private")
+            (check (fixture-socket-owner-p pid (format nil "~A/wayland-1" runtime)) "Unowned Wayland socket")
+            (let ((environment (uiop:read-file-string (format nil "/proc/~D/environ" pid))))
+              (check (and (search "WLR_BACKENDS=headless" environment)
+                          (search "WLR_RENDERER=pixman" environment)) "Not explicit headless compositor"))
+            (funcall function (format nil "~A/wayland-1" runtime))))
+      (when process
+        (when (uiop:process-alive-p process) (uiop:terminate-process process))
+        (uiop:wait-process process)
+        (check (not (uiop:process-alive-p process)) "Owned Xvfb survived cleanup"))
+      (when runtime
+        (fixture-command (list "tests/wayland-gate.sh" "stop" (namestring directory)))
+        (fixture-wait (lambda () (not (probe-file (format nil "~A/wayland-1" runtime)))) "owned Wayland cleanup")
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname runtime) :validate t)))))
+
+(defun native-parity-frame (display)
+  (let* ((width (lispterm.display::display-width display))
+         (height (lispterm.display::display-height display))
+         (cpu (parity-display width height)))
+    (dotimes (row (lispterm.display::display-rows display))
+      (dotimes (column (lispterm.display::display-columns display))
+        (let ((cell (lispterm.display::make-cell :char (char "AgW# " (mod (+ row column) 5))
+                    :fg #xe1ab73 :bg #x123456 :bold (oddp column) :underline (= 2 (mod column 4)))))
+          (lispterm.display::render-cpu-cell cpu row column cell)
+          (lispterm.display::render-cell display row column cell))))
+    (check (null (lispterm.display::display-framebuffer-storage display)) "GPU composed a CPU framebuffer")
+    (lispterm.display:present display)
+    (let* ((pixels (lispterm.display::display-framebuffer display))
+           (metrics (lispterm.display:display-metrics display))
+           (driver (getf metrics :driver)))
+      (check (not (mismatch pixels (lispterm.display::display-framebuffer cpu))) "Native GPU pixel mismatch")
+      (check (eq :gpu (getf metrics :renderer)) "Not selected GPU")
+      (check (and (getf driver :device-associated-p) (not (getf driver :software-p))) "Not associated hardware")
+      (check (and (plusp (getf metrics :draw-calls)) (plusp (getf metrics :readbacks))) "No actual GPU draw/readback")
+      (let ((count (getf metrics :readbacks)))
+        (lispterm.display::display-framebuffer display)
+        (lispterm.display:present display)
+        (check (= count (getf (lispterm.display:display-metrics display) :readbacks)) "Duplicate lazy readback"))
+      (format t "NATIVE ~A ~D exact ARGB pixels, actual GPU metrics ~S~%" (lispterm.display::display-backend display) (length pixels) metrics)))
+  t)
+
+(defun native-gpu-check (backend)
+  (call-private-display backend
+    (lambda (name)
+      (let ((display (lispterm.display:open-display :backend backend :display-name name :columns 12 :rows 4)))
+        (unwind-protect
+             (progn (check (eq :auto (lispterm.display::display-renderer-request display)) "Default is not hardware-preferring")
+                    (native-parity-frame display))
+          (lispterm.display:close-display display)))))
+  t)
+
+(register-check "gpu-x11" (lambda () (native-gpu-check :x11)))
+(register-check "gpu-wayland" (lambda () (native-gpu-check :wayland)))

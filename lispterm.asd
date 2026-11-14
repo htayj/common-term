@@ -65,7 +65,7 @@
 (defsystem "lispterm/pty" :depends-on ("lispterm/base" "cffi")
  :serial t :components ((:file "src/pty/package") (:file "src/pty/ffi")
                         (:file "src/pty/posix") (:file "src/pty/process")))
-(defsystem "lispterm/display" :depends-on ("lispterm/base" "babel")
+(defsystem "lispterm/display" :depends-on ("lispterm/base" "babel" "lispterm/gpu")
  :serial t :components ((:file "src/display/package") (:file "src/display/cells")
                        (:file "src/display/font-otb") (:file "src/display/font")
                        (:file "src/display/keys") (:file "src/display/protocol")
@@ -160,10 +160,11 @@
     (:file "renderer") (:file "readback")))))
 
 (defsystem "lispterm/gpu-tests"
-  :license "MIT" :depends-on ("lispterm/gpu" "lispterm/display") :serial t
+  :license "MIT" :depends-on ("lispterm/gpu" "lispterm") :serial t
   :components ((:module "tests/gpu" :serial t :components (
     (:file "registry") (:file "language-tests") (:file "delivery-tests")
     (:file "foundation-tests") (:file "fixture-tests")
     (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
     (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
+    (:file "native-tests") (:file "lifecycle-tests")
     (:file "wayland-dmabuf-tests")))))

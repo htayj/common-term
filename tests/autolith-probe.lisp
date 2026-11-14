@@ -37,6 +37,13 @@
   ;; Clinedi treats fast multi-character input as a paste. Submit separately.
   (sleep .3)
   (lispterm:send-input *host* (string #\Return)))
+(defun hardware-receipt (host)
+  (let* ((metrics (getf (lispterm:status host) :geometry))
+         (driver (getf metrics :driver)))
+    (assert (eq :gpu (getf metrics :renderer)))
+    (assert (and (getf driver :device-associated-p) (not (getf driver :software-p))))
+    (assert (and (plusp (getf metrics :draw-calls)) (plusp (getf metrics :readbacks))))
+    metrics))
 (defun active-test (application)
   ;; This function is invoked by Lisp input in the real application's controller.
   (let* ((before (loop for fd below 3 collect (sb-posix:readlink (format nil "/proc/self/fd/~D" fd))))
@@ -55,6 +62,8 @@
            (lispterm:send-input shell (format nil "printf 'ACTIVE-SHELL-OK\\n'~C" #\Return))
            (sleep .3)
            (assert (plusp (getf (lispterm:status shell) :bytes-received)))
+           (wait-for (lambda () (plusp (or (getf (getf (lispterm:status shell) :geometry) :draw-calls) 0))) "active shell GPU frame")
+           (marker "active-gpu.sexp" (hardware-receipt shell))
             (marker "active-image.sexp" (list :registered-command-handler t :fresh-pty t :stdio-unchanged t :streams-identical t :same-image-pid (sb-posix:getpid)))
            (setf *active-tested* t))
       (lispterm.autolith:forget-host shell)
@@ -77,6 +86,7 @@
            (assert (string= (getf evidence :style) "direct"))
            (assert (string= (getf evidence :term) "xterm-256color"))
            (assert (getf evidence :registered)))
+         (marker "same-heap-gpu.sexp" (hardware-receipt *host*))
          (enter "(lispterm.autolith-probe::active-test autolith::*active-application*)")
          (wait-for (lambda () *active-tested*) "active-image shell")
           ;; Redefine the live renderer through the actual Lisp prompt. This is a

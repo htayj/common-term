@@ -30,6 +30,12 @@
       (unwind-protect
            (progn
              (until (lambda () (search "READY" (text))))
+             (until (lambda () (plusp (or (getf (getf (lispterm:status host) :geometry) :draw-calls) 0))))
+             (let* ((metrics (getf (lispterm:status host) :geometry)) (driver (getf metrics :driver)))
+               (assert (eq :gpu (getf metrics :renderer)))
+               (assert (and (getf driver :device-associated-p) (not (getf driver :software-p))))
+               (assert (plusp (getf metrics :readbacks)))
+               (mark "hardware-gpu.sexp" metrics))
              (mark "ready" (lispterm:status host))
              (until (lambda () (search "NATIVEKEY" (text))))
              (mark "keys" t)
@@ -43,6 +49,7 @@
              (let ((token (lispterm:quiesce host)) (validation-failed nil))
                (assert (not (getf (lispterm:status host) :worker-alive-p)))
                (assert (null (lispterm::host-display host)))
+               (lispterm.gpu::require-no-live-contexts)
                (handler-case
                    (unwind-protect (error "Injected checkpoint validation failure")
                      (lispterm:resume host token))
@@ -58,6 +65,8 @@
                (mark "rollback" t))
              (lispterm:send-input host "ROLLBACKSURVIVE")
              (until (lambda () (search "ROLLBACKSURVIVE" (text))))
+             (until (lambda () (plusp (or (getf (getf (lispterm:status host) :geometry) :draw-calls) 0))))
+             (assert (eq :gpu (getf (getf (lispterm:status host) :geometry) :renderer)))
              ;; Install a DEFUN in this running heap while both PTY and native
              ;; display are live. The owner resolves it on its next frame.
              (let ((original (symbol-function 'lispterm::render-session)))
@@ -81,6 +90,7 @@
              (mark "acceptance" (list :backend backend :rollback t :live-redefinition t
                                       :status (lispterm:status host))))
         (lispterm:close host))
+       (lispterm.gpu::require-no-live-contexts)
       (assert (= fds-before (native-fd-count)))
       (assert (null (set-difference (sb-thread:list-all-threads) threads-before)))
       (assert (null (lispterm:status)))
