@@ -32,6 +32,22 @@
                "Preserved content snapshot changed: ~A" path))))
   t)
 
+(defun check-early-preservation ()
+  "Verify the actual CPU checkout before integration, independently of delivery."
+  (let* ((outer (uiop:pathname-parent-directory-pathname *root*))
+         (manifest (read-bounded-data (merge-pathnames "preservation.sexp" outer)))
+         (main (pathname (getf manifest :root))))
+    (check (equal *cpu-baseline* (getf manifest :initial-head)) "Unexpected preservation baseline")
+    (check (equal *cpu-baseline* (trimmed-git main "rev-parse" "HEAD"))
+           "Main HEAD changed before integration")
+    (check (= 21 (length (getf manifest :files))) "Expected all 21 preserved source files")
+    ;; CHECK-PRESERVATION lstats and hashes the originals, including executable
+    ;; modes. Backup content is checked too, but backup modes are not originals.
+    (check-preservation outer manifest))
+  t)
+
+(register-check "gpu-preservation" #'check-early-preservation)
+
 (defun check-delivery ()
   ;; Evidence lives outside the committed tree, avoiding a commit that must name itself.
   ;; The orchestrator authenticates reviewer provenance before supplying this receipt.

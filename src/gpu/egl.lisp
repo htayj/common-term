@@ -1,11 +1,12 @@
 (in-package #:lispterm.gpu)
 
 ;;; Libraries are resolved only when OPEN-CONTEXT is requested. Every call into
-;;; a driver is non-interruptible and masks all SBCL floating-point traps.
+;;; a driver is non-interruptible and masks SBCL's supported floating-point traps.
+;;; :DENORMALIZED-OPERAND is an x86-only name, not supported on pinned x86-64.
 (defmacro with-driver-call (&body body)
   `(sb-sys:without-interrupts
      (sb-int:with-float-traps-masked (:invalid :divide-by-zero :overflow
-                                   :underflow :inexact :denormalized-operand)
+                                   :underflow :inexact #+x86 :denormalized-operand)
        ,@body)))
 
 (defvar *native-libraries* nil)
