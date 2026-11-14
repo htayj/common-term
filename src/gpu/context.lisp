@@ -131,6 +131,12 @@
   ;; handle and registry entry so CLOSE-CONTEXT can be retried by the owner.
   (handler-case
       (progn
+          ;; Construction failures keep strong GL ownership. Drain only while this
+          ;; exact context is current, before any EGL unbind or handle release.
+          (when (and (not (cffi:null-pointer-p (context-native context)))
+                     (pending-gl-objects-p (context-native context)))
+            (assert-context-owner context)
+            (drain-gl-object-cleanup))
         (unless (cffi:null-pointer-p (context-display context))
           (when (context-initialized-p context)
             (egl-check (egl-make-current (context-display context) (cffi:null-pointer)
@@ -154,6 +160,9 @@
           (setf (context-gbm context) (cffi:null-pointer)))
         (close-render-node (context-fd context))
         (setf (context-fd context) nil (context-closed-p context) t))
+    (gl-object-cleanup-error (condition)
+      (pushnew context *live-contexts*)
+      (error condition))
     (gpu-unavailable (condition)
       ;; Failed creation also needs a reachable cleanup handle. Saving an image
       ;; continues to be prohibited until this retained context is closed.

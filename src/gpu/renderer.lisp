@@ -7,6 +7,8 @@
    (atlas :accessor renderer-atlas) (atlas-columns :accessor renderer-atlas-columns)
    (atlas-capacity :initform 0 :accessor renderer-atlas-capacity)
    (cells :initform (make-hash-table :test 'equal) :reader renderer-cells)
+   ;; Fixed cell-sized spatial buckets contain retained rectangle keys.
+   (cell-index :initform (make-hash-table :test 'equal) :reader renderer-cell-index)
    (remainders :initform (make-hash-table :test 'equal) :reader renderer-remainders)
    (program :initform 0 :accessor renderer-program)
    (texture :initform 0 :accessor renderer-texture)
@@ -77,6 +79,19 @@
       (setf (renderer-closed r) t)))
   t)
 
+(define-condition renderer-construction-cleanup-error (error)
+  ((renderer :initarg :renderer :reader construction-error-renderer)
+   (cause :initarg :cause :reader construction-error-cause)
+   (cleanup-error :initarg :cleanup-error :reader construction-error-cleanup-error))
+  (:report (lambda (condition stream)
+             (format stream "Renderer construction failed (~A); cleanup failed (~A). Retained renderer requires owner-thread close."
+                     (construction-error-cause condition)
+                     (construction-error-cleanup-error condition)))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (export '(renderer-construction-cleanup-error construction-error-renderer
+            construction-error-cause construction-error-cleanup-error)))
+
 (defgeneric renderer-resize (renderer width height cell-width cell-height))
 (defmethod renderer-resize ((r gpu-renderer) width height cell-width cell-height)
   (renderer-owner r)
@@ -125,16 +140,20 @@
               (renderer-atlas-columns r) columns (renderer-atlas r) atlas
               (renderer-atlas-capacity r) 0
               (renderer-octets r) nil (renderer-dirty r) t)
-        (clrhash (renderer-cells r)) (clrhash (renderer-remainders r))
+        (clrhash (renderer-cells r)) (clrhash (renderer-cell-index r))
+        (clrhash (renderer-remainders r))
         (renderer-count r :generations))))
   r)
 
-(defun make-renderer (&key context width height cell-width cell-height)
+(defun make-renderer (&key context width height cell-width cell-height owner)
+  "Expose partial ownership through OWNER before allocating any GL objects.
+If cleanup fails, the signaled condition also retains the renderer for explicit retry."
   (assert-context-owner context)
   (sb-sys:without-interrupts
-    (let ((r (make-instance 'gpu-renderer :context context)) (success nil))
+    (let ((r (make-instance 'gpu-renderer :context context)) (success nil) (cause nil))
+      (when owner (funcall owner r))
       (unwind-protect
-           (progn
+           (handler-bind ((error (lambda (condition) (setf cause condition))))
              (setf (renderer-program r)
                    (link-gl-program (emit-shader (shader-form :vertex))
                                     (emit-shader (shader-form :fragment)))
@@ -143,8 +162,13 @@
                    (renderer-vao r) (renderer-name #'gl-gen-vertex-arrays)
                    (renderer-vbo r) (renderer-name #'gl-gen-buffers))
              (renderer-resize r width height cell-width cell-height)
-             (setf success t) r)
-        (unless success (renderer-close r))))))
+             (setf success t)
+             r)
+        (unless success
+          (handler-case (renderer-close r)
+            (error (cleanup)
+              (error 'renderer-construction-cleanup-error :renderer r
+                     :cause (or cause "nonlocal construction exit") :cleanup-error cleanup))))))))
 
 (defun renderer-subtract-remainders (r left top right bottom)
   "Keep only old background-strip pixels outside a newly overwritten rectangle."
@@ -166,26 +190,66 @@
     (dolist (rectangle remove) (remhash rectangle (renderer-remainders r)))
     (dolist (piece pieces) (setf (gethash (car piece) (renderer-remainders r)) (cdr piece)))))
 
+(defun renderer-rectangle-buckets (r rectangle function)
+  "Visit fixed-size spatial tiles touched by a nonempty half-open rectangle."
+  (destructuring-bind (left top right bottom) rectangle
+    (when (and (< left right) (< top bottom))
+      (loop for y from (floor top (renderer-ch r)) below (ceiling bottom (renderer-ch r))
+            do (loop for x from (floor left (renderer-cw r)) below (ceiling right (renderer-cw r))
+                     do (funcall function (list x y)))))))
+
+(defun renderer-index-cell (r position cell &optional remove-p)
+  (renderer-rectangle-buckets
+   r (getf cell :rectangle)
+   (lambda (tile)
+     (let ((bucket (gethash tile (renderer-cell-index r))))
+       (if remove-p
+           (when bucket
+             (remhash position bucket)
+             (when (zerop (hash-table-count bucket))
+               (remhash tile (renderer-cell-index r))))
+           (progn
+             (unless bucket
+               (setf bucket (make-hash-table :test 'equal)
+                     (gethash tile (renderer-cell-index r)) bucket))
+             (setf (gethash position bucket) t)))))))
+
 (defun renderer-subtract-cells (r left top right bottom)
-  "Retain disjoint GPU-drawn fragments outside a rectangular CPU-style write."
-  (let ((remove nil) (pieces nil))
+  "Subtract coverage from nearby retained fragments without scanning the frame."
+  (let ((candidates (make-hash-table :test 'equal)) (remove nil) (pieces nil))
+    (renderer-rectangle-buckets
+     r (list left top right bottom)
+     (lambda (tile)
+       (let ((bucket (gethash tile (renderer-cell-index r))))
+         (when bucket
+           (maphash (lambda (position present)
+                      (declare (ignore present))
+                      (renderer-count r :cell-index-visits)
+                      (setf (gethash position candidates) t)) bucket)))))
     (maphash
-     (lambda (position cell)
-       (destructuring-bind (x y end-x end-y) (getf cell :rectangle)
-         (let ((ix (max x left)) (iy (max y top))
-               (ir (min end-x right)) (ib (min end-y bottom)))
-           (when (and (< ix ir) (< iy ib))
-             (push position remove)
-             (flet ((piece (px py pr pb)
-                      (when (and (< px pr) (< py pb))
-                        (let* ((rectangle (list px py pr pb)) (copy (copy-list cell)))
-                          (setf (getf copy :rectangle) rectangle (getf copy :clipped) t)
-                          (push (cons (append (subseq position 0 2) rectangle) copy) pieces)))))
-               (piece x y end-x iy) (piece x ib end-x end-y)
-               (piece x iy ix ib) (piece ir iy end-x ib))))))
-     (renderer-cells r))
-    (dolist (position remove) (remhash position (renderer-cells r)))
-    (dolist (piece pieces) (setf (gethash (car piece) (renderer-cells r)) (cdr piece)))))
+     (lambda (position present)
+       (declare (ignore present))
+       (renderer-count r :cell-intersection-tests)
+       (let ((cell (gethash position (renderer-cells r))))
+         (destructuring-bind (x y end-x end-y) (getf cell :rectangle)
+           (let ((ix (max x left)) (iy (max y top))
+                 (ir (min end-x right)) (ib (min end-y bottom)))
+             (when (and (< ix ir) (< iy ib))
+               (push position remove)
+               (flet ((piece (px py pr pb)
+                        (when (and (< px pr) (< py pb))
+                          (let* ((rectangle (list px py pr pb)) (copy (copy-list cell)))
+                            (setf (getf copy :rectangle) rectangle (getf copy :clipped) t)
+                            (push (cons (append (subseq position 0 2) rectangle) copy) pieces)))))
+                 (piece x y end-x iy) (piece x ib end-x end-y)
+                 (piece x iy ix ib) (piece ir iy end-x ib)))))))
+     candidates)
+    (dolist (position remove)
+      (renderer-index-cell r position (gethash position (renderer-cells r)) t)
+      (remhash position (renderer-cells r)))
+    (dolist (piece pieces)
+      (setf (gethash (car piece) (renderer-cells r)) (cdr piece))
+      (renderer-index-cell r (car piece) (cdr piece)))))
 
 (defun renderer-positions (r)
   ;; Shared ordering for the packed records and the optional scissor draws.
@@ -231,10 +295,12 @@
                        (* (+ column span) (renderer-cw r) scale)))
            (bottom (* (1+ row) (renderer-ch r))))
       (renderer-subtract-cells r left top right bottom)
-      (setf (gethash (list column row left top right bottom) (renderer-cells r))
-            (list :key key :mask (copy-seq mask) :foreground foreground :background background
-                  :bold bold :underline underline :hidden hidden :span span :line-size line-size
-                  :rectangle (list left top right bottom))))
+      (let* ((position (list column row left top right bottom))
+             (cell (list :key key :mask (copy-seq mask) :foreground foreground :background background
+                         :bold bold :underline underline :hidden hidden :span span :line-size line-size
+                         :rectangle (list left top right bottom))))
+        (setf (gethash position (renderer-cells r)) cell)
+        (renderer-index-cell r position cell)))
     (setf (renderer-dirty r) t))
   r)
 

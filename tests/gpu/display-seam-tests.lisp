@@ -83,6 +83,18 @@
                (assert (equal (first calls)
                               '("RENDERER-WRITE-REMAINDER" :renderer 16 0 8 16 263430)))
                (assert (null (called "RENDERER-READBACK")))
+              (let ((grid (display-grid d)) (damage (display-damage d))
+                    (cache (display-framebuffer-storage d)))
+                (setf failure-operation "RENDERER-RESIZE"
+                      failure (make-condition 'simple-error :format-control "resize failed"))
+                (assert (eq failure (handler-case (resize-display d 48 32)
+                                      (simple-error (c) c))))
+                (assert (= 24 (display-width d)))
+                (assert (= 16 (display-height d)))
+                (assert (eq grid (display-grid d)))
+                (assert (eq damage (display-damage d)))
+                (assert (eq cache (display-framebuffer-storage d)))
+                (setf failure nil))
                (resize-display d 24 16)
                (assert (called "RENDERER-RESIZE"))
                (let ((thread (sb-thread:make-thread

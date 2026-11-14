@@ -5,6 +5,22 @@
 (defstruct dma-target context width height texture framebuffer image
   fourcc modifier fds strides offsets (closed-p nil))
 
+;; Strong ownership is intentional until successful cleanup, even if creation
+;; never returned a target to its caller. Access is confined to context owners.
+(defvar *dma-pending-targets* (make-hash-table :test #'eq))
+
+(define-condition dma-cleanup-failed (error)
+  ((target :initarg :target :reader dma-failed-target)
+   (cause :initarg :cause :reader dma-cleanup-cause))
+  (:report (lambda (condition stream)
+             (format stream "DMA target cleanup pending: ~A" (dma-cleanup-cause condition)))))
+
+(defun dma-cleanup-pending (context)
+  "Retry partial target cleanup before destroying its owning context."
+  (dolist (target (loop for target being the hash-keys of *dma-pending-targets*
+                       when (eq context (dma-target-context target)) collect target))
+    (dma-destroy target)))
+
 (defun dma-supported-p (context)
   (assert-context-owner context)
   (let ((extensions (egl-query-string (context-display context) #x3055)))
@@ -16,6 +32,7 @@
   (restart-case
       (unless (dma-target-closed-p target)
         (assert-context-owner (dma-target-context target))
+        (setf (gethash target *dma-pending-targets*) t)
         ;; Reject stale errors before any resource ownership can change.
         (gl-check 'dma-destroy-entry)
         (loop while (dma-target-fds target) do
@@ -42,7 +59,8 @@
               (gl-delete-textures 1 name)
               (gl-check 'dma-destroy-texture)
               (setf (dma-target-texture target) nil))))
-        (setf (dma-target-closed-p target) t))
+        (setf (dma-target-closed-p target) t)
+        (remhash target *dma-pending-targets*))
     (retry-dma-destroy () :report "Retry unfinished export-target cleanup."
       (dma-destroy target))))
 
@@ -53,22 +71,38 @@
                (<= 1 height 16384) (<= (* width height) 67108864))
     (unavailable 'dma-create "Unsafe target dimensions"))
   (unless (dma-supported-p context) (unavailable 'dma-create "EGL dma-buf export unavailable"))
+  (gl-check 'dma-create-entry)
   (let ((target (make-dma-target :context context :width width :height height)) (ok nil))
     (unwind-protect
          (progn
            (cffi:with-foreign-object (name :unsigned-int)
-             (gl-gen-textures 1 name)
-             (setf (dma-target-texture target) (cffi:mem-ref name :unsigned-int))
+             (setf (cffi:mem-ref name :unsigned-int) 0)
+             (sb-sys:without-interrupts
+               (gl-gen-textures 1 name)
+               (let ((value (cffi:mem-ref name :unsigned-int)))
+                 (when (plusp value) (setf (dma-target-texture target) value)))
+               (gl-check 'dma-gen-texture))
+             (unless (dma-target-texture target) (unavailable 'dma-gen-texture "Zero texture name"))
              (gl-bind-texture #x0de1 (dma-target-texture target))
+             (gl-check 'dma-bind-texture)
              (gl-tex-parameter-i #x0de1 #x2801 #x2600)
              (gl-tex-parameter-i #x0de1 #x2800 #x2600)
+             (gl-check 'dma-texture-parameters)
              (gl-tex-image-2d #x0de1 0 #x8058 width height 0 #x1908 #x1401 (cffi:null-pointer))
-             (gl-gen-framebuffers 1 name)
-             (setf (dma-target-framebuffer target) (cffi:mem-ref name :unsigned-int))
+             (gl-check 'dma-texture-storage)
+             (setf (cffi:mem-ref name :unsigned-int) 0)
+             (sb-sys:without-interrupts
+               (gl-gen-framebuffers 1 name)
+               (let ((value (cffi:mem-ref name :unsigned-int)))
+                 (when (plusp value) (setf (dma-target-framebuffer target) value)))
+               (gl-check 'dma-gen-framebuffer))
+             (unless (dma-target-framebuffer target) (unavailable 'dma-gen-framebuffer "Zero framebuffer name"))
              (gl-bind-framebuffer #x8d40 (dma-target-framebuffer target))
              (gl-framebuffer-texture-2d #x8d40 #x8ce0 #x0de1 (dma-target-texture target) 0)
-             (unless (= #x8cd5 (gl-check-framebuffer-status #x8d40))
-               (unavailable 'dma-create "Incomplete export FBO")))
+             (gl-check 'dma-attach-texture)
+             (let ((status (gl-check-framebuffer-status #x8d40)))
+               (gl-check 'dma-framebuffer-status)
+               (unless (= #x8cd5 status) (unavailable 'dma-create "Incomplete export FBO"))))
            (cffi:with-foreign-object (attrs :int 3)
              (setf (cffi:mem-aref attrs :int 0) #x30d2 ; EGL_IMAGE_PRESERVED_KHR
                    (cffi:mem-aref attrs :int 1) 1
@@ -113,18 +147,27 @@
                    (dotimes (i 4) (let ((fd (cffi:mem-aref fds :int i)))
                                    (when (>= fd 0) (sb-posix:close fd))))))))
            (gl-bind-framebuffer #x8d40 0)
+           (gl-check 'dma-unbind-framebuffer)
            (setf ok t) target)
-      (unless ok (dma-destroy target)))))
+      (unless ok
+        (handler-case (dma-destroy target)
+          (error (cause)
+          (restart-case
+              (error 'dma-cleanup-failed :target target :cause cause)
+            (retry-dma-construction-cleanup ()
+              :report "Retry cleanup of the retained partial export target."
+              (dma-destroy target)))))))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (export '(dma-target dma-supported-p dma-create dma-destroy dma-target-context
+  (export '(dma-cleanup-failed dma-failed-target dma-cleanup-cause dma-cleanup-pending
+            dma-target dma-supported-p dma-create dma-destroy dma-target-context
             dma-target-width dma-target-height dma-target-framebuffer dma-target-fourcc
             dma-target-modifier dma-target-fds dma-target-strides dma-target-offsets)))
 
 (in-package #:lispterm.display.wayland)
 (defstruct dma-protocol id formats buffers disabled-reason
   (exports 0) (imports 0) (presents 0) (releases 0) (reuses 0) (finishes 0))
-(defstruct dma-buffer id target generation (busy-p nil) (uses 0))
+(defstruct dma-buffer id target generation (busy-p nil) (uses 0) (protocol-destroyed-p nil))
 (defvar *dma-protocols* (make-hash-table :test #'eq :weakness :key))
 (defvar *dma-force-unsupported* nil)
 
@@ -147,7 +190,11 @@
                               (dma-protocol-formats dma) :test #'equal)))))))))
 
 (defun dma-buffer-destroy (state buffer &optional disconnected)
-  (unless disconnected (wire-send (wayland-state-wire state) (dma-buffer-id buffer) 0))
+  (unless (dma-buffer-protocol-destroyed-p buffer)
+    (sb-sys:without-interrupts
+      (unless (or disconnected (null (dma-buffer-id buffer)))
+        (wire-send (wayland-state-wire state) (dma-buffer-id buffer) 0))
+      (setf (dma-buffer-protocol-destroyed-p buffer) t)))
   (lispterm.gpu:dma-destroy (dma-buffer-target buffer)))
 
 (defun dma-import (state dma target)
@@ -290,6 +337,8 @@
 (defun dma-close-display (display)
   ;; Backend disconnect occurs first, invalidating every compositor reference.
   (let* ((state (window-protocol display)) (dma (gethash state *dma-protocols*)))
+    (let ((context (lispterm.display::display-renderer-context display)))
+      (when context (lispterm.gpu::dma-cleanup-pending context)))
     (when dma
       (loop while (dma-protocol-buffers dma) do
         (dma-buffer-destroy state (first (dma-protocol-buffers dma)) t)

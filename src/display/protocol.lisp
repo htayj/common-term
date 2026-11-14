@@ -93,11 +93,27 @@
                 (gpu-call "MAKE-RENDERER" :context (display-renderer-context display)
                           :width (display-width display) :height (display-height display)
                           :cell-width (font-width (display-font display))
-                          :cell-height (font-height (display-font display)))
+                          :cell-height (font-height (display-font display))
+                          :owner (lambda (renderer)
+                                   (setf (display-renderer-state display) renderer)))
                 (display-renderer-kind display) :gpu
                 (display-renderer-pending-p display) t
                 (display-readback-pending-p display) t))
       (error (condition)
+        ;; Failed shader/program deletion retains construction objects and context.
+        ;; Only an explicit owner close may retry it; do not initialize a CPU fallback.
+        (let* ((package (find-package "LISPTERM.GPU"))
+               (type (and package (find-symbol "GL-OBJECT-CLEANUP-ERROR" package))))
+          (when (and type (find-class type nil) (typep condition type))
+            (error condition)))
+        ;; Construction cleanup failure retains the renderer and its live context.
+        ;; Do not retry implicitly or turn this failure into CPU fallback.
+        (let* ((package (find-package "LISPTERM.GPU"))
+               (type (and package (find-symbol "RENDERER-CONSTRUCTION-CLEANUP-ERROR" package))))
+          (when (and type (find-class type nil) (typep condition type))
+            (setf (display-renderer-state display)
+                  (gpu-call "CONSTRUCTION-ERROR-RENDERER" condition))
+            (error condition)))
         ;; OPEN-CONTEXT can fail after acquiring native state. Retain it for
         ;; owner-thread cleanup, including when that cleanup itself fails.
         (let* ((package (find-package "LISPTERM.GPU"))

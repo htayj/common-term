@@ -3,26 +3,30 @@
 
 (defun resize-display (d width height)
   (assert-owner d)
-  (setf (display-width d) (max 1 width)
-        (display-height d) (max 1 height)
-        (display-columns d) (max 1 (floor width (font-width (display-font d))))
-        (display-rows d) (max 1 (floor height (font-height (display-font d))))
-        (display-framebuffer-storage d)
-        (when (and (eq (display-renderer-kind d) :cpu)
-                   (or (eq (display-renderer-request d) :cpu)
-                       (display-renderer-fallback-reason d)))
-          (make-array (* (display-width d) (display-height d))
-                      :element-type '(unsigned-byte 32) :initial-element #xff1d2021))
-        (display-grid d)
-        (make-array (list (display-rows d) (display-columns d)) :initial-element nil)
-        (display-damage d) (list (list 0 0 (display-width d) (display-height d))))
-  (when (eq (display-renderer-kind d) :gpu)
-    (gpu-call "RENDERER-RESIZE" (display-renderer-state d)
-              (display-width d) (display-height d)
-              (font-width (display-font d)) (font-height (display-font d)))
-    (setf (display-renderer-pending-p d) t (display-readback-pending-p d) t))
-  (make-resize-event :columns (display-columns d) :rows (display-rows d)
-                     :width width :height height))
+  ;; Prepare all Lisp allocations before changing the renderer or public geometry.
+  (let* ((new-width (max 1 width)) (new-height (max 1 height))
+         (columns (max 1 (floor width (font-width (display-font d)))))
+         (rows (max 1 (floor height (font-height (display-font d)))))
+         (storage (when (and (eq (display-renderer-kind d) :cpu)
+                             (or (eq (display-renderer-request d) :cpu)
+                                 (display-renderer-fallback-reason d)))
+                    (make-array (* new-width new-height)
+                                :element-type '(unsigned-byte 32) :initial-element #xff1d2021)))
+         (grid (make-array (list rows columns) :initial-element nil))
+         (damage (list (list 0 0 new-width new-height)))
+         (event (make-resize-event :columns columns :rows rows :width width :height height)))
+    (sb-sys:without-interrupts
+      (when (eq (display-renderer-kind d) :gpu)
+        ;; A checked failure leaves display metadata and caches untouched.
+        (gpu-call "RENDERER-RESIZE" (display-renderer-state d) new-width new-height
+                  (font-width (display-font d)) (font-height (display-font d))))
+      (setf (display-width d) new-width (display-height d) new-height
+            (display-columns d) columns (display-rows d) rows
+            (display-framebuffer-storage d) storage
+            (display-grid d) grid (display-damage d) damage)
+      (when (eq (display-renderer-kind d) :gpu)
+        (setf (display-renderer-pending-p d) t (display-readback-pending-p d) t)))
+    event))
 
 (defun cell-x-scale (cell)
   (if (eq (cell-line-size cell) :single) 1 2))

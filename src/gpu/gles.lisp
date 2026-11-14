@@ -84,49 +84,181 @@
       (unavailable operation (format nil "GL error #x~X" code))))
   t)
 
-(defun compile-gl-shader (stage source)
-  "Compile in-memory generated GLSL; caller owns the returned shader."
+;;; Failed construction retains each allocation until checked deletion succeeds.
+(define-driver-function gl-object-current-context :egl "eglGetCurrentContext" :pointer)
+
+(defstruct gl-object-owner
+  kind name context thread pid)
+
+(defvar *pending-gl-objects* nil)
+(defvar *gl-object-lock* (sb-thread:make-mutex :name "GL construction ownership"))
+
+(define-condition gl-object-cleanup-error (error)
+  ((objects :initarg :objects :reader gl-cleanup-objects)
+   (cause :initarg :cause :reader gl-cleanup-cause))
+  (:report (lambda (condition stream)
+             (format stream "GL construction cleanup pending for ~D object(s): ~A"
+                     (length (gl-cleanup-objects condition))
+                     (gl-cleanup-cause condition)))))
+
+(defun own-gl-object (kind name)
+  (when (plusp name)
+    (let ((owner (make-gl-object-owner
+                  :kind kind :name name :context (gl-object-current-context)
+                  :thread sb-thread:*current-thread* :pid (sb-unix:unix-getpid))))
+      (sb-thread:with-mutex (*gl-object-lock*) (push owner *pending-gl-objects*))
+      owner)))
+
+(defun forget-gl-object (owner)
+  (sb-thread:with-mutex (*gl-object-lock*)
+    (setf *pending-gl-objects* (delete owner *pending-gl-objects*))))
+
+(defun pending-gl-objects-p (native-context)
+  (sb-thread:with-mutex (*gl-object-lock*)
+    (some (lambda (owner)
+            (and (= (gl-object-owner-pid owner) (sb-unix:unix-getpid))
+                 (cffi:pointer-eq native-context (gl-object-owner-context owner))))
+          *pending-gl-objects*)))
+(defun delete-owned-gl-object (owner)
+  (unless (and (= (gl-object-owner-pid owner) (sb-unix:unix-getpid))
+               (eq (gl-object-owner-thread owner) sb-thread:*current-thread*)
+               (cffi:pointer-eq (gl-object-owner-context owner) (gl-object-current-context))
+               (not (cffi:null-pointer-p (gl-object-owner-context owner))))
+    (error "Restore the allocating process, thread and EGL context before GL cleanup"))
+  ;; A stale error must never make an already completed deletion look retryable.
+  (gl-check 'before-gl-object-delete)
+  (ecase (gl-object-owner-kind owner)
+    (:shader (gl-delete-shader (gl-object-owner-name owner)))
+    (:program (gl-delete-program (gl-object-owner-name owner))))
+  (gl-check 'gl-object-delete)
+  (setf (gl-object-owner-name owner) 0)
+  (forget-gl-object owner))
+
+(defun retry-gl-object-cleanup (condition)
+  "Retry retained construction allocations with their allocating context current."
+  (let ((remaining nil) (cause nil))
+    (dolist (owner (gl-cleanup-objects condition))
+      (when (plusp (gl-object-owner-name owner))
+        (handler-case (delete-owned-gl-object owner)
+          (error (failure) (push owner remaining) (setf cause failure)))))
+    (when remaining
+      (restart-case
+          (error 'gl-object-cleanup-error :objects (nreverse remaining) :cause cause)
+        (retry-gl-object-cleanup () :report "Retry checked GL object deletion."
+          (retry-gl-object-cleanup condition))))
+    t))
+
+(defun drain-gl-object-cleanup ()
+  "Delete pending construction objects for the current EGL context before teardown."
+  (let ((objects
+          (sb-thread:with-mutex (*gl-object-lock*)
+            (remove-if-not
+             (lambda (owner)
+               (and (= (gl-object-owner-pid owner) (sb-unix:unix-getpid))
+                    (eq (gl-object-owner-thread owner) sb-thread:*current-thread*)
+                    (cffi:pointer-eq (gl-object-owner-context owner)
+                                     (gl-object-current-context))))
+             *pending-gl-objects*))))
+    (retry-gl-object-cleanup
+     (make-condition 'gl-object-cleanup-error :objects objects :cause "pending construction"))))
+
+(defun call-with-gl-construction (function)
+  "FUNCTION registers allocations and returns the owner to transfer to its caller."
   (sb-sys:without-interrupts
-  (let ((shader (gl-create-shader stage)) (success nil))
-    (unwind-protect
-         (progn
-           (cffi:with-foreign-string (text source :encoding :utf-8)
-             (cffi:with-foreign-object (strings :pointer)
-               (setf (cffi:mem-ref strings :pointer) text)
-               (gl-shader-source shader 1 strings (cffi:null-pointer))))
-           (gl-compile-shader shader)
-           (cffi:with-foreign-object (status :int)
-             (gl-get-shader-iv shader #x8B81 status)
-             (when (zerop (cffi:mem-ref status :int))
-               (cffi:with-foreign-object (log :char 8192)
-                 (gl-get-shader-info-log shader 8192 (cffi:null-pointer) log)
-                 (unavailable 'compile-gl-shader (cffi:foreign-string-to-lisp log)))))
-           (setf success t)
-           shader)
-      (unless success (gl-delete-shader shader))))))
+    (let ((owners nil) (result nil) (cause "nonlocal exit") (complete nil))
+      (unwind-protect
+           (handler-bind ((error (lambda (condition) (setf cause condition))))
+             (setf result
+                   (funcall function
+                            (lambda (kind name)
+                              (let ((owner (own-gl-object kind name)))
+                                (when owner (push owner owners))
+                                owner)))
+                   complete t))
+        (let ((remaining nil))
+          (dolist (owner owners)
+            (unless (and complete (eq owner result))
+              (handler-case (delete-owned-gl-object owner)
+                (error (failure) (setf cause failure) (push owner remaining)))))
+          (when remaining
+            ;; A successful result cannot be transferred when temporary cleanup failed.
+            (when (and complete result) (push result remaining))
+            (restart-case
+                (error 'gl-object-cleanup-error :objects remaining :cause cause)
+              (retry-gl-object-cleanup () :report "Delete retained GL construction objects."
+                (retry-gl-object-cleanup
+                 (make-condition 'gl-object-cleanup-error :objects remaining :cause cause))))
+            ;; Successful retry releases resources, not a program/shader result.
+            (error "GL construction aborted after cleanup retry"))))
+      (forget-gl-object result)
+      (gl-object-owner-name result))))
+
+(defun gl-object-status (kind object parameter)
+  (cffi:with-foreign-object (status :int)
+    (setf (cffi:mem-ref status :int) 0)
+    (ecase kind
+      (:shader (gl-get-shader-iv object parameter status))
+      (:program (gl-get-program-iv object parameter status)))
+    (gl-check 'gl-object-status)
+    (cffi:mem-ref status :int)))
+
+(defun gl-object-log (kind object)
+  "Read only the checked, bounded byte count actually written by GLES."
+  (cffi:with-foreign-objects ((log :unsigned-char 8192) (length :int))
+    (dotimes (i 8192) (setf (cffi:mem-aref log :unsigned-char i) 0))
+    (setf (cffi:mem-ref length :int) 0)
+    (ecase kind
+      (:shader (gl-get-shader-info-log object 8192 length log))
+      (:program (gl-get-program-info-log object 8192 length log)))
+    (gl-check 'gl-object-log)
+    (let ((count (cffi:mem-ref length :int)))
+      (unless (<= 0 count 8191)
+        (unavailable 'gl-object-log "Driver returned an invalid diagnostic byte count"))
+      (cffi:foreign-string-to-lisp log :count count :encoding :utf-8))))
+
+(defun compile-gl-shader (stage source)
+  "Compile generated GLSL; transfer a checked nonzero shader to the caller."
+  (gl-check 'before-compile-gl-shader)
+  (call-with-gl-construction
+   (lambda (own)
+     (let* ((shader (gl-create-shader stage)) (owner (funcall own :shader shader)))
+       (gl-check 'gl-create-shader)
+       (unless owner (unavailable 'gl-create-shader "Driver returned shader zero"))
+       (cffi:with-foreign-string (text source :encoding :utf-8)
+         (cffi:with-foreign-object (strings :pointer)
+           (setf (cffi:mem-ref strings :pointer) text)
+           (gl-shader-source shader 1 strings (cffi:null-pointer))))
+       (gl-check 'gl-shader-source)
+       (gl-compile-shader shader)
+       (gl-check 'gl-compile-shader)
+       (when (zerop (gl-object-status :shader shader #x8B81))
+         (unavailable 'compile-gl-shader (gl-object-log :shader shader)))
+       owner))))
 
 (defun link-gl-program (vertex-source fragment-source)
-  "Compile/link generated text. Caller owns program; temporary shaders are deleted."
-  (sb-sys:without-interrupts
-  (let ((vertex 0) (fragment 0) (program 0) (success nil))
-    (unwind-protect
-         (progn
-           (setf vertex (compile-gl-shader #x8B31 vertex-source)
-                 fragment (compile-gl-shader #x8B30 fragment-source)
-                 program (gl-create-program))
-           (gl-attach-shader program vertex)
-           (gl-attach-shader program fragment)
-           (gl-link-program program)
-           (cffi:with-foreign-object (status :int)
-             (gl-get-program-iv program #x8B82 status)
-             (when (zerop (cffi:mem-ref status :int))
-               (cffi:with-foreign-object (log :char 8192)
-                 (gl-get-program-info-log program 8192 (cffi:null-pointer) log)
-                 (unavailable 'link-gl-program (cffi:foreign-string-to-lisp log)))))
-           (setf success t)
-           program)
-      (unless (zerop vertex) (gl-delete-shader vertex))
-      (unless (zerop fragment) (gl-delete-shader fragment))
-      (unless (or success (zerop program)) (gl-delete-program program))))))
+  "Compile/link generated text, checking temporary shader cleanup before transfer."
+  (gl-check 'before-link-gl-program)
+  (call-with-gl-construction
+   (lambda (own)
+     (let* ((vertex (compile-gl-shader #x8B31 vertex-source))
+            (vertex-owner (funcall own :shader vertex))
+            (fragment (compile-gl-shader #x8B30 fragment-source))
+            (fragment-owner (funcall own :shader fragment))
+            (program (gl-create-program))
+            (owner (funcall own :program program)))
+       (declare (ignore vertex-owner fragment-owner))
+       (gl-check 'gl-create-program)
+       (unless owner (unavailable 'gl-create-program "Driver returned program zero"))
+       (gl-attach-shader program vertex)
+       (gl-check 'gl-attach-vertex-shader)
+       (gl-attach-shader program fragment)
+       (gl-check 'gl-attach-fragment-shader)
+       (gl-link-program program)
+       (gl-check 'gl-link-program)
+       (when (zerop (gl-object-status :program program #x8B82))
+         (unavailable 'link-gl-program (gl-object-log :program program)))
+       owner))))
 
-(export '(gl-integer gl-integers gl-check compile-gl-shader link-gl-program))
+(export '(gl-integer gl-integers gl-check compile-gl-shader link-gl-program
+          gl-object-cleanup-error gl-cleanup-objects gl-cleanup-cause
+          retry-gl-object-cleanup drain-gl-object-cleanup))
