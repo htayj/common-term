@@ -3,7 +3,7 @@
 (defparameter *cpu-baseline* "56ca10b1367177b20d649f8144280a2fa20f3b02")
 (defparameter *existing-glue*
   '("tests/verify.sh" "scripts/sbcl" "scripts/deps.nix"
-    "tests/packaging-gate.sh" "tests/wayland-gate.sh"
+    "tests/packaging-gate.sh" "tests/wayland-gate.sh" "tests/vttest-gate.sh"
     "tests/fastfetch-gate.sh" "scripts/autolith-runtime"))
 
 (defun nul-paths (text)
