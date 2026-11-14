@@ -3,6 +3,8 @@
 (load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
 (asdf:load-system "lispterm")
 (load (merge-pathnames "vttest-protocol.lisp" *load-truename*))
+;; The definition-only reader below skips the recorder's dependency LOAD forms.
+(load (merge-pathnames "vttest-gpu.lisp" *load-truename*))
 (defparameter *recorder* (merge-pathnames "vttest-gate.lisp" *load-truename*))
 ;; Read every form with all real packages present. Only definitions are installed;
 ;; skip instrumentation LETs and the top-level runner, which are GUI operations.
