@@ -2,6 +2,8 @@
 
 (define-condition gpu-ownership-error (gpu-unavailable) ())
 (define-condition gpu-software-rejected (gpu-unavailable) ())
+(define-condition gpu-cleanup-error (gpu-unavailable)
+  ((context :initarg :context :reader cleanup-error-context)))
 
 (defclass graphics-context ()
   ((thread :initform sb-thread:*current-thread* :reader context-thread)
@@ -125,28 +127,39 @@
                                       (gl-integer #x9316) (gl-integer #x84E8)))))
 
 (defun release-context-handles (context)
-  ;; Called only on the owning thread with asynchronous unwinds disabled.
-  (unless (cffi:null-pointer-p (context-display context))
-    (when (context-initialized-p context)
-      (egl-make-current (context-display context) (cffi:null-pointer)
-                        (cffi:null-pointer) (cffi:null-pointer))
-      (unless (cffi:null-pointer-p (context-native context))
-        (egl-destroy-context (context-display context) (context-native context)))
-      ;; EGL platform-device displays can be shared across software contexts.
-      ;; eglInitialize is not reference counted. Terminate only the last owner.
-      (unless (some (lambda (other)
-                      (and (not (eq other context))
-                           (cffi:pointer-eq (context-display other) (context-display context))))
-                    *live-contexts*)
-        (egl-terminate (context-display context)))))
-  (unless (cffi:null-pointer-p (context-gbm context))
-    (gbm-device-destroy (context-gbm context)))
-  (close-render-node (context-fd context))
-  (setf (context-native context) (cffi:null-pointer)
-        (context-display context) (cffi:null-pointer)
-        (context-gbm context) (cffi:null-pointer)
-        (context-fd context) nil
-        (context-closed-p context) t))
+  ;; Commit each successful release separately. A failed EGL release retains its
+  ;; handle and registry entry so CLOSE-CONTEXT can be retried by the owner.
+  (handler-case
+      (progn
+        (unless (cffi:null-pointer-p (context-display context))
+          (when (context-initialized-p context)
+            (egl-check (egl-make-current (context-display context) (cffi:null-pointer)
+                                         (cffi:null-pointer) (cffi:null-pointer))
+                       'close-context-unbind)
+            (unless (cffi:null-pointer-p (context-native context))
+              (egl-check (egl-destroy-context (context-display context) (context-native context))
+                         'close-context-destroy)
+              (setf (context-native context) (cffi:null-pointer)))
+            ;; Platform-device displays can be shared. EGL initialization is not
+            ;; reference counted, so only the final live owner terminates one.
+            (unless (some (lambda (other)
+                            (and (not (eq other context))
+                                 (cffi:pointer-eq (context-display other) (context-display context))))
+                          *live-contexts*)
+              (egl-check (egl-terminate (context-display context)) 'close-context-terminate))
+            (setf (context-initialized-p context) nil))
+          (setf (context-display context) (cffi:null-pointer)))
+        (unless (cffi:null-pointer-p (context-gbm context))
+          (gbm-device-destroy (context-gbm context))
+          (setf (context-gbm context) (cffi:null-pointer)))
+        (close-render-node (context-fd context))
+        (setf (context-fd context) nil (context-closed-p context) t))
+    (gpu-unavailable (condition)
+      ;; Failed creation also needs a reachable cleanup handle. Saving an image
+      ;; continues to be prohibited until this retained context is closed.
+      (pushnew context *live-contexts*)
+      (error 'gpu-cleanup-error :context context :operation 'close-context
+             :detail (format nil "~A; retry CLOSE-CONTEXT on CLEANUP-ERROR-CONTEXT" condition)))))
 
 (defun create-context (software device)
   (sb-thread:with-mutex (*context-lock*)
@@ -209,6 +222,7 @@ No desktop socket, window surface or inherited display handle is used."
             (let ((nodes (if device (list device) (discover-render-nodes))) (failures nil))
               (dolist (node nodes)
                 (handler-case (return-from open-context (create-context nil node))
+                  (gpu-cleanup-error (error) (error error))
                   (gpu-unavailable (error) (push (format nil "~A: ~A" node error) failures))))
               (unavailable 'open-context
                            (format nil "No usable hardware render node: ~{~A~^; ~}" (reverse failures))))))
@@ -220,17 +234,21 @@ No desktop socket, window surface or inherited display handle is used."
 (defgeneric close-context (context))
 (defmethod close-context ((context graphics-context))
   (check-context-identity context)
-  (unless (context-closed-p context)
-    (sb-sys:without-interrupts
-      (sb-thread:with-mutex (*context-lock*)
-        (release-context-handles context)
-        (setf *live-contexts* (delete context *live-contexts*)))))
-  t)
+  (restart-case
+      (progn
+        (unless (context-closed-p context)
+          (sb-sys:without-interrupts
+            (sb-thread:with-mutex (*context-lock*)
+              (release-context-handles context)
+              (setf *live-contexts* (delete context *live-contexts*)))))
+        t)
+    (retry-close () :report "Retry releasing this context's retained native handles."
+      (close-context context))))
 
 (defgeneric context-info (context))
 (defmethod context-info ((context graphics-context))
   (assert-context-owner context)
   (copy-tree (context-metadata context)))
 
-(export '(graphics-context gpu-ownership-error gpu-software-rejected
-          require-hardware-context context-display context-native))
+(export '(graphics-context gpu-ownership-error gpu-software-rejected gpu-cleanup-error
+          cleanup-error-context require-hardware-context context-display context-native))

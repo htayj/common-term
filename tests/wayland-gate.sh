@@ -19,7 +19,7 @@ if [[ -z ${LISPTERM_XKBCOMMON_LIBRARY:-} ]]; then
   candidates=(/nix/store/*libxkbcommon-*/lib/libxkbcommon.so.0)
   [[ ! -f ${candidates[0]} ]] || export LISPTERM_XKBCOMMON_LIBRARY=${candidates[0]}
 fi
-artifacts=${LISPTERM_WAYLAND_ARTIFACTS:-$root/.git/autolith-tests/wayland}
+artifacts=${LISPTERM_WAYLAND_ARTIFACTS:-$root/.build/evidence/wayland}
 mkdir -p "$artifacts"; artifacts=$(realpath "$artifacts")
 export LISPTERM_WAYLAND_ARTIFACTS="$artifacts/"
 start() {
@@ -40,7 +40,7 @@ default_border none
 focus_follows_mouse no
 CONFIG
   clear_session_endpoints
-  env -u DISPLAY -u WAYLAND_DISPLAY -u SWAYSOCK -u HYPRLAND_INSTANCE_SIGNATURE \
+  env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u SWAYSOCK -u HYPRLAND_INSTANCE_SIGNATURE \
     -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR="$runtime" WLR_BACKENDS=headless \
     WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
     "$SWAY" --config "$dir/sway.conf" > "$dir/compositor.log" 2>&1 & pid=$!

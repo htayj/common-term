@@ -160,10 +160,10 @@
     (:file "renderer") (:file "readback")))))
 
 (defsystem "lispterm/gpu-tests"
-  :license "MIT" :depends-on ("lispterm/gpu") :serial t
+  :license "MIT" :depends-on ("lispterm/gpu" "lispterm/display") :serial t
   :components ((:module "tests/gpu" :serial t :components (
     (:file "registry") (:file "language-tests") (:file "delivery-tests")
-    (:file "foundation-tests")
+    (:file "foundation-tests") (:file "fixture-tests")
     (:file "shader-tests") (:file "probe-tests") (:file "software-control-tests")
     (:file "atlas-tests") (:file "offscreen-tests") (:file "evidence-tests")
     (:file "wayland-dmabuf-tests")))))

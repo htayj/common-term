@@ -95,7 +95,71 @@
      (lispterm.gpu:gpu-unavailable () t)))
   t)
 
+(defun call-with-driver-control (symbol replacement function)
+  ;; A disposable test process only. Restore even when an assertion unwinds.
+  (let ((original (symbol-function symbol)))
+    (unwind-protect
+         (progn (setf (symbol-function symbol) replacement) (funcall function))
+      (setf (symbol-function symbol) original))))
+
+(defun assert-context-cleanup-controls ()
+  ;; Inject one failure at each fallible EGL release. The retained object must
+  ;; be reachable and retryable, and already-destroyed handles must be cleared.
+  (dolist (stage '(lispterm.gpu:egl-make-current lispterm.gpu:egl-destroy-context
+                   lispterm.gpu:egl-terminate))
+    (let ((context (lispterm.gpu:open-context)))
+      (unwind-protect
+           (progn
+             (call-with-driver-control
+              stage (lambda (&rest arguments) (declare (ignore arguments)) 0)
+              (lambda ()
+                (let ((condition
+                        (handler-case (progn (lispterm.gpu:close-context context) nil)
+                          (lispterm.gpu:gpu-cleanup-error (condition) condition))))
+                  (assert condition)
+                  (assert (eq context (lispterm.gpu:cleanup-error-context condition)))
+                  (assert (member context lispterm.gpu::*live-contexts*))
+                  (assert (not (lispterm.gpu::context-closed-p context)))
+                  (assert (eq (eq stage 'lispterm.gpu:egl-terminate)
+                              (cffi:null-pointer-p (lispterm.gpu:context-native context)))))))
+             (assert (lispterm.gpu:close-context context))
+             (assert (not (member context lispterm.gpu::*live-contexts*))))
+        (lispterm.gpu:close-context context))))
+  ;; Fail after acquiring all native resources. Successful cleanup must remove
+  ;; the device FD too, and a fresh hardware context must still open/draw.
+  (let ((before (length (uiop:directory-files #p"/proc/self/fd/"))))
+    (call-with-driver-control
+     'lispterm.gpu::collect-context-info
+     (lambda (&rest arguments) (declare (ignore arguments)) (error "Injected metadata failure"))
+     (lambda ()
+       (assert (handler-case (progn (lispterm.gpu:open-context) nil)
+                 (simple-error () t)))))
+    (assert (null lispterm.gpu::*live-contexts*))
+    (assert (= before (length (uiop:directory-files #p"/proc/self/fd/")))))
+  ;; Failed-creation cleanup itself can fail. Its typed condition must carry the
+  ;; partially created context instead of silently trying another DRM device.
+  (let ((retained nil))
+    (unwind-protect
+         (catch 'metadata-control
+           (call-with-driver-control
+            'lispterm.gpu::collect-context-info
+            (lambda (&rest arguments) (declare (ignore arguments)) (throw 'metadata-control nil))
+            (lambda ()
+              (call-with-driver-control
+               'lispterm.gpu:egl-destroy-context
+               (lambda (&rest arguments) (declare (ignore arguments)) 0)
+               (lambda ()
+                 (handler-case (lispterm.gpu:open-context)
+                   (lispterm.gpu:gpu-cleanup-error (condition)
+                     (setf retained (lispterm.gpu:cleanup-error-context condition)))))))))
+      (when retained (lispterm.gpu:close-context retained)))
+    (assert retained))
+  (assert (null lispterm.gpu::*live-contexts*))
+  (format t "CONTEXT-CLEANUP injected unbind/destroy/terminate and partial-create failures: retained handles, typed errors and retry verified~%")
+  t)
+
 (defun gpu-probe-check ()
+  (assert (assert-context-cleanup-controls))
   (let ((context (lispterm.gpu:open-context)))
     (unwind-protect
          (progn

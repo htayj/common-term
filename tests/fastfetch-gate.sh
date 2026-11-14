@@ -15,7 +15,8 @@ if [[ ! -f ${LISPTERM_FONT:-} ]]; then
   export LISPTERM_FONT=${fonts[0]}
 fi
 [[ -f $LISPTERM_FONT ]] || { echo 'Missing Terminus 16px font' >&2; exit 1; }
-art=$(mktemp -d "$root/.git/fastfetch-${backend}.XXXXXX")
+mkdir -p "$root/.build/evidence"
+art=$(mktemp -d "$root/.build/evidence/fastfetch-${backend}.XXXXXX")
 # Keep the original acceptance evidence immutable across fresh native runs.
 originals=(evidence/fastfetch-x11.png evidence/fastfetch-wayland.png evidence/fastfetch.org)
 for original in "${originals[@]}"; do
