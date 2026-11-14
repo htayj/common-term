@@ -27,6 +27,9 @@
     (and (extension-present-p "EGL_KHR_image_base" extensions)
          (extension-present-p "EGL_MESA_image_dma_buf_export" extensions))))
 
+(defun dma-close-fd (fd)
+  (sb-posix:close fd))
+
 (defun dma-destroy (target)
   "Release an export target, retaining ownership when checked teardown fails."
   (restart-case
@@ -37,7 +40,7 @@
         (gl-check 'dma-destroy-entry)
         (loop while (dma-target-fds target) do
           (sb-sys:without-interrupts
-            (sb-posix:close (first (dma-target-fds target)))
+            (dma-close-fd (first (dma-target-fds target)))
             (pop (dma-target-fds target))))
         (when (dma-target-image target)
           (sb-sys:without-interrupts
@@ -73,6 +76,9 @@
   (unless (dma-supported-p context) (unavailable 'dma-create "EGL dma-buf export unavailable"))
   (gl-check 'dma-create-entry)
   (let ((target (make-dma-target :context context :width width :height height)) (ok nil))
+    ;; Retain even a successful allocation until a pool adopts it. An exit
+    ;; between returning the target and the caller's unwind cannot lose it.
+    (setf (gethash target *dma-pending-targets*) t)
     (unwind-protect
          (progn
            (cffi:with-foreign-object (name :unsigned-int)
@@ -107,13 +113,14 @@
              (setf (cffi:mem-aref attrs :int 0) #x30d2 ; EGL_IMAGE_PRESERVED_KHR
                    (cffi:mem-aref attrs :int 1) 1
                    (cffi:mem-aref attrs :int 2) #x3038)
-             (let ((image (with-driver-call
-                            (cffi:foreign-funcall-pointer (extension-address "eglCreateImageKHR") ()
-                              :pointer (context-display context) :pointer (context-native context)
-                              :unsigned-int #x30b1 :pointer (cffi:make-pointer (dma-target-texture target))
-                              :pointer attrs :pointer))))
-               (when (cffi:null-pointer-p image) (unavailable 'dma-create "eglCreateImageKHR failed"))
-               (setf (dma-target-image target) image)))
+              (sb-sys:without-interrupts
+                (let ((image (with-driver-call
+                               (cffi:foreign-funcall-pointer (extension-address "eglCreateImageKHR") ()
+                                 :pointer (context-display context) :pointer (context-native context)
+                                 :unsigned-int #x30b1 :pointer (cffi:make-pointer (dma-target-texture target))
+                                 :pointer attrs :pointer))))
+                  (when (cffi:null-pointer-p image) (unavailable 'dma-create "eglCreateImageKHR failed"))
+                  (setf (dma-target-image target) image))))
            (cffi:with-foreign-objects ((format :int) (planes :int) (modifier :uint64))
              (egl-check (with-driver-call
                           (cffi:foreign-funcall-pointer (extension-address "eglExportDMABUFImageQueryMESA") ()
@@ -125,27 +132,29 @@
                      (dma-target-modifier target) (cffi:mem-ref modifier :uint64))
                (cffi:with-foreign-objects ((fds :int 4) (strides :int 4) (offsets :int 4))
                  (dotimes (i 4) (setf (cffi:mem-aref fds :int i) -1))
-                 (unwind-protect
-                      (progn
-                        (egl-check (with-driver-call
-                                     (cffi:foreign-funcall-pointer (extension-address "eglExportDMABUFImageMESA") ()
-                                       :pointer (context-display context) :pointer (dma-target-image target)
-                                       :pointer fds :pointer strides :pointer offsets :unsigned-int)) 'dma-export)
-                        (setf (dma-target-fds target)
-                              (loop for i below count collect (cffi:mem-aref fds :int i))
-                              (dma-target-strides target)
-                              (loop for i below count collect (cffi:mem-aref strides :int i))
-                              (dma-target-offsets target)
-                              (loop for i below count collect (cffi:mem-aref offsets :int i)))
-                        (dotimes (i count) (setf (cffi:mem-aref fds :int i) -1))
-                        (dolist (fd (dma-target-fds target))
-                          (when (minusp fd) (unavailable 'dma-export "Invalid exported FD"))
-                          (sb-posix:fcntl fd sb-posix:f-setfd 1)) ; Linux FD_CLOEXEC
-                        (unless (and (every #'plusp (dma-target-strides target))
-                                     (every (lambda (x) (not (minusp x))) (dma-target-offsets target)))
-                          (unavailable 'dma-export "Invalid exported plane layout")))
-                   (dotimes (i 4) (let ((fd (cffi:mem-aref fds :int i)))
-                                   (when (>= fd 0) (sb-posix:close fd))))))))
+                  ;; The driver writes temporary FD slots. Adopt every returned
+                  ;; FD, including partial failure output, before an exit can run
+                  ;; cleanup. No second FD owner or temporary close path exists.
+                  (sb-sys:without-interrupts
+                    (unwind-protect
+                         (egl-check (with-driver-call
+                                      (cffi:foreign-funcall-pointer (extension-address "eglExportDMABUFImageMESA") ()
+                                        :pointer (context-display context) :pointer (dma-target-image target)
+                                        :pointer fds :pointer strides :pointer offsets :unsigned-int)) 'dma-export)
+                      (setf (dma-target-fds target)
+                            (loop for i below 4 for fd = (cffi:mem-aref fds :int i)
+                                  when (>= fd 0) collect fd))))
+                  (unless (= count (length (dma-target-fds target)))
+                    (unavailable 'dma-export "Invalid exported FD count"))
+                  (setf (dma-target-strides target)
+                        (loop for i below count collect (cffi:mem-aref strides :int i))
+                        (dma-target-offsets target)
+                        (loop for i below count collect (cffi:mem-aref offsets :int i)))
+                  (dolist (fd (dma-target-fds target))
+                    (sb-posix:fcntl fd sb-posix:f-setfd 1)) ; Linux FD_CLOEXEC
+                  (unless (and (every #'plusp (dma-target-strides target))
+                               (every (lambda (x) (not (minusp x))) (dma-target-offsets target)))
+                    (unavailable 'dma-export "Invalid exported plane layout")))))
            (gl-bind-framebuffer #x8d40 0)
            (gl-check 'dma-unbind-framebuffer)
            (setf ok t) target)
@@ -167,7 +176,9 @@
 (in-package #:lispterm.display.wayland)
 (defstruct dma-protocol id formats buffers disabled-reason
   (exports 0) (imports 0) (presents 0) (releases 0) (reuses 0) (finishes 0))
-(defstruct dma-buffer id target generation (busy-p nil) (uses 0) (protocol-destroyed-p nil))
+(defstruct dma-buffer id target generation params (params-created-p nil)
+  (params-destroyed-p nil) (import-pending-p nil) (complete-p nil)
+  (busy-p nil) (uses 0) (protocol-destroyed-p nil))
 (defvar *dma-protocols* (make-hash-table :test #'eq :weakness :key))
 (defvar *dma-force-unsupported* nil)
 
@@ -189,7 +200,21 @@
                                             (bytes-u32 payload 8)))
                               (dma-protocol-formats dma) :test #'equal)))))))))
 
+(defun dma-params-destroy (state buffer &optional disconnected)
+  (unless (dma-buffer-params-destroyed-p buffer)
+    (sb-sys:without-interrupts
+      (when (and (dma-buffer-params-created-p buffer) (not disconnected))
+        (wire-send (wayland-state-wire state) (dma-buffer-params buffer) 0))
+      (setf (dma-buffer-params-destroyed-p buffer) t))))
+
 (defun dma-buffer-destroy (state buffer &optional disconnected)
+  ;; An interrupted roundtrip may leave the server-created buffer ID in
+  ;; flight. Retain this owner until its callback records that ID or failure.
+  (when (and (dma-buffer-import-pending-p buffer) (not disconnected))
+    (protocol-roundtrip state)
+    (when (dma-buffer-import-pending-p buffer)
+      (wire-error "dma import result still pending at cleanup" nil)))
+  (dma-params-destroy state buffer disconnected)
   (unless (dma-buffer-protocol-destroyed-p buffer)
     (sb-sys:without-interrupts
       (unless (or disconnected (null (dma-buffer-id buffer)))
@@ -198,18 +223,28 @@
   (lispterm.gpu:dma-destroy (dma-buffer-target buffer)))
 
 (defun dma-import (state dma target)
-  (let* ((wire (wayland-state-wire state)) (result nil) (failed nil)
-         (buffer (make-dma-buffer :target target :generation (wayland-state-generation state)))
-         (params (wire-id wire :dma-params
-                   (lambda (id opcode payload)
-                     (declare (ignore id))
-                     (case opcode
-                       (0 (unless (= 4 (length payload)) (wire-error "invalid dma-buf created event" nil))
-                          (setf result (bytes-u32 payload 0)))
-                       (1 (setf failed t)))))))
-    (unwind-protect
-         (progn
-           (wire-send wire (dma-protocol-id dma) 1 params)
+  (let* ((wire (wayland-state-wire state)) (failed nil)
+         (buffer (make-dma-buffer :target target :generation (wayland-state-generation state))))
+    ;; Publish one durable owner before any protocol request or callback. The
+    ;; caller tests pool membership on unwind, never normal-return timing.
+    (sb-sys:without-interrupts
+      (push buffer (dma-protocol-buffers dma))
+      (remhash target lispterm.gpu::*dma-pending-targets*))
+    (let ((params (wire-id wire :dma-params
+                    (lambda (id opcode payload)
+                      (declare (ignore id))
+                      (case opcode
+                        (0 (unless (= 4 (length payload)) (wire-error "invalid dma-buf created event" nil))
+                           (sb-sys:without-interrupts
+                             (setf (dma-buffer-id buffer) (bytes-u32 payload 0)
+                                   (dma-buffer-import-pending-p buffer) nil)))
+                        (1 (setf failed t (dma-buffer-import-pending-p buffer) nil)))))))
+      (setf (dma-buffer-params buffer) params)
+      (unwind-protect
+           (progn
+             (sb-sys:without-interrupts
+               (wire-send wire (dma-protocol-id dma) 1 params)
+               (setf (dma-buffer-params-created-p buffer) t))
            (loop for fd in (lispterm.gpu:dma-target-fds target)
                  for stride in (lispterm.gpu:dma-target-strides target)
                  for offset in (lispterm.gpu:dma-target-offsets target)
@@ -217,30 +252,33 @@
                    (wire-send wire params 1 (list :fd fd) plane offset stride
                               (ldb (byte 32 32) (lispterm.gpu:dma-target-modifier target))
                               (ldb (byte 32 0) (lispterm.gpu:dma-target-modifier target))))
-           (wire-send wire params 2 (lispterm.gpu:dma-target-width target)
-                      (lispterm.gpu:dma-target-height target)
-                      (lispterm.gpu:dma-target-fourcc target) 0)
-           (protocol-roundtrip state)
-           (when (or failed (not result)) (return-from dma-import nil))
-           (setf (dma-buffer-id buffer) result
-                 (gethash result (wire-interfaces wire)) :buffer
-                 (gethash result (wire-handlers wire))
-                 (lambda (id opcode payload)
-                   (declare (ignore id))
-                   (unless (and (= opcode 0) (zerop (length payload)))
-                     (wire-error "invalid dma wl_buffer.release" nil))
-                   (unless (dma-buffer-busy-p buffer) (wire-error "duplicate dma release" nil))
-                   (setf (dma-buffer-busy-p buffer) nil)
-                   (incf (dma-protocol-releases dma))))
-           (incf (dma-protocol-imports dma))
-           (push buffer (dma-protocol-buffers dma)) buffer)
-      (wire-send wire params 0))))
+             (sb-sys:without-interrupts
+               (wire-send wire params 2 (lispterm.gpu:dma-target-width target)
+                          (lispterm.gpu:dma-target-height target)
+                          (lispterm.gpu:dma-target-fourcc target) 0)
+               (setf (dma-buffer-import-pending-p buffer) t))
+             (protocol-roundtrip state)
+             (when (or failed (not (dma-buffer-id buffer))) (return-from dma-import nil))
+             (setf (gethash (dma-buffer-id buffer) (wire-interfaces wire)) :buffer
+                   (gethash (dma-buffer-id buffer) (wire-handlers wire))
+                   (lambda (id opcode payload)
+                     (declare (ignore id))
+                     (unless (and (= opcode 0) (zerop (length payload)))
+                       (wire-error "invalid dma wl_buffer.release" nil))
+                     (unless (dma-buffer-busy-p buffer) (wire-error "duplicate dma release" nil))
+                     (setf (dma-buffer-busy-p buffer) nil)
+                     (incf (dma-protocol-releases dma))))
+             (incf (dma-protocol-imports dma)))
+        (dma-params-destroy state buffer))
+      (setf (dma-buffer-complete-p buffer) t)
+      buffer)))
 
 (defun dma-collect (state dma)
   (setf (dma-protocol-buffers dma)
         (delete-if (lambda (b)
-                     (when (and (not (dma-buffer-busy-p b))
-                                (/= (dma-buffer-generation b) (wayland-state-generation state)))
+                      (when (and (not (dma-buffer-busy-p b))
+                                 (or (not (dma-buffer-complete-p b))
+                                     (/= (dma-buffer-generation b) (wayland-state-generation state))))
                        (dma-buffer-destroy state b) t))
                    (dma-protocol-buffers dma))))
 
@@ -306,7 +344,7 @@
                                   sum (* 4 (lispterm.gpu:dma-target-width target)
                                            (lispterm.gpu:dma-target-height target)))) 268435456))
           (return-from dma-present :busy))
-        (let ((target (lispterm.gpu:dma-create context width height)) (owned nil))
+        (let ((target (lispterm.gpu:dma-create context width height)))
           (unwind-protect
                (progn
                  (incf (dma-protocol-exports dma))
@@ -318,9 +356,9 @@
                  (setf buffer (dma-import state dma target))
                  (unless buffer
                    (setf (dma-protocol-disabled-reason dma) :compositor-import-failed)
-                   (return-from dma-present :unsupported))
-                 (setf owned t))
-            (unless owned (lispterm.gpu:dma-destroy target)))))
+                    (return-from dma-present :unsupported)))
+            (unless (find target (dma-protocol-buffers dma) :key #'dma-buffer-target)
+              (lispterm.gpu:dma-destroy target)))))
       (when (dma-buffer-busy-p buffer) (wire-error "attempted in-flight dma overwrite" nil))
       (when (plusp (dma-buffer-uses buffer)) (incf (dma-protocol-reuses dma)))
       (lispterm.gpu:renderer-copy-target (lispterm.display::display-renderer-state display)

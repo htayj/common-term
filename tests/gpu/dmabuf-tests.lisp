@@ -110,6 +110,144 @@
            "Failed partial cleanup can be mistaken for clean GPU unavailability")
     target))
 
+(defun dma-allocation-transfer-controls (context)
+  (dolist (mode '(:image-interrupt :fd-interrupt :fd-throw))
+    (let ((address (symbol-function 'lispterm.gpu::extension-address))
+          (check-egl (symbol-function 'lispterm.gpu::egl-check))
+          (destroy (symbol-function 'lispterm.gpu:dma-destroy))
+          (close-fd (symbol-function 'lispterm.gpu::dma-close-fd))
+          (target nil) (image nil) (fds nil) (sentinels nil)
+          (closes (make-hash-table)) (image-destroys 0) (injected nil) (caught nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'lispterm.gpu::extension-address)
+                   (lambda (name)
+                     (let ((pointer (funcall address name)))
+                       (when (string= name "eglDestroyImageKHR") (incf image-destroys))
+                       (when (and (not injected)
+                                  (or (and (eq mode :image-interrupt) (string= name "eglCreateImageKHR"))
+                                      (and (eq mode :fd-interrupt) (string= name "eglExportDMABUFImageMESA"))))
+                         (setf injected t)
+                         ;; Queue a real SBCL asynchronous nonlocal exit. The
+                         ;; driver call must finish and publish ownership first.
+                         (sb-thread:interrupt-thread sb-thread:*current-thread*
+                           (lambda () (throw 'dma-allocation :interrupted))))
+                       pointer))
+                   (symbol-function 'lispterm.gpu::egl-check)
+                   (lambda (result operation)
+                     (prog1 (funcall check-egl result operation)
+                       (when (and (eq mode :fd-throw) (eq operation 'lispterm.gpu::dma-export))
+                         (setf injected t)
+                         (throw 'dma-allocation :thrown))))
+                   (symbol-function 'lispterm.gpu:dma-destroy)
+                   (lambda (owner)
+                     (setf target owner image (lispterm.gpu::dma-target-image owner)
+                           fds (copy-list (lispterm.gpu:dma-target-fds owner)))
+                     (funcall destroy owner))
+                   (symbol-function 'lispterm.gpu::dma-close-fd)
+                   (lambda (fd)
+                     (prog1 (funcall close-fd fd)
+                       (when (member fd fds)
+                         (incf (gethash fd closes 0))
+                         ;; Reuse the just-closed number. A duplicate close must
+                         ;; not close this unrelated descriptor during unwind.
+                         (push (sb-posix:open "/dev/null" sb-posix:o-rdonly) sentinels)))))
+             (setf caught (catch 'dma-allocation (lispterm.gpu:dma-create context 16 16))))
+        (setf (symbol-function 'lispterm.gpu::extension-address) address
+              (symbol-function 'lispterm.gpu::egl-check) check-egl
+              (symbol-function 'lispterm.gpu:dma-destroy) destroy
+              (symbol-function 'lispterm.gpu::dma-close-fd) close-fd))
+      (unwind-protect
+           (progn
+             (check (and injected (eq caught (if (eq mode :fd-throw) :thrown :interrupted))
+                         target image (= 1 image-destroys)
+                         (lispterm.gpu::dma-target-closed-p target)
+                         (not (gethash target lispterm.gpu::*dma-pending-targets*)))
+                    "DMA allocation exit lost image/target ownership: ~S" mode)
+             (unless (eq mode :image-interrupt)
+               (check fds "Export exit lost FD ownership")
+               (dolist (fd fds) (check (= 1 (gethash fd closes 0)) "FD ~D closed other than once" fd)))
+             (dolist (fd sentinels)
+               (check (integerp (sb-posix:fcntl fd sb-posix:f-getfd)) "Reused FD was closed again"))
+             (format t "DIRECT ALLOCATION TRANSFER ~S image-destroys=~D FD-closes=~S reused-FDs-live=~D~%"
+                     mode image-destroys (loop for fd in fds collect (gethash fd closes)) (length sentinels)))
+        (dolist (fd sentinels) (funcall close-fd fd))))))
+
+(defun dma-import-transfer-controls (display)
+  ;; Fail after a real successful compositor import, before params destruction.
+  ;; Exercise the actual dma-present caller's unwind, not a model of it.
+  (let* ((state (lispterm.display.wayland::window-protocol display))
+         (dma (gethash state lispterm.display.wayland::*dma-protocols*))
+         (wire (lispterm.display.wayland::wayland-state-wire state))
+         (send (symbol-function 'lispterm.display.wayland::wire-send))
+         (create (symbol-function 'lispterm.gpu:dma-create))
+         (all-safe t))
+    (dolist (mode '(:error :throw))
+      (let ((target nil) (injected nil) (caught nil)
+            (old (copy-list (lispterm.display.wayland::dma-protocol-buffers dma)))
+            (busy nil))
+        (setf busy (mapcar #'lispterm.display.wayland::dma-buffer-busy-p old))
+        (unwind-protect
+             (progn
+               (dolist (buffer old) (setf (lispterm.display.wayland::dma-buffer-busy-p buffer) t))
+               (setf (symbol-function 'lispterm.gpu:dma-create)
+                     (lambda (&rest arguments) (setf target (apply create arguments)))
+                     (symbol-function 'lispterm.display.wayland::wire-send)
+                     (lambda (connection id opcode &rest arguments)
+                       (when (and (= opcode 0)
+                                  (eq :dma-params (gethash id (lispterm.display.wayland::wire-interfaces wire))))
+                         (setf injected t)
+                         (if (eq mode :throw) (throw 'dma-transfer :thrown)
+                             (error "Injected trailing params destruction failure")))
+                       (apply send connection id opcode arguments)))
+               (setf caught
+                     (catch 'dma-transfer
+                       (handler-case (lispterm.display.wayland::dma-present display)
+                         (error () :error)))))
+          (setf (symbol-function 'lispterm.gpu:dma-create) create
+                (symbol-function 'lispterm.display.wayland::wire-send) send)
+          (loop for buffer in old for value in busy do
+            (setf (lispterm.display.wayland::dma-buffer-busy-p buffer) value)))
+        (let* ((buffer (find target (lispterm.display.wayland::dma-protocol-buffers dma)
+                             :key #'lispterm.display.wayland::dma-buffer-target))
+               (safe (and injected (eq caught (if (eq mode :throw) :thrown :error))
+                          target buffer (not (lispterm.gpu::dma-target-closed-p target))
+                          (lispterm.gpu:dma-target-fds target)
+                          (= 1 (count target (lispterm.display.wayland::dma-protocol-buffers dma)
+                                      :key #'lispterm.display.wayland::dma-buffer-target))
+                          (not (gethash target lispterm.gpu::*dma-pending-targets*))
+                          (lispterm.display.wayland::dma-buffer-params-created-p buffer)
+                          (not (lispterm.display.wayland::dma-buffer-params-destroyed-p buffer))
+                          (not (lispterm.display.wayland::dma-buffer-protocol-destroyed-p buffer))
+                          (not (lispterm.display.wayland::dma-buffer-complete-p buffer)))))
+          (format t "DIRECT TRANSFER ~S injected=~S caught=~S pool-owner=~S closed=~S safe=~S~%"
+                  mode injected caught (not (null buffer))
+                  (and target (lispterm.gpu::dma-target-closed-p target)) (not (null safe)))
+          (unless safe
+            (setf all-safe nil)
+            ;; Permit the second pre-repair reproduction without exhausting the
+            ;; bounded pool with the first broken buffer.
+            (when buffer
+              (lispterm.display.wayland::dma-buffer-destroy state buffer)
+              (setf (lispterm.display.wayland::dma-protocol-buffers dma)
+                    (remove buffer (lispterm.display.wayland::dma-protocol-buffers dma)))))
+          ;; Failed imports must be collectible while still connected, including
+          ;; retrying params destruction, without damaging the normal pool.
+          (when safe
+            (let ((fds (copy-list (lispterm.gpu:dma-target-fds target))))
+              (lispterm.display.wayland::dma-collect state dma)
+              (lispterm.display.wayland::protocol-roundtrip state)
+              (check (and (lispterm.gpu::dma-target-closed-p target)
+                          (lispterm.display.wayland::dma-buffer-params-destroyed-p buffer)
+                          (lispterm.display.wayland::dma-buffer-protocol-destroyed-p buffer)
+                          (not (gethash target lispterm.gpu::*dma-pending-targets*))
+                          (not (member buffer (lispterm.display.wayland::dma-protocol-buffers dma))))
+                     "Failed import retry did not release pool ownership")
+              (dolist (fd fds)
+                (check (handler-case (progn (sb-posix:fcntl fd sb-posix:f-getfd) nil)
+                         (sb-posix:syscall-error () t)) "Import retry leaked FD ~D" fd)))))))
+    (check all-safe "Trailing params failure/nonlocal exit retained a destroyed pool target")))
+
 (defun dma-one-session (directory &key (label "direct"))
   (let ((display (lispterm.display:open-display :backend :wayland :renderer :gpu :columns 12 :rows 4))
         (fds nil) (context nil) (partial nil))
@@ -117,6 +255,7 @@
          (progn
            (setf context (lispterm.display::display-renderer-context display))
            (lispterm.gpu:require-hardware-context context)
+            (dma-allocation-transfer-controls context)
             (dma-name-allocation-controls context)
             (setf partial (dma-partial-construction-control context))
            (let* ((state (lispterm.display.wayland::window-protocol display))
@@ -136,6 +275,7 @@
                  (check (plusp (lispterm.display.wayland::dma-protocol-presents dma))
                         "Direct path did not present, reason ~S" (lispterm.display.wayland::dma-metrics state))
                  (when (= phase 4) (dma-capture-compare display cpu directory label))))
+              (dma-import-transfer-controls display)
              (check (plusp (lispterm.display.wayland::dma-protocol-releases dma)) "No actual wl_buffer.release")
              (check (plusp (lispterm.display.wayland::dma-protocol-reuses dma)) "No released-buffer reuse")
              (check (= (lispterm.display.wayland::dma-protocol-presents dma)
