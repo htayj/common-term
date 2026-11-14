@@ -105,11 +105,61 @@
                  :line-size line-size)))))
     grid))
 
+(defun check-overlapping-cell-writes (context)
+  "Rectangular CPU writes preserve uncovered pixels, even across line modes."
+  (let* ((cpu (parity-display 48 32))
+         (font (lispterm.display::display-font cpu))
+         (cw (lispterm.display::font-width font))
+         (ch (lispterm.display::font-height font))
+         (renderer (lispterm.gpu:make-renderer :context context :width 48 :height 32
+                                            :cell-width cw :cell-height ch)))
+    (unwind-protect
+         (progn
+           (dolist (write '((1 0 #\W 2 :single #xabcdef #x123456)
+                            (0 0 #\A 2 :single #xfedcba #x654321)
+                            (1 0 #\B 1 :single #xeeeeee #x234567)
+                            (0 1 #\W 2 :double-width #xabcdef #x123456)
+                            (1 1 #\A 1 :single #xfedcba #x654321)
+                            (0 1 #\B 1 :double-width #xffffff #x234567)
+                            (1 1 #\R 1 :double-width #xabcdef #x123456)
+                            (1 1 #\S 1 :single #xfedcba #x654321)))
+             (destructuring-bind (column row char span size fg bg) write
+               (parity-write cpu renderer column row
+                             (lispterm.display::make-cell :char char :width span
+                                                         :line-size size :fg fg :bg bg))
+               (assert-parity cpu renderer (format nil "OVERLAP ~S" write))))
+           ;; Repeated identical overwrites must not accumulate dead fragments.
+           (dotimes (i 32)
+             (parity-write cpu renderer 0 0
+                           (lispterm.display::make-cell :char #\A :width 2
+                                                       :fg #xfedcba :bg #x654321)))
+           (assert (< (hash-table-count (lispterm.gpu::renderer-cells renderer)) 16))
+           (assert-parity cpu renderer "OVERLAP-REPEATED")
+           ;; Exercise the public damage cache too: unrelated cached cells are
+           ;; not redrawn by DRAW-CELLS and cannot hide lost retained pixels.
+           (setf cpu (parity-display 48 32))
+           (lispterm.gpu:renderer-resize renderer 48 32 cw ch)
+           (let ((gpu (parity-gpu-display cpu renderer)))
+             (dolist (column '(1 0))
+               (let ((cell (lispterm.display::make-cell :char (if (zerop column) #\A #\W)
+                                                      :width 2 :fg #xabcdef :bg #x123456)))
+                 (lispterm.display::draw-cells cpu 0 column (vector cell))
+                 (lispterm.display::draw-cells gpu 0 column (vector cell))
+                 (assert-parity cpu renderer (format nil "DAMAGE-OVERLAP ~D" column))))
+             ;; A complete row repaint does cover the old right half, explaining
+             ;; why full-grid corpus checks alone did not expose this defect.
+             (let ((grid (corpus-grid 6 2 0 :single)))
+               (lispterm.display::draw-frame cpu grid)
+               (lispterm.display::draw-frame gpu grid)
+               (assert-parity cpu renderer "OVERLAP-FULL-ROW-REPAINT"))))
+      (lispterm.gpu:renderer-close renderer))))
+
 (defun gpu-offscreen-check ()
   (let ((context (lispterm.gpu:open-context)) (renderer nil) (frames 0) (pixels 0))
     (unwind-protect
          (progn
            (lispterm.gpu:require-hardware-context context)
+           (check-overlapping-cell-writes context)
            (dolist (dimensions '((51 35) (43 33) (8 16) (7 9) (89 48)))
              (destructuring-bind (width height) dimensions
                (let* ((cpu (parity-display width height))

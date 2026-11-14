@@ -14,6 +14,7 @@
    (fbo :initform 0 :accessor renderer-fbo)
    (vao :initform 0 :accessor renderer-vao)
    (vbo :initform 0 :accessor renderer-vbo)
+   (pending-textures :initform nil :accessor renderer-pending-textures)
    (octets :initform nil :accessor renderer-octets)
    (dirty :initform t :accessor renderer-dirty)
    (closed :initform nil :accessor renderer-closed)
@@ -26,98 +27,124 @@
   (incf (gethash name (renderer-counters r) 0) amount))
 (defun renderer-name (generator)
   (cffi:with-foreign-object (p :unsigned-int)
+    (gl-check 'before-allocate-renderer-name)
     (setf (cffi:mem-ref p :unsigned-int) 0)
     (funcall generator 1 p)
     (gl-check 'allocate-renderer-name)
     (cffi:mem-ref p :unsigned-int)))
 (defun renderer-delete-name (deleter name)
   (unless (zerop name)
+    ;; A stale error is not evidence about the deletion. Refuse before touching
+    ;; ownership, then check the result while the caller still owns the name.
+    (gl-check 'before-renderer-delete)
     (cffi:with-foreign-object (p :unsigned-int)
       (setf (cffi:mem-ref p :unsigned-int) name)
-      (funcall deleter 1 p))))
+      (funcall deleter 1 p)
+      (gl-check 'renderer-delete))))
 (defun renderer-color (rgb)
   (gl-clear-color (/ (ldb (byte 8 16) rgb) 255.0)
                   (/ (ldb (byte 8 8) rgb) 255.0)
                   (/ (ldb (byte 8 0) rgb) 255.0) 1.0))
 
 (defgeneric renderer-close (renderer))
+(defmethod renderer-close :around ((r gpu-renderer))
+  ;; Keep partial-construction ownership reachable while handling a cleanup error.
+  (loop
+    (restart-case (return (call-next-method))
+      (retry-renderer-close () :report "Retry releasing the retained renderer objects."))))
 (defmethod renderer-close ((r gpu-renderer))
-  (unless (renderer-closed r)
-    (renderer-owner r)
-    ;; Zero each handle only after its deletion succeeds, permitting cleanup retry.
-    (macrolet ((release (accessor function)
-                 `(progn (renderer-delete-name #',function (,accessor r))
-                         (setf (,accessor r) 0))))
-      (release renderer-vbo gl-delete-buffers)
-      (release renderer-vao gl-delete-vertex-arrays)
-      (release renderer-fbo gl-delete-framebuffers)
-      (release renderer-target gl-delete-textures)
-      (release renderer-texture gl-delete-textures))
-    (unless (zerop (renderer-program r))
-      (gl-delete-program (renderer-program r)) (setf (renderer-program r) 0))
-    (setf (renderer-closed r) t))
+  (sb-sys:without-interrupts
+    (unless (renderer-closed r)
+      (renderer-owner r)
+      ;; Check and release each owned name atomically with respect to Lisp
+      ;; interruption. Failed deletions retain their handle for a cleanup retry.
+      (macrolet ((release (accessor function)
+                   `(progn (renderer-delete-name #',function (,accessor r))
+                           (setf (,accessor r) 0))))
+        (release renderer-vbo gl-delete-buffers)
+        (release renderer-vao gl-delete-vertex-arrays)
+        (release renderer-fbo gl-delete-framebuffers)
+        (release renderer-target gl-delete-textures)
+        (release renderer-texture gl-delete-textures))
+      (dolist (texture (copy-list (renderer-pending-textures r)))
+        (renderer-delete-name #'gl-delete-textures texture)
+        (setf (renderer-pending-textures r) (remove texture (renderer-pending-textures r))))
+      (unless (zerop (renderer-program r))
+        (gl-check 'before-renderer-delete-program)
+        (gl-delete-program (renderer-program r))
+        (gl-check 'renderer-delete-program)
+        (setf (renderer-program r) 0))
+      (setf (renderer-closed r) t)))
   t)
 
 (defgeneric renderer-resize (renderer width height cell-width cell-height))
 (defmethod renderer-resize ((r gpu-renderer) width height cell-width cell-height)
   (renderer-owner r)
-  (let* ((limit (gl-integer #x0D33))
-         (viewport (gl-integers #x0D3A 2)))
-    (dolist (v (list width height cell-width cell-height))
-      (model-positive-integer v :dimension (min limit (expt 2 24))))
-    (unless (and (<= width (first viewport)) (<= height (second viewport))
-                 (<= (* width height 4) #x7fffffff)
-                 (<= (* (max 1 (floor width cell-width))
-                        (max 1 (floor height cell-height))) 1048576)
-                 (<= (* 4 (max width cell-width)) (expt 2 24))
-                 (<= (* 4 (max height cell-height)) (expt 2 24)))
-      (error "Renderer dimensions exceed device or exact shader arithmetic bounds"))
-    ;; Allocate a replacement target before changing the usable renderer state.
-    (let ((texture (renderer-name #'gl-gen-textures)) (success nil))
-      (unwind-protect
-           (progn
-             (gl-bind-texture #x0DE1 texture)
-             (gl-tex-parameter-i #x0DE1 #x2801 #x2600)
-             (gl-tex-parameter-i #x0DE1 #x2800 #x2600)
-             (gl-tex-image-2d #x0DE1 0 #x8058 width height 0 #x1908 #x1401 (cffi:null-pointer))
-             (gl-bind-framebuffer #x8D40 (renderer-fbo r))
-             (gl-framebuffer-texture-2d #x8D40 #x8CE0 #x0DE1 texture 0)
-             (unless (= (gl-check-framebuffer-status #x8D40) #x8CD5)
-               (error "Incomplete renderer framebuffer"))
-             (gl-check 'renderer-resize)
-             (renderer-delete-name #'gl-delete-textures (renderer-target r))
-             (setf (renderer-target r) texture success t))
-        (unless success
-          (gl-framebuffer-texture-2d #x8D40 #x8CE0 #x0DE1 (renderer-target r) 0)
-          (renderer-delete-name #'gl-delete-textures texture))))
-    (setf (renderer-width r) width (renderer-height r) height
-          (renderer-cw r) cell-width (renderer-ch r) cell-height
-          (renderer-atlas-columns r) (min 64 (floor limit cell-width))
-          (renderer-atlas r)
-          (make-atlas :tile-width cell-width :tile-height cell-height :capacity 1
-                      :max-capacity (min 65536 (* (min 64 (floor limit cell-width))
-                                                  (floor limit cell-height))))
-          (renderer-atlas-capacity r) 0
-          (renderer-octets r) nil (renderer-dirty r) t)
-    (clrhash (renderer-cells r)) (clrhash (renderer-remainders r))
-    (renderer-count r :generations))
+  (sb-sys:without-interrupts
+    (gl-check 'before-renderer-resize)
+    (let* ((limit (gl-integer #x0D33))
+           (viewport (gl-integers #x0D3A 2)))
+      (dolist (v (list width height cell-width cell-height))
+        (model-positive-integer v :dimension (min limit (expt 2 24))))
+      (unless (and (<= width (first viewport)) (<= height (second viewport))
+                   (<= (* width height 4) #x7fffffff)
+                   (<= (* (max 1 (floor width cell-width))
+                          (max 1 (floor height cell-height))) 1048576)
+                   (<= (* 4 (max width cell-width)) (expt 2 24))
+                   (<= (* 4 (max height cell-height)) (expt 2 24)))
+        (error "Renderer dimensions exceed device or exact shader arithmetic bounds"))
+      ;; Prepare Lisp storage before committing the GL target replacement too.
+      (let* ((columns (min 64 (floor limit cell-width)))
+             (atlas (make-atlas :tile-width cell-width :tile-height cell-height :capacity 1
+                                :max-capacity (min 65536 (* columns (floor limit cell-height)))))
+             (texture (renderer-name #'gl-gen-textures)) (success nil))
+        ;; Retain provisional ownership if rollback deletion itself fails.
+        (push texture (renderer-pending-textures r))
+        (unwind-protect
+             (progn
+               (gl-bind-texture #x0DE1 texture)
+               (gl-tex-parameter-i #x0DE1 #x2801 #x2600)
+               (gl-tex-parameter-i #x0DE1 #x2800 #x2600)
+               (gl-tex-image-2d #x0DE1 0 #x8058 width height 0 #x1908 #x1401 (cffi:null-pointer))
+               (gl-bind-framebuffer #x8D40 (renderer-fbo r))
+               (gl-framebuffer-texture-2d #x8D40 #x8CE0 #x0DE1 texture 0)
+               (gl-check 'renderer-resize)
+               (unless (= (gl-check-framebuffer-status #x8D40) #x8CD5)
+                 (unavailable 'renderer-resize "Incomplete renderer framebuffer"))
+               (renderer-delete-name #'gl-delete-textures (renderer-target r))
+               (setf (renderer-target r) texture success t
+                     (renderer-pending-textures r) (remove texture (renderer-pending-textures r))))
+          (unless success
+            (gl-bind-framebuffer #x8D40 (renderer-fbo r))
+            (gl-framebuffer-texture-2d #x8D40 #x8CE0 #x0DE1 (renderer-target r) 0)
+            (gl-check 'renderer-resize-rollback)
+            (renderer-delete-name #'gl-delete-textures texture)
+            (setf (renderer-pending-textures r) (remove texture (renderer-pending-textures r)))))
+        (setf (renderer-width r) width (renderer-height r) height
+              (renderer-cw r) cell-width (renderer-ch r) cell-height
+              (renderer-atlas-columns r) columns (renderer-atlas r) atlas
+              (renderer-atlas-capacity r) 0
+              (renderer-octets r) nil (renderer-dirty r) t)
+        (clrhash (renderer-cells r)) (clrhash (renderer-remainders r))
+        (renderer-count r :generations))))
   r)
 
 (defun make-renderer (&key context width height cell-width cell-height)
   (assert-context-owner context)
-  (let ((r (make-instance 'gpu-renderer :context context)) (success nil))
-    (unwind-protect
-         (progn
-           (setf (renderer-program r)
-                 (link-gl-program (emit-shader (shader-form :vertex))
-                                  (emit-shader (shader-form :fragment)))
-                 (renderer-fbo r) (renderer-name #'gl-gen-framebuffers)
-                 (renderer-texture r) (renderer-name #'gl-gen-textures)
-                 (renderer-vao r) (renderer-name #'gl-gen-vertex-arrays)
-                 (renderer-vbo r) (renderer-name #'gl-gen-buffers))
-           (renderer-resize r width height cell-width cell-height)
-           (setf success t) r)
-      (unless success (renderer-close r)))))
+  (sb-sys:without-interrupts
+    (let ((r (make-instance 'gpu-renderer :context context)) (success nil))
+      (unwind-protect
+           (progn
+             (setf (renderer-program r)
+                   (link-gl-program (emit-shader (shader-form :vertex))
+                                    (emit-shader (shader-form :fragment)))
+                   (renderer-fbo r) (renderer-name #'gl-gen-framebuffers)
+                   (renderer-texture r) (renderer-name #'gl-gen-textures)
+                   (renderer-vao r) (renderer-name #'gl-gen-vertex-arrays)
+                   (renderer-vbo r) (renderer-name #'gl-gen-buffers))
+             (renderer-resize r width height cell-width cell-height)
+             (setf success t) r)
+        (unless success (renderer-close r))))))
 
 (defun renderer-subtract-remainders (r left top right bottom)
   "Keep only old background-strip pixels outside a newly overwritten rectangle."
@@ -138,6 +165,38 @@
              (renderer-remainders r))
     (dolist (rectangle remove) (remhash rectangle (renderer-remainders r)))
     (dolist (piece pieces) (setf (gethash (car piece) (renderer-remainders r)) (cdr piece)))))
+
+(defun renderer-subtract-cells (r left top right bottom)
+  "Retain disjoint GPU-drawn fragments outside a rectangular CPU-style write."
+  (let ((remove nil) (pieces nil))
+    (maphash
+     (lambda (position cell)
+       (destructuring-bind (x y end-x end-y) (getf cell :rectangle)
+         (let ((ix (max x left)) (iy (max y top))
+               (ir (min end-x right)) (ib (min end-y bottom)))
+           (when (and (< ix ir) (< iy ib))
+             (push position remove)
+             (flet ((piece (px py pr pb)
+                      (when (and (< px pr) (< py pb))
+                        (let* ((rectangle (list px py pr pb)) (copy (copy-list cell)))
+                          (setf (getf copy :rectangle) rectangle (getf copy :clipped) t)
+                          (push (cons (append (subseq position 0 2) rectangle) copy) pieces)))))
+               (piece x y end-x iy) (piece x ib end-x end-y)
+               (piece x iy ix ib) (piece ir iy end-x ib))))))
+     (renderer-cells r))
+    (dolist (position remove) (remhash position (renderer-cells r)))
+    (dolist (piece pieces) (setf (gethash (car piece) (renderer-cells r)) (cdr piece)))))
+
+(defun renderer-positions (r)
+  ;; Shared ordering for the packed records and the optional scissor draws.
+  (sort (loop for p being the hash-keys of (renderer-cells r) collect p)
+        (lambda (a b)
+          (or (< (second a) (second b))
+              (and (= (second a) (second b))
+                   (or (< (first a) (first b))
+                       (and (= (first a) (first b))
+                          (loop for x in (cddr a) for y in (cddr b)
+                                when (/= x y) return (< x y)))))))))
 
 (defgeneric renderer-write-cell (renderer column row &key glyph-key mask foreground background
                                                          bold underline hidden span line-size))
@@ -165,18 +224,18 @@
      (min (renderer-width r) (* (renderer-cw r) scale (max 1 (floor columns scale)))
           (* (+ column span) (renderer-cw r) scale))
      (* (1+ row) (renderer-ch r)))
-    (let ((remove nil))
-      (maphash (lambda (position cell)
-                 (when (and (= (second position) row)
-                            (or (not (eq (getf cell :line-size) line-size))
-                                (and (< (first position) (+ column span))
-                                     (<= column (first position)))))
-                   (push position remove))) (renderer-cells r))
-      (dolist (position remove) (remhash position (renderer-cells r))))
-    (setf (gethash (list column row) (renderer-cells r))
-          (list :key key :mask (copy-seq mask) :foreground foreground :background background
-                :bold bold :underline underline :hidden hidden :span span :line-size line-size)
-          (renderer-dirty r) t))
+    (let* ((left (* column (renderer-cw r) scale))
+           (top (* row (renderer-ch r)))
+           (right (min (renderer-width r)
+                       (* (renderer-cw r) scale (max 1 (floor columns scale)))
+                       (* (+ column span) (renderer-cw r) scale)))
+           (bottom (* (1+ row) (renderer-ch r))))
+      (renderer-subtract-cells r left top right bottom)
+      (setf (gethash (list column row left top right bottom) (renderer-cells r))
+            (list :key key :mask (copy-seq mask) :foreground foreground :background background
+                  :bold bold :underline underline :hidden hidden :span span :line-size line-size
+                  :rectangle (list left top right bottom))))
+    (setf (renderer-dirty r) t))
   r)
 
 (defgeneric renderer-write-remainder (renderer x y width height background))
@@ -219,9 +278,7 @@
         (atlas-acknowledge-upload atlas slot epoch)))))
 
 (defun renderer-pack-instances (r)
-  (let* ((positions (sort (loop for p being the hash-keys of (renderer-cells r) collect p)
-                          (lambda (a b) (or (< (second a) (second b))
-                                           (and (= (second a) (second b)) (< (first a) (first b)))))))
+  (let* ((positions (renderer-positions r))
          (atlas (renderer-atlas r))
          (columns (max 1 (floor (renderer-width r) (renderer-cw r))))
          (rows (max 1 (floor (renderer-height r) (renderer-ch r))))
@@ -295,11 +352,33 @@
         (gl-uniform-2i (location "u_cell_size") (renderer-cw r) (renderer-ch r))
         (gl-uniform-1i (location "u_atlas_columns") (renderer-atlas-columns r))
         (gl-uniform-1i (location "u_atlas") 0))
-      (let ((count (/ (length packed) 32)))
-        (when (plusp count)
-          (gl-draw-arrays-instanced #x0004 0 6 count)
-          (gl-check 'renderer-draw)
-          (renderer-count r :draw-calls) (renderer-count r :instances count)))
+      (let* ((positions (renderer-positions r)) (count (length positions)))
+        (flet ((draw (n)
+                 (gl-draw-arrays-instanced #x0004 0 6 n)
+                 (gl-check 'renderer-draw)
+                 (renderer-count r :draw-calls) (renderer-count r :instances n)))
+          (if (some (lambda (p) (getf (gethash p (renderer-cells r)) :clipped)) positions)
+              ;; Only clipped fragments need separate scissor draws. Keep runs
+              ;; of ordinary cells instanced even in a partially clipped frame.
+              (loop with remaining = positions with index = 0
+                    while remaining
+                    do (let* ((cell (gethash (first remaining) (renderer-cells r)))
+                              (clipped (getf cell :clipped))
+                              (n (if clipped 1
+                                     (loop for p in remaining
+                                           until (getf (gethash p (renderer-cells r)) :clipped)
+                                           count t))))
+                         (if clipped
+                             (destructuring-bind (x y right bottom) (getf cell :rectangle)
+                               (gl-enable #x0C11)
+                               (gl-scissor x (- (renderer-height r) bottom) (- right x) (- bottom y)))
+                             (gl-disable #x0C11))
+                         (dotimes (attribute 2)
+                           (gl-vertex-attrib-i-pointer attribute 4 #x1405 32
+                                                      (cffi:make-pointer (+ (* index 32) (* attribute 16)))))
+                         (draw n)
+                         (incf index n) (setf remaining (nthcdr n remaining))))
+              (when (plusp count) (draw count)))))
       (gl-enable #x0C11)
       (maphash (lambda (rectangle color)
                  (destructuring-bind (x y width height) rectangle

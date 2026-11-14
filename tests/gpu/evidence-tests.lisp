@@ -53,6 +53,174 @@
             (lispterm.gpu::renderer-dirty renderer) t)
       (unless (zerop alternate) (lispterm.gpu:gl-delete-program alternate)))))
 
+(defun check-renderer-delete-errors (context &optional (modes '(:stale :buffer :program :resize)))
+  "Inject real GLES errors, not Lisp throws from the deletion wrapper."
+  (dolist (mode modes)
+    (let* ((r (lispterm.gpu:make-renderer :context context :width 16 :height 16
+                                       :cell-width 8 :cell-height 16))
+           (name (if (eq mode :program) 'lispterm.gpu:gl-delete-program
+                     (if (eq mode :resize) 'lispterm.gpu:gl-delete-textures
+                         'lispterm.gpu:gl-delete-buffers)))
+           (saved (symbol-function name))
+           (calls 0) (shader 0)
+           (old (if (eq mode :program) (lispterm.gpu::renderer-program r)
+                    (if (eq mode :resize) (lispterm.gpu::renderer-target r)
+                        (lispterm.gpu::renderer-vbo r)))))
+      (unwind-protect
+           (progn
+             (when (eq mode :program)
+               (setf shader (lispterm.gpu:gl-create-shader #x8B31)))
+             (setf (symbol-function name)
+                   (lambda (&rest args)
+                     (incf calls)
+                     (case mode
+                       (:stale (apply saved args))
+                       (:program (funcall saved shader)) ; shader is not a program: INVALID_OPERATION
+                       (otherwise (funcall saved -1 (second args)))))) ; INVALID_VALUE
+             (when (eq mode :stale) (lispterm.gpu:gl-enable #xffffffff))
+             (assert (handler-case
+                         (progn (if (eq mode :resize)
+                                    (lispterm.gpu:renderer-resize r 24 16 8 16)
+                                    (lispterm.gpu:renderer-close r)) nil)
+                       (lispterm.gpu:gpu-unavailable (e)
+                         (assert (search (case mode (:stale "#x500") (:program "#x502")
+                                               (otherwise "#x501"))
+                                         (lispterm.gpu::gpu-detail e)))
+                         t)))
+             (assert (not (lispterm.gpu::renderer-closed r)))
+             (assert (= old (case mode
+                              (:program (lispterm.gpu::renderer-program r))
+                              (:resize (lispterm.gpu::renderer-target r))
+                              (otherwise (lispterm.gpu::renderer-vbo r)))))
+             (when (eq mode :stale) (assert (zerop calls)))
+             (when (eq mode :resize)
+               (assert (= 16 (lispterm.gpu::renderer-width r)))
+               (assert (lispterm.gpu::renderer-pending-textures r))
+               (setf (symbol-function name) saved)
+               (let ((cpu (parity-display 16 16)))
+                 (parity-write cpu r 0 0 (lispterm.display::make-cell :char #\R :fg #xabcdef :bg #x123456))
+                 (assert-parity cpu r "FAILED-RESIZE-OLD-TARGET")))
+             (format t "REAL-GL-DELETE-ERROR ~A retained ownership; deletion calls ~D~%" mode calls)
+             (when (eq mode :buffer)
+               (handler-bind
+                   ((lispterm.gpu:gpu-unavailable
+                      (lambda (e)
+                        (assert (find-restart 'lispterm.gpu::retry-renderer-close e))
+                        (setf (symbol-function name) saved)
+                        (invoke-restart 'lispterm.gpu::retry-renderer-close))))
+                 (lispterm.gpu:renderer-close r))
+               (format t "RENDERER-CLOSE retry restart released retained objects~%")))
+        (setf (symbol-function name) saved)
+        (loop repeat 16 until (zerop (lispterm.gpu:gl-get-error)))
+        (unless (zerop shader) (lispterm.gpu:gl-delete-shader shader))
+        (lispterm.gpu:renderer-close r))
+      (assert (lispterm.gpu::renderer-closed r))
+      (assert (null (lispterm.gpu::renderer-pending-textures r)))
+      (assert (every #'zerop (list (lispterm.gpu::renderer-vbo r)
+                                  (lispterm.gpu::renderer-vao r)
+                                  (lispterm.gpu::renderer-fbo r)
+                                  (lispterm.gpu::renderer-target r)
+                                  (lispterm.gpu::renderer-texture r)
+                                  (lispterm.gpu::renderer-program r)))))))
+
+(defun check-renderer-partial-initialization (context)
+  (dolist (name '(lispterm.gpu:gl-gen-buffers lispterm.gpu:gl-tex-image-2d))
+    (let ((saved (symbol-function name))
+          (close (symbol-function 'lispterm.gpu:renderer-close)) (partial nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function name)
+                   (lambda (&rest args)
+                     (if (eq name 'lispterm.gpu:gl-gen-buffers)
+                         (setf (first args) -1)
+                         (setf (fourth args) -1))
+                     (apply saved args))
+                   (symbol-function 'lispterm.gpu:renderer-close)
+                   (lambda (r) (setf partial r) (funcall close r)))
+             (assert (handler-case
+                         (progn (lispterm.gpu:make-renderer :context context :width 16 :height 16
+                                                          :cell-width 8 :cell-height 16) nil)
+                       (lispterm.gpu:gpu-unavailable () t)))
+             (assert partial)
+             (assert (lispterm.gpu::renderer-closed partial))
+             (assert (null (lispterm.gpu::renderer-pending-textures partial)))
+             (dolist (accessor '(lispterm.gpu::renderer-vbo lispterm.gpu::renderer-vao
+                                 lispterm.gpu::renderer-fbo lispterm.gpu::renderer-target
+                                 lispterm.gpu::renderer-texture lispterm.gpu::renderer-program))
+               (assert (zerop (funcall accessor partial))))
+             (lispterm.gpu:gl-check 'partial-initialization-control)
+             (format t "REAL-GL-PARTIAL-INIT ~A: all owned handles released~%" name))
+        (setf (symbol-function name) saved
+              (symbol-function 'lispterm.gpu:renderer-close) close)
+        (loop repeat 16 until (zerop (lispterm.gpu:gl-get-error)))
+        (when (and partial (not (lispterm.gpu::renderer-closed partial)))
+          (funcall close partial))))))
+
+(defun check-renderer-copy-target (context)
+  (let* ((cpu (parity-display 24 32)) (source nil) (target nil)
+         (font (lispterm.display::display-font cpu))
+         (cw (lispterm.display::font-width font)) (ch (lispterm.display::font-height font))
+         (saved-read (symbol-function 'lispterm.gpu:gl-read-pixels))
+         (saved-blit (symbol-function 'lispterm.gpu::gl-blit-framebuffer)))
+    (unwind-protect
+         (progn
+           (setf source (lispterm.gpu:make-renderer :context context :width 24 :height 32
+                                                 :cell-width cw :cell-height ch)
+                 target (lispterm.gpu:make-renderer :context context :width 24 :height 32
+                                                 :cell-width cw :cell-height ch))
+           (dotimes (row 2)
+             (parity-write cpu source 0 row
+                           (lispterm.display::make-cell :char (if (zerop row) #\A #\W)
+                                                       :fg #xabcdef :bg (if (zerop row) #x123456 #x654321))))
+           (let ((expected (copy-seq (lispterm.display::display-framebuffer cpu)))
+                 (fbo (lispterm.gpu::renderer-fbo target)))
+             (dolist (invert '(nil t))
+               (lispterm.gpu:gl-bind-framebuffer #x8CA8 fbo)
+               (lispterm.gpu:gl-bind-framebuffer #x8CA9 (lispterm.gpu::renderer-fbo source))
+               (lispterm.gpu:gl-enable #x0C11)
+               (lispterm.gpu:gl-scissor 1 2 3 4)
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'lispterm.gpu:gl-read-pixels)
+                            (lambda (&rest args) (declare (ignore args)) (error "Readback during GPU copy")))
+                      (lispterm.gpu:renderer-copy-target source fbo 24 32 :invert-y invert))
+                 (setf (symbol-function 'lispterm.gpu:gl-read-pixels) saved-read))
+               (assert (= fbo (lispterm.gpu:gl-integer #x8CAA)))
+               (assert (= (lispterm.gpu::renderer-fbo source) (lispterm.gpu:gl-integer #x8CA6)))
+               (assert (= 1 (lispterm.gpu:gl-integer #x0C11)))
+               (assert (equal '(1 2 3 4) (lispterm.gpu:gl-integers #x0C10 4)))
+               (setf (lispterm.gpu::renderer-dirty target) nil)
+               (let ((pixels (lispterm.gpu:renderer-readback target)))
+                 (dotimes (y 32)
+                   (dotimes (x 24)
+                     (assert (= (aref pixels (+ x (* y 24)))
+                                (aref expected (+ x (* (if invert (- 31 y) y) 24))))))))
+               (format t "GPU-TARGET-COPY invert=~S: 768 exact pixels; no readback; bindings/scissor restored~%" invert))
+             ;; Inject a real invalid blit mask. A failed copy restores bindings
+             ;; and must not increment the successful-copy counter.
+             (let ((read (lispterm.gpu:gl-integer #x8CAA))
+                   (draw (lispterm.gpu:gl-integer #x8CA6)))
+               (unwind-protect
+                    (progn
+                      (setf (symbol-function 'lispterm.gpu::gl-blit-framebuffer)
+                            (lambda (&rest args)
+                              (setf (nth 8 args) #xffffffff)
+                              (apply saved-blit args)))
+                      (assert (handler-case
+                                  (progn (lispterm.gpu:renderer-copy-target source fbo 24 32) nil)
+                                (lispterm.gpu:gpu-unavailable (e)
+                                  (assert (search "#x501" (lispterm.gpu::gpu-detail e))) t))))
+                 (setf (symbol-function 'lispterm.gpu::gl-blit-framebuffer) saved-blit))
+               (assert (= read (lispterm.gpu:gl-integer #x8CAA)))
+               (assert (= draw (lispterm.gpu:gl-integer #x8CA6))))
+             (assert (= 2 (getf (lispterm.gpu:renderer-metrics source) :target-copies)))
+             (assert (zerop (getf (lispterm.gpu:renderer-metrics source) :readbacks 0)))))
+      (setf (symbol-function 'lispterm.gpu:gl-read-pixels) saved-read
+            (symbol-function 'lispterm.gpu::gl-blit-framebuffer) saved-blit)
+      (lispterm.gpu:gl-disable #x0C11)
+      (when target (lispterm.gpu:renderer-close target))
+      (when source (lispterm.gpu:renderer-close source)))))
+
 (defun gpu-evidence-check ()
   (let* ((context (lispterm.gpu:open-context)) (renderer nil)
          (cpu (parity-display 51 35))
@@ -62,6 +230,9 @@
     (unwind-protect
          (progn
            (lispterm.gpu:require-hardware-context context)
+           (check-renderer-delete-errors context)
+           (check-renderer-partial-initialization context)
+           (check-renderer-copy-target context)
            ;; Compute the reference before installing the no-CPU-composition guard.
            (lispterm.display::draw-frame cpu grid :cursor-row 0 :cursor-col 0 :cursor-visible t)
            (setf (lispterm.display::cell-fg (aref changed-grid 0 0)) #x123abc)
