@@ -1,0 +1,77 @@
+;;;; Production scheduling regression controls; device boundaries simulated.
+(in-package #:lispterm.owner.tests)
+(let* ((checks 0) (failures 0) (blocked t) (written nil)
+       (lock (sb-thread:make-mutex :name "lifecycle test device"))
+       (session (lispterm::make-session nil 2 8))
+       (host (lispterm::%make-host :session session :state :detached))
+       (bytes (make-array lispterm::*input-queue-limit* :element-type '(unsigned-byte 8)
+                          :initial-element 65)))
+  (setf (lispterm::session-pty session) (lispterm.pty::%make-pty :open-p nil))
+  (labels ((verify (name value)
+             (incf checks) (unless value (incf failures))
+             (format t "~S~%" (list :check name :pass (not (null value)))))
+           (pending () (sb-thread:with-mutex ((lispterm::session-input-lock session))
+                         (lispterm::session-input-pending session)))
+           (until-empty ()
+             (loop with deadline = (+ (get-internal-real-time) (* 5 internal-time-units-per-second))
+                   until (zerop (pending))
+                   do (when (> (get-internal-real-time) deadline)
+                        (error "Owner failed to drain before lifecycle test deadline"))
+                      (sleep .001))))
+    (with-functions
+     (list
+      (cons 'lispterm.pty:pty-write
+            (lambda (pty chunk &key timeout)
+              (declare (ignore pty timeout))
+              (sb-thread:with-mutex (lock)
+                (if blocked 0
+                    (progn (loop for byte across chunk do (push byte written))
+                           (length chunk))))))
+      (cons 'lispterm.pty:pty-read (lambda (&rest x) (declare (ignore x)) nil))
+      (cons 'lispterm.pty:pty-process (lambda (&rest x) (declare (ignore x)) nil)))
+     (lambda ()
+       (unwind-protect
+            (progn
+              (lispterm::session-write session bytes)
+              (lispterm::start-window-worker host)
+              (let ((refused nil))
+                (handler-case (lispterm:send-input host "X")
+                  (lispterm::input-backpressure (c) (setf refused c)))
+                (verify :send-input-full-fifo-signals-typed
+                        (and refused (= 1 (lispterm::input-backpressure-requested refused))
+                             (= (length bytes) (lispterm::input-backpressure-pending refused)))))
+              (verify :api-refusal-keeps-accepted-bytes (= (length bytes) (pending)))
+              (let ((token (lispterm:quiesce host)))
+                (verify :actual-quiesce-state
+                        (and (eq :quiesced (lispterm::host-state-value host))
+                             (null (lispterm::host-thread host))))
+                (verify :actual-quiesce-preserves-bytes (= (length bytes) (pending)))
+                (verify :actual-quiesce-no-device-delivery (null written))
+                (lispterm:resume host token)
+                (verify :actual-resume-owns-session
+                        (and (eq :detached (lispterm::host-state-value host))
+                             (sb-thread:thread-alive-p (lispterm::host-thread host))))
+                (verify :actual-resume-preserves-bytes (= (length bytes) (pending))))
+              (sb-thread:with-mutex (lock) (setf blocked nil))
+              (until-empty)
+              (let ((token (lispterm:quiesce host)))
+                (verify :resumed-accepted-fifo-exactly-once
+                        (equalp bytes (coerce (reverse written) 'vector)))
+                ;; Final close joins a resumed owner and cancels accepted bytes
+                ;; plus engine replies. It does not reinterpret an API refusal.
+                (sb-thread:with-mutex (lock) (setf blocked t))
+                (lispterm::session-write session (lispterm::utf8 "AB"))
+                (setf (nerimux/terminal:screen-response-queue (lispterm::session-screen session)) '("R"))
+                (lispterm:resume host token))
+              (let ((cancelled nil))
+                (handler-case (lispterm:close host)
+                  (lispterm::input-cancelled (c) (setf cancelled (lispterm::input-cancelled-bytes c))))
+                (verify :actual-final-close-cancellation (= (or cancelled -1) 3)))
+              (verify :actual-final-close-state
+                      (and (eq :closed (lispterm::host-state-value host))
+                           (null (lispterm::host-thread host)) (zerop (pending))))
+              (verify :actual-second-close-idempotent (eq host (lispterm:close host))))
+         (unless (eq :closed (lispterm::host-state-value host))
+           (handler-case (lispterm:close host) (lispterm::input-cancelled () nil))))))
+    (format t "~S~%" (list :checks checks :failures failures))
+    (when (plusp failures) (uiop:quit 1))))

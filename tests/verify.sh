@@ -69,5 +69,9 @@ case $gate in
  vttest-harness) exec tests/vttest-harness-tests.sh ;;
  packaging) exec tests/packaging-gate.sh "$@" ;;
  git) exec tests/git-gate.sh "$@" ;;
+ latency-unit) run_lisp_gate tests/run-latency-unit-tests.lisp "$@" ;;
+ latency-wayland) run_lisp_gate tests/run-latency-wayland.lisp "$@" ;;
+ latency-controls) run_lisp_gate tests/run-latency-controls.lisp "$@" ;;
+ latency-measurement-controls) run_lisp_gate tests/run-latency-measurement-controls.lisp "$@" ;;
  *) echo "Unknown verification gate: ${gate:-<none>}" >&2; exit 2 ;;
 esac

@@ -1,0 +1,46 @@
+;;;; Production scheduling regression controls; device boundaries simulated.
+(in-package #:lispterm.owner.tests)
+(let* ((*checks* 0) (now 0) (callback-ready nil) (submitted nil) (polls 0) (attempts 0)
+       (state (lispterm.display.wayland::make-wayland-state :frame-pending-p t))
+       (window (lispterm.display.wayland::make-wayland-window :protocol state :pending-frame-p t))
+       (display (ltd::make-display :backend :wayland :backend-state window
+                                  :owner sb-thread:*current-thread* :grid :old))
+       (session (lispterm::make-session nil 2 8))
+       (host (lispterm::%make-host :session session :display display :state :attached))
+       (schedule (lispterm::make-owner-schedule :next-frame internal-time-units-per-second))
+       (lispterm::*owner-clock* (lambda () now))
+       (lispterm.display.wayland::*direct-present-hook*
+         (lambda (d)
+           (incf attempts)
+           (if (lispterm.display.wayland::wayland-state-frame-pending-p state)
+               :busy
+               (progn (push (ltd::display-grid d) submitted) :presented)))))
+  (with-functions
+   (list
+    (cons 'lispterm.display.wayland::protocol-pump
+          (lambda (s &optional timeout)
+            (declare (ignore timeout)) (incf polls)
+            (when callback-ready
+              (setf (lispterm.display.wayland::wayland-state-frame-pending-p s) nil))))
+    (cons 'lispterm.display.wayland::keyboard-repeat (lambda (&rest x) (declare (ignore x))))
+    (cons 'lispterm.display.wayland::protocol-collect-buffers (lambda (&rest x) (declare (ignore x))))
+    (cons 'ltd:poll-events (lambda (d &key timeout) (ltd::backend-poll :wayland d timeout)))
+    (cons 'lispterm::session-read-output (lambda (&rest x) (declare (ignore x)) nil))
+    (cons 'lispterm::window-geometry-intent (lambda (&rest x) (declare (ignore x))))
+    (cons 'ltd:geometry-tick (lambda (&rest x) (declare (ignore x))))
+    (cons 'ltd:geometry-status (lambda (&rest x) (declare (ignore x))))
+    (cons 'ltd:display-metrics (lambda (&rest x) (declare (ignore x)))))
+   (lambda ()
+     (lispterm::owner-iteration host schedule)
+     (check :busy-retry-before-render-deadline (= attempts 1))
+     (check :busy-keeps-pending (lispterm.display.wayland::wayland-window-pending-frame-p window))
+     (check :busy-does-not-submit (null submitted))
+     (setf now 1 callback-ready t (ltd::display-grid display) :newest)
+     (lispterm::owner-iteration host schedule)
+     (check :callback-pumped-within-render-cooldown (= polls 2))
+     (check :callback-retries-pending-within-same-turn (= attempts 2))
+     (check :pending-retry-uses-newest-frame (equal submitted '(:newest)))
+     (check :submitted-clears-pending (not (lispterm.display.wayland::wayland-window-pending-frame-p window)))
+     (check :callback-no-new-draw (= 0 (lispterm::session-frames session)))
+     (check :no-errors (null (lispterm:host-errors host)))))
+  (format t "~D backend callback controls passed.~%" *checks*))

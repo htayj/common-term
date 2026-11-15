@@ -59,7 +59,9 @@
 per size generation. Busy old buffers survive resize until compositor release."
   (unless (wayland-state-configured-p state) (return-from protocol-present nil))
   (protocol-collect-buffers state)
-  (when (wayland-state-frame-pending-p state) (return-from protocol-present nil))
+  (when (wayland-state-frame-pending-p state)
+    (lispterm.trace:trace-event :present-deferred :path :shm :reason :frame-pending)
+    (return-from protocol-present nil))
   (let* ((scale (wayland-state-scale state))
          (bw (* width scale)) (bh (* height scale))
          (generation (wayland-state-generation state))
@@ -74,7 +76,9 @@ per size generation. Busy old buffers survive resize until compositor release."
                                     268435456))
                        (make-protocol-buffer state bw bh))))
          (wire (wayland-state-wire state)))
-    (unless buffer (return-from protocol-present nil))
+    (unless buffer
+      (lispterm.trace:trace-event :present-deferred :path :shm :reason :no-buffer)
+      (return-from protocol-present nil))
     (unless (and (= width (wayland-state-width state)) (= height (wayland-state-height state)))
       (wire-error "framebuffer and surface dimensions differ" nil))
     ;; Integer nearest-neighbour buffer scale. CPU font rasterization stays logical-size.
@@ -82,11 +86,15 @@ per size generation. Busy old buffers survive resize until compositor release."
       (dotimes (x bw)
         (setf (cffi:mem-aref (shm-buffer-pointer buffer) :uint32 (+ x (* y bw)))
               (aref pixels (+ (floor x scale) (* (floor y scale) width))))))
+    ;; The buffer now holds the framebuffer as it is at this instant.
+    (lispterm.trace:trace-event :copy :path :shm :buffer (shm-buffer-id buffer)
+      :width bw :height bh :scale scale :store buffer)
     (let* ((geometry-request (wayland-state-geometry-request state))
            (callback (wire-id wire :callback
                      (lambda (id opcode payload)
                        (declare (ignore opcode payload))
                        (remhash id (wire-handlers wire))
+                       (lispterm.trace:trace-event :frame-callback :path :shm :callback id)
                        (setf (wayland-state-frame-pending-p state) nil)
                        (incf (wayland-state-frame-generation state))
                        (setf (wayland-state-frame-request-id state)
@@ -101,6 +109,8 @@ per size generation. Busy old buffers survive resize until compositor release."
       (wire-send wire (wayland-state-surface state) 2 0 0 width height)
       (setf (shm-buffer-busy-p buffer) t)
       (wire-send wire (wayland-state-surface state) 6)
+      (lispterm.trace:trace-event :commit :path :shm :buffer (shm-buffer-id buffer)
+        :callback callback :generation (1+ (wayland-state-commit-generation state)))
       (incf (wayland-state-commit-generation state))
       (setf (wayland-state-committed-width state) width
             (wayland-state-committed-height state) height

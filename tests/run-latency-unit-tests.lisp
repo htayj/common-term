@@ -1,0 +1,10 @@
+;;;; Disposable image: production scheduling and backpressure regression controls.
+(load (merge-pathnames "../scripts/bootstrap.lisp" *load-truename*))
+(asdf:load-system "lispterm")
+(load (merge-pathnames "owner-scheduling-tests.lisp" *load-truename*))
+(lispterm.owner.tests:run)
+(load (merge-pathnames "owner-read-render-tests.lisp" *load-truename*))
+(load (merge-pathnames "owner-callback-tests.lisp" *load-truename*))
+(load (merge-pathnames "owner-backpressure-tests.lisp" *load-truename*))
+(load (merge-pathnames "owner-saturation-tests.lisp" *load-truename*))
+(load (merge-pathnames "owner-lifecycle-tests.lisp" *load-truename*))

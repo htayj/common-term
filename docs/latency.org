@@ -1,0 +1,85 @@
+#+title: Input and submission latency
+
+* Behavior
+The window owner polls native input independently of draw deadlines and drains
+accepted input before polling and after event admission, allowing same-turn PTY
+writes. Reads and writes are bounded. Frames retain rational 60 Hz pacing;
+deadlines advance only when a frame is drawn. Under backpressure, a native input
+event is rejected whole once, rather than retained for replay.
+
+For stable cell layouts, GPU instance packing updates only changed records.
+Atlas upload scans remain; structural changes and unresolved atlas transitions
+use full packing. GPU synchronization is unchanged.
+
+* Reproduce
+Run from the checkout. Prepare dependencies with =scripts/bootstrap-deps --tests=
+(see [[file:packaging.org][packaging]]). Native measurement requires hardware EGL/GLES and DMA support,
+Sway, swaymsg and wtype. The current private compositor fixture requires an AMD
+Radeon on =/dev/dri/renderD128=. The runtime must include Mesa's
+=share/glvnd/egl_vendor.d/50_mesa.json= and driver libraries; select an equivalent
+prepared closure with =LISPTERM_RUNTIME= if =.build/deps= is older.
+
+#+begin_src sh
+tests/verify.sh latency-unit
+tests/verify.sh latency-controls
+tests/verify.sh latency-measurement-controls
+scripts/sbcl --script tests/trace-safety-controls.lisp
+tests/verify.sh gpu-offscreen
+tests/verify.sh gpu-evidence
+
+unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET XDG_RUNTIME_DIR SWAYSOCK
+unset XAUTHORITY DBUS_SESSION_BUS_ADDRESS
+tests/verify.sh latency-wayland baseline-record </dev/null >baseline.out 2>baseline.err
+tests/verify.sh latency-wayland fixed-acceptance </dev/null >fixed.out 2>fixed.err
+#+end_src
+
+=baseline-record= returns 3 for a valid recording, even when budgets fail.
+=fixed-acceptance= returns 0 only for admitted evidence within every frozen
+limit; errors or misses return 1. Missing/unknown modes return 2 before launch.
+Retain separate output streams and artifacts under =.build/raw-latency-*/=.
+
+* Method and controls
+The primary workload is a plain terminal without tmux. Real Wayland keyboard
+events injected through wtype reach a private compositor, terminal and PTY child.
+Nonce-bearing output tokens match dispatch, PTY write, complete parse, draw,
+copied-buffer generation and Wayland socket commit causally. Measure 70 matched
+tokens, discard 20 warmups, and report 50 samples at scale 1, 100 by 37 cells.
+Socket submission is the endpoint, not physical display.
+
+Frozen p95 limits are 2 ms dispatch-to-write, 20 ms parse-to-submit and 1 ms
+calibration wake jitter. Source identities, complete drained recorder receipts,
+zero host errors and complete token chains are required for admission.
+
+Separate four-token DMA readback audits check real copying and an actual
+skipped-copy negative. Timed runs omit readback. Offline controls deliberately
+add 40 ms to copied evidence to check budget rejection; they do not inject a
+live production delay. Packing controls count encoded/compared records, atlas
+resolutions, sorts and upload bytes at two grid sizes, alongside exact pixels
+and packed-byte comparisons with full packing.
+
+* Trace callback contract
+=lispterm.trace:*trace*= is NIL by default. Disabled tracing skips clocks and
+arguments. Hooks receive =(stage time-ns &rest plist)= synchronously, sometimes
+inside critical sections. Ordinary errors are contained and recorded in
+=*trace-failure*=; recursive reporting is suppressed and invalidates evidence.
+Hooks must not reenter production, transfer control nonlocally, block
+indefinitely, or mutate/retain live objects. Do not replace hooks concurrently;
+retire and drain reporters before replacement or snapshotting.
+
+* Measurement status
+Final fixed acceptance passed once without retries or relaxed limits on an AMD
+Radeon 780M, =renderD128=, GPU DMA, scale 1, 100 by 37 cells / 800 by 600 pixels.
+All 70 samples matched, with 20 warmups and 50 measured, and zero host errors.
+Positive and actual skipped-copy audits each had four complete samples.
+
+| Interval (ms) | Baseline p95 | Final median | Final p95 | Frozen p95 limit |
+|---------------+--------------+--------------+-----------+------------------|
+| Dispatch to PTY write | 5.215556 | 0.094345 | 0.239547 | 2 |
+| Parse to socket commit | 32.545529 | 2.207342 | 3.021218 | 20 |
+| Calibration wake jitter | 0.063073 | 0.060138 | 0.073061 | 1 |
+
+These plain-terminal runs used no tmux. The scheduler-only parse-to-submit p95
+was 22.195499 ms, above the 20 ms limit. Same-turn input admission/writes and
+independent polling address input delay; incremental packing avoids full-grid
+record work on stable updates. These are separate matched workloads, not a
+randomized paired experiment. Results measure submission, not physical display.

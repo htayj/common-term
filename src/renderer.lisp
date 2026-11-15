@@ -60,14 +60,22 @@
         (ltd:set-title display (subseq title 0 (min 1024 (length title))))
         (setf (session-last-title session) (copy-seq title)))
       (when (or dirty cursor-changed)
+        (lispterm.trace:trace-event :render-start :dirty (and dirty t))
         (if dirty
-            (ltd:draw-frame display (screen-grid screen)
-              :cursor-row (first cursor) :cursor-col (second cursor)
-              :cursor-visible (third cursor)
-              :reverse-screen (lispterm.engine:reverse-screen-p screen)
-              :blink-phase phase)
-            (ltd:set-cursor display (first cursor) (second cursor) :visible (third cursor)))
+            (let ((grid (screen-grid screen)))
+              ;; The hook sees the very grid that is drawn, under this lock hold.
+              (lispterm.trace:trace-event :draw-start :kind :frame :grid grid)
+              (ltd:draw-frame display grid
+                :cursor-row (first cursor) :cursor-col (second cursor)
+                :cursor-visible (third cursor)
+                :reverse-screen (lispterm.engine:reverse-screen-p screen)
+                :blink-phase phase))
+            (progn
+              (lispterm.trace:trace-event :draw-start :kind :cursor)
+              (ltd:set-cursor display (first cursor) (second cursor) :visible (third cursor))))
+        (lispterm.trace:trace-event :draw-end)
         (ltd:present display)
+        (lispterm.trace:trace-event :present-return)
         (incf (session-frames session))
         ;; Publish the phase with its completed frame, never ahead of a failed draw.
         (setf (session-last-cursor session) cursor (session-force-frame session) nil

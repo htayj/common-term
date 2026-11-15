@@ -67,6 +67,7 @@ tests/verify.sh packaging
 new-shell/stdio-preservation test on the requested backend. Run
 =tests/verify.sh git= after the final signed commit. See
 [[file:evidence/verification.org][verification]] for gate meanings and results. Graphical tests create private displays.
+See [[file:docs/latency.org][latency measurement and controls]] for plain-terminal input and submission checks.
 
 [[file:docs/architecture.org][Architecture]] · [[file:docs/security.org][Security]] · [[file:THIRD_PARTY.org][Third-party provenance]]
 

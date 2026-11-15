@@ -136,6 +136,30 @@ ATLAS-CANDIDATE-PROBES counts actual slot reads for per-frame profiling."
             (gethash key (atlas-index atlas)) slot)
       (values slot (atlas-epoch atlas) t))))
 
+(defun atlas-resolve-settled-glyph (atlas key mask)
+  "Resolve KEY between full frames, without eviction or growth.
+Validate key and mask as ATLAS-ENSURE-GLYPH does, including the changed-mask
+error. Return slot, epoch and pending flag for a resident glyph, or after filling
+the next free slot. Return NIL with the entries untouched when the glyph needs
+eviction or growth: the caller then runs a full ATLAS-BEGIN-FRAME frame.
+The epoch never moves here. Free slots never reappear, so the free cursor of the
+last full frame stays a valid lower bound."
+  (let ((key (snapshot-glyph-key key)))
+    (checked-mask atlas mask)
+    (multiple-value-bind (slot found) (gethash key (atlas-index atlas))
+      (if found
+          (let ((entry (aref (atlas-entries atlas) slot)))
+            (unless (equalp mask (atlas-entry-mask entry))
+              (error "A glyph key cannot change its mask; use a new key or atlas"))
+            (setf (gethash key (atlas-protected atlas)) t)
+            (values slot (atlas-epoch atlas) (atlas-entry-pending-p entry)))
+          (let ((slot (atlas-next-candidate atlas t)))
+            (when slot
+              (setf (aref (atlas-entries atlas) slot) (make-atlas-entry :key key :mask (copy-seq mask))
+                    (gethash key (atlas-index atlas)) slot
+                    (gethash key (atlas-protected atlas)) t)
+              (values slot (atlas-epoch atlas) t)))))))
+
 (defun atlas-reference-valid-p (atlas slot epoch &optional key)
   "Epoch references are conservative: any eviction invalidates every old reference."
   (and (eql epoch (atlas-epoch atlas)) (integerp slot)

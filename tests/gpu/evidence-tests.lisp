@@ -337,6 +337,370 @@
       (when target (lispterm.gpu:renderer-close target))
       (when source (lispterm.gpu:renderer-close source)))))
 
+;;;; Retry controls execute real GPU writes before the injected check failure.
+(defparameter *retry-columns* 16)
+(defparameter *retry-rows* 4)
+(defparameter *retry-gray* #x808080)
+
+(defun retry-expect (label actual expected)
+  (if (equalp actual expected)
+      (format t "PASS ~A ~S~%" label actual)
+      (error "~A got ~S expected ~S" label actual expected)))
+
+(defun retry-counter (r key) (gethash key (lispterm.gpu::renderer-counters r) 0))
+
+(defun retry-put (r column row &key (glyph "X") (mask 255) (fg *retry-gray*) (bg 0) (line-size :single))
+  (lispterm.gpu:renderer-write-cell
+   r column row :glyph-key (list glyph nil 1)
+   :mask (make-array 1 :element-type '(unsigned-byte 8) :initial-element mask)
+   :foreground fg :background bg :line-size line-size))
+
+(defun retry-paint (r)
+  (dotimes (y *retry-rows*) (dotimes (x *retry-columns*) (retry-put r x y))))
+
+(defun retry-draw (r &key full)
+  (let ((lispterm.gpu::*renderer-force-full-pack* full))
+    (lispterm.gpu:renderer-draw r)))
+
+(defun retry-call-with-failing-check (operation nth thunk)
+  "Run THUNK. The NTH gl-check of OPERATION signals GPU-UNAVAILABLE after the GL
+call it guards and the real check both ran."
+  (let ((real (symbol-function 'lispterm.gpu::gl-check)) (seen 0))
+    (unwind-protect
+         (progn (setf (symbol-function 'lispterm.gpu::gl-check)
+                      (lambda (checked)
+                        (funcall real checked)
+                        (when (and (eq checked operation) (= (incf seen) nth))
+                          (lispterm.gpu::unavailable checked "injected retry-failure after the GL call"))
+                        t))
+                (funcall thunk))
+      (setf (symbol-function 'lispterm.gpu::gl-check) real))))
+
+(defun retry-call-with-failing-driver (name nth thunk)
+  "Run THUNK. The NTH call of the driver function NAME signals without reaching GL."
+  (let ((real (symbol-function name)) (seen 0))
+    (unwind-protect
+         (progn (setf (symbol-function name)
+                      (lambda (&rest arguments)
+                        (if (= (incf seen) nth)
+                            (error "injected ~A retry-failure before the GL call" name)
+                            (apply real arguments))))
+                (funcall thunk))
+      (setf (symbol-function name) real))))
+
+(defun retry-failure (thunk)
+  "Return the type of the error THUNK signals, or NIL."
+  (handler-case (progn (funcall thunk) nil) (error (condition) (type-of condition))))
+
+(defun retry-unknown-records (r)
+  "Count of records whose GPU copy the renderer holds unknown, or :ABSENT before the repair."
+  (let ((accessor (find-symbol "RENDERER-OCTETS-UNKNOWN" '#:lispterm.gpu)))
+    (if (and accessor (fboundp accessor))
+        (count 1 (funcall accessor r))
+        :absent)))
+
+(defun retry-pixel (pixels column row) (aref pixels (+ column (* *retry-columns* row))))
+
+(defun retry-scenario (context name play &key retry-full retry-bytes retry-compared gray-cells)
+  "PLAY receives a renderer and a function running one retry-draw thunk as the failing
+frame, and leaves the retry pending. The retry is one retry-draw, forced full when
+RETRY-FULL."
+  (let ((r (lispterm.gpu:make-renderer :context context :width *retry-columns* :height *retry-rows*
+                                       :cell-width 1 :cell-height 1))
+        (twin (lispterm.gpu:make-renderer :context context :width *retry-columns* :height *retry-rows*
+                                          :cell-width 1 :cell-height 1)))
+    (unwind-protect
+         (flet ((label (text) (format nil "~A: ~A" name text)))
+           (funcall play twin (lambda (inject thunk) (declare (ignore inject)) (funcall thunk)))
+           (funcall play r
+                    (lambda (inject thunk)
+                      (retry-expect (label "failing frame signals")
+                              (and (retry-failure (lambda () (funcall inject thunk))) t) t)
+                      (retry-expect (label "failing frame stays dirty for the caller's retry")
+                              (lispterm.gpu::renderer-dirty r) t)))
+           (let* ((bytes (retry-counter r :instance-bytes)) (compared (retry-counter r :records-compared))
+                  (pixels (progn (retry-draw r :full retry-full) (lispterm.gpu:renderer-readback r)))
+                  (wanted (progn (retry-draw twin :full retry-full) (lispterm.gpu:renderer-readback twin))))
+             (retry-expect (label "retry pixels equal the never-failing twin") (mismatch pixels wanted) nil)
+             (loop for (column row) in gray-cells
+                   do (retry-expect (label (format nil "cell ~D,~D shows the reverted gray" column row))
+                              (retry-pixel pixels column row) (retry-pixel pixels 0 (1- *retry-rows*))))
+             (when retry-bytes
+               (retry-expect (label "retry instance bytes") (- (retry-counter r :instance-bytes) bytes) retry-bytes))
+             (when retry-compared
+               (retry-expect (label "retry records compared")
+                       (- (retry-counter r :records-compared) compared) retry-compared))
+             (retry-expect (label "acknowledged octets equal the staged records")
+                     (mismatch (lispterm.gpu::renderer-octets r) (lispterm.gpu::renderer-pack-staged r)) nil)
+             (retry-expect (label "staged records equal the twin's")
+                     (mismatch (lispterm.gpu::renderer-pack-staged r) (lispterm.gpu::renderer-pack-staged twin))
+                     nil)
+             (retry-expect (label "no unknown records, no dirty records, pack retained")
+                     (list (retry-unknown-records r) (hash-table-count (lispterm.gpu::renderer-pack-dirty r))
+                           (and (lispterm.gpu::renderer-pack-valid r) t))
+                     (list (if (eq (retry-unknown-records r) :absent) :absent 0) 0 t))))
+      (lispterm.gpu:renderer-close twin)
+      (lispterm.gpu:renderer-close r))))
+
+(defun retry-second-range-check (thunk) (retry-call-with-failing-check 'lispterm.gpu::instance-upload 2 thunk))
+
+(defun retry-run (context)
+  ;; Full pack. Two nonadjacent ranges; the first is uploaded and acknowledged,
+  ;; the second fails. The first cell goes back to its old value before the retry.
+  (retry-scenario context "full, first range reverted"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :fg #x00ff00)
+              (funcall failing #'retry-second-range-check (lambda () (retry-draw r :full t)))
+              (retry-put r 1 0))
+            :retry-full t :retry-bytes 64 :gray-cells '((1 0)))
+  (retry-scenario context "full, first range reverted, second fails before its GL call"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :fg #x00ff00)
+              (funcall failing
+                       (lambda (thunk) (retry-call-with-failing-driver 'lispterm.gpu::gl-buffer-sub-data 2 thunk))
+                       (lambda () (retry-draw r :full t)))
+              (retry-put r 1 0))
+            :retry-full t :retry-bytes 64 :gray-cells '((1 0)))
+  ;; The failing range itself is reverted: the buffer holds its new bytes.
+  (retry-scenario context "full, failed range reverted"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :fg #x00ff00)
+              (funcall failing #'retry-second-range-check (lambda () (retry-draw r :full t)))
+              (retry-put r 9 2))
+            :retry-full t :retry-bytes 32 :gray-cells '((9 2)))
+  ;; No test control: a new glyph needing atlas growth makes the incremental pack
+  ;; fall back to the full pack, whose second range fails.
+  (retry-scenario context "growth fallback, first range reverted"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :glyph "Y" :mask 0 :bg #x00ff00)
+              (let ((full (retry-counter r :full-packs)))
+                (funcall failing #'retry-second-range-check (lambda () (retry-draw r)))
+                (retry-expect "growth fallback: the failing frame ran the full pack"
+                        (- (retry-counter r :full-packs) full) 1))
+              (retry-put r 1 0))
+            :retry-bytes 64 :gray-cells '((1 0)))
+  ;; Allocation. 63 records, then 64 whose allocation fails, then the 63 old ones.
+  (flet ((allocation (name inject)
+           (retry-scenario context name
+                     (lambda (r failing)
+                       (retry-paint r) (retry-put r 2 0 :fg #x0000ff :line-size :double-width) (retry-draw r)
+                       (retry-put r 4 0 :fg #xff0000)
+                       (funcall failing inject (lambda () (retry-draw r)))
+                       (retry-put r 2 0 :fg #x0000ff :line-size :double-width))
+                     :retry-bytes (* 63 32) :retry-compared 0)))
+    (allocation "allocation fails after its GL call, length reverts"
+                (lambda (thunk) (retry-call-with-failing-check 'lispterm.gpu::instance-allocation 1 thunk)))
+    (allocation "allocation fails before its GL call, length reverts"
+                (lambda (thunk) (retry-call-with-failing-driver 'lispterm.gpu::gl-buffer-data 1 thunk))))
+  ;; Incremental pack, same shapes.
+  (retry-scenario context "incremental, both ranges reverted"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :fg #x00ff00)
+              (let ((incremental (retry-counter r :incremental-packs)))
+                (funcall failing #'retry-second-range-check (lambda () (retry-draw r)))
+                (retry-expect "incremental: the failing frame ran the incremental pack"
+                        (- (retry-counter r :incremental-packs) incremental) 1))
+              (retry-put r 1 0) (retry-put r 9 2))
+            :retry-bytes 64 :gray-cells '((1 0) (9 2)))
+  ;; A range the incremental upload left unknown is next seen by the full pack.
+  (retry-scenario context "incremental failure, failed range reverted, full pack retries"
+            (lambda (r failing)
+              (retry-paint r) (retry-draw r)
+              (retry-put r 1 0 :fg #xff0000) (retry-put r 9 2 :fg #x00ff00)
+              (funcall failing #'retry-second-range-check (lambda () (retry-draw r)))
+              (retry-put r 9 2))
+            :retry-full t :retry-bytes 32 :gray-cells '((9 2))))
+
+(defclass publication-renderer (lispterm.gpu::gpu-renderer) ())
+(defun make-publication-renderer (&rest arguments)
+  (change-class (apply #'lispterm.gpu:make-renderer arguments) 'publication-renderer))
+
+(defparameter *publication-columns* 16)
+(defparameter *publication-rows* 4)
+(defparameter *publication-gray* #x808080)
+
+(defvar *publication-tracing* nil "True while a publication-draw is observed.")
+(defvar *publication-trace* nil "Events of the observed publication-draw, newest first.")
+(defvar *publication-exit* nil "NIL, or (SLOT KIND): leave before the next non-NIL write of SLOT by KIND.")
+
+(define-condition publication-injected-exit (error) ((slot :initarg :slot))
+  (:report (lambda (condition stream)
+             (format stream "injected exit before the ~A write" (slot-value condition 'slot)))))
+
+(defun publication-expect (label actual expected)
+  (if (equalp actual expected)
+      (format t "PASS ~A ~S~%" label actual)
+      (error "~A got ~S expected ~S" label actual expected)))
+
+(defun publication-info (label value) (format t "INFO ~A ~S~%" label value))
+
+(defun publication-call-observing-write (slot value write)
+  "Run the slot write WRITE and record it, or leave before it when it is the armed one."
+  (when (and *publication-tracing* value (eq slot (first *publication-exit*)))
+    (let ((kind (second *publication-exit*)))
+      (setf *publication-exit* nil)
+      (push (list :exit-before-write slot kind) *publication-trace*)
+      (ecase kind
+        (:error (error 'publication-injected-exit :slot slot))
+        (:throw (throw 'publication-injected-exit (list :throw slot))))))
+  (multiple-value-prog1 (funcall write)
+    (when *publication-tracing* (push (list :wrote slot (if value :value nil)) *publication-trace*))))
+
+(defmethod (setf lispterm.gpu::renderer-octets) :around (value (r publication-renderer))
+  (publication-call-observing-write :octets value #'call-next-method))
+
+(defmethod (setf lispterm.gpu::renderer-octets-unknown) :around (value (r publication-renderer))
+  (publication-call-observing-write :unknown value #'call-next-method))
+
+(defun publication-call-observed (thunk)
+  "Run THUNK recording real instance glBufferData calls, passed allocation checks
+and publication-snapshot slot writes. Return how THUNK ended, the events in order, and the
+report of the error that ended it."
+  (let ((buffer-data (symbol-function 'lispterm.gpu::gl-buffer-data))
+        (check (symbol-function 'lispterm.gpu::gl-check))
+        (*publication-tracing* t) (*publication-trace* nil) (report nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'lispterm.gpu::gl-buffer-data)
+                 (lambda (&rest arguments)
+                   (multiple-value-prog1 (apply buffer-data arguments)
+                     (when (eql (first arguments) #x8892)
+                       (push (list :gl-buffer-data (second arguments)) *publication-trace*))))
+                 (symbol-function 'lispterm.gpu::gl-check)
+                 (lambda (&rest arguments)
+                   (multiple-value-prog1 (apply check arguments)
+                     (when (eq (first arguments) 'lispterm.gpu::instance-allocation)
+                       (push (list :check-passed :instance-allocation) *publication-trace*)))))
+           (let ((outcome (catch 'publication-injected-exit
+                            (handler-case (progn (funcall thunk) :completed)
+                              (error (condition)
+                                (setf report (princ-to-string condition))
+                                (list :error (type-of condition)))))))
+             (values outcome (reverse *publication-trace*) report)))
+      (setf (symbol-function 'lispterm.gpu::gl-buffer-data) buffer-data
+            (symbol-function 'lispterm.gpu::gl-check) check))))
+
+(defun publication-exit-after-allocation-p (trace)
+  "True when TRACE shows glBufferData, then its passed check, then the injected exit."
+  (let ((data (position :gl-buffer-data trace :key #'first))
+        (check (position :check-passed trace :key #'first))
+        (exit (position :exit-before-write trace :key #'first)))
+    (and data check exit (< data check exit))))
+
+(defun publication-counter (r key) (gethash key (lispterm.gpu::renderer-counters r) 0))
+
+(defun publication-put (r column row &key (glyph "X") (mask 255) (fg *publication-gray*) (bg 0) (line-size :single))
+  (lispterm.gpu:renderer-write-cell
+   r column row :glyph-key (list glyph nil 1)
+   :mask (make-array 1 :element-type '(unsigned-byte 8) :initial-element mask)
+   :foreground fg :background bg :line-size line-size))
+
+(defun publication-paint (r)
+  (dotimes (y *publication-rows*) (dotimes (x *publication-columns*) (publication-put r x y))))
+
+(defun publication-draw (r) (lispterm.gpu:renderer-draw r))
+
+(defun publication-pixel (pixels column row) (aref pixels (+ column (* *publication-columns* row))))
+
+(defun publication-snapshot (r)
+  "The renderer's publication-snapshot slots as (OCTET-COUNT-OR-NIL BIT-COUNT-OR-NIL)."
+  (let ((octets (lispterm.gpu::renderer-octets r)) (unknown (lispterm.gpu::renderer-octets-unknown r)))
+    (list (and octets (length octets)) (and unknown (length unknown)))))
+
+(defun publication-snapshot-usable-p (r)
+  "True when the next publication-draw can use the snapshot: none, or one bit per record."
+  (destructuring-bind (octets bits) (publication-snapshot r)
+    (and (or (null octets) (and bits (= bits (floor octets 32)))) t)))
+
+(defun publication-scenario (context name exit play &key marked-cells)
+  "PLAY receives a renderer and a function running one publication-draw thunk as the frame
+the exit EXIT leaves, and returns with the retry pending. The retry is drawn at
+most twice. MARKED-CELLS must differ from the gray of cell 0 in the last row."
+  (let ((r (make-publication-renderer :context context :width *publication-columns* :height *publication-rows*
+                                       :cell-width 1 :cell-height 1))
+        (twin (make-publication-renderer :context context :width *publication-columns* :height *publication-rows*
+                                          :cell-width 1 :cell-height 1)))
+    (unwind-protect
+         (flet ((label (text) (format nil "~A: ~A" name text)))
+           (funcall play twin #'funcall)
+           (funcall play r
+                    (lambda (thunk)
+                      (multiple-value-bind (outcome trace)
+                          (let ((*publication-exit* exit)) (publication-call-observed thunk))
+                        (publication-info (label "failing frame events") trace)
+                        (publication-expect (label "the injected exit left the frame") outcome
+                                (ecase (second exit)
+                                  (:error '(:error publication-injected-exit))
+                                  (:throw (list :throw (first exit)))))
+                        (publication-expect (label "the exit came after the real glBufferData and its passed check")
+                                (publication-exit-after-allocation-p trace) t)
+                        (publication-expect (label "the frame stays dirty for the caller's retry")
+                                (lispterm.gpu::renderer-dirty r) t)
+                        (publication-info (label "snapshot after the exit (octets bits)") (publication-snapshot r))
+                        (publication-expect (label "snapshot after the exit is absent or has one bit per record")
+                                (publication-snapshot-usable-p r) t))))
+           (let* ((bytes (publication-counter r :instance-bytes)) (compared (publication-counter r :records-compared))
+                  (retries (loop repeat 2
+                                 collect (multiple-value-bind (outcome trace report)
+                                             (publication-call-observed (lambda () (publication-draw r)))
+                                           (publication-info (label "retry events") trace)
+                                           (when report (publication-info (label "retry error") report))
+                                           outcome)
+                                   into outcomes
+                                 until (eq (first (last outcomes)) :completed)
+                                 finally (return outcomes)))
+                  (pixels (handler-case (lispterm.gpu:renderer-readback r) (error () nil)))
+                  (wanted (progn (publication-draw twin) (lispterm.gpu:renderer-readback twin)))
+                  (staged (lispterm.gpu::renderer-pack-staged r))
+                  (octets (lispterm.gpu::renderer-octets r))
+                  (unknown (lispterm.gpu::renderer-octets-unknown r)))
+             (publication-expect (label "the same-length retry completes at once") retries '(:completed))
+             (publication-expect (label "retry pixels equal the never-failing twin")
+                     (if pixels (mismatch pixels wanted) :no-readback) nil)
+             (loop for (column row) in marked-cells
+                   do (publication-expect (label (format nil "twin cell ~D,~D differs from gray" column row))
+                              (/= (publication-pixel wanted column row) (publication-pixel wanted 0 (1- *publication-rows*))) t))
+             (publication-expect (label "retry allocated again (instance bytes, records compared)")
+                     (list (- (publication-counter r :instance-bytes) bytes) (- (publication-counter r :records-compared) compared))
+                     (list (length (lispterm.gpu::renderer-pack-staged twin)) 0))
+             (publication-expect (label "acknowledged octets equal the staged records")
+                     (if octets (mismatch octets staged) :absent) nil)
+             (publication-expect (label "staged records equal the twin's")
+                     (mismatch staged (lispterm.gpu::renderer-pack-staged twin)) nil)
+             (publication-expect (label "no unknown records, pack retained")
+                     (list (if unknown (count 1 unknown) :absent)
+                           (and (lispterm.gpu::renderer-pack-valid r) t))
+                     '(0 t))))
+      (lispterm.gpu:renderer-close twin)
+      (lispterm.gpu:renderer-close r))))
+
+(defun publication-run (context)
+  (flet ((first-allocation (r failing)
+           (publication-paint r) (publication-put r 1 0 :fg #xff0000)
+           (funcall failing (lambda () (publication-draw r))))
+         ;; 63 records drawn, then 64 whose publication is left, then one more
+         ;; cell changes at the same 64 records before the retry.
+         (regrown-allocation (r failing)
+           (publication-paint r) (publication-put r 2 0 :fg #x0000ff :line-size :double-width) (publication-draw r)
+           (publication-put r 4 0 :fg #xff0000)
+           (funcall failing (lambda () (publication-draw r)))
+           (publication-put r 9 2 :fg #x00ff00)))
+    (publication-scenario context "first allocation, error before the unknown-bits write"
+              '(:unknown :error) #'first-allocation :marked-cells '((1 0)))
+    (publication-scenario context "first allocation, throw before the unknown-bits write"
+              '(:unknown :throw) #'first-allocation :marked-cells '((1 0)))
+    (publication-scenario context "63 -> 64 records, error before the unknown-bits write, cell changed before the retry"
+              '(:unknown :error) #'regrown-allocation :marked-cells '((4 0) (9 2)))
+    (publication-scenario context "first allocation, error before the octets write"
+              '(:octets :error) #'first-allocation :marked-cells '((1 0)))
+    (publication-scenario context "63 -> 64 records, throw before the octets write, cell changed before the retry"
+              '(:octets :throw) #'regrown-allocation :marked-cells '((4 0) (9 2)))))
+
 (defun gpu-evidence-check ()
   (let* ((context (lispterm.gpu:open-context)) (renderer nil)
          (cpu (parity-display 51 35))
@@ -346,6 +710,8 @@
     (unwind-protect
          (progn
            (lispterm.gpu:require-hardware-context context)
+           (retry-run context)
+           (publication-run context)
            (check-renderer-delete-errors context)
            (check-renderer-partial-initialization context)
            (check-renderer-construction-cleanup context)

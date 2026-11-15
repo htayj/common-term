@@ -106,7 +106,9 @@
 (defun emit-key (state keycode)
   (when (wayland-state-xkb state)
     (let ((key (xkb-normalized-key (wayland-state-xkb state) keycode)))
-      (when key (apply #'protocol-emit state :key key)))))
+      (when key
+        (lispterm.trace:trace-event :key-emit)
+        (apply #'protocol-emit state :key key)))))
 (defun keyboard-event (state opcode payload)
   (case opcode
     ;; Keep ancillary ownership in the wire queue until the payload is valid.
@@ -122,6 +124,9 @@
     (2 (setf (wayland-state-repeat-key state) nil)
        (protocol-emit state :focus :focused-p nil))
     (3 (let ((key (bytes-u32 payload 8)) (pressed (bytes-u32 payload 12)))
+         ;; Metadata only: the compositor's event time and the state, never the key.
+         (lispterm.trace:trace-event :key-dispatch :event-time (bytes-u32 payload 4)
+           :pressed (= pressed 1))
          (if (= pressed 1)
              (progn
                (emit-key state key)

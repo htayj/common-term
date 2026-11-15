@@ -456,6 +456,7 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
                      (lambda (id opcode payload)
                        (declare (ignore opcode payload))
                        (remhash id (wire-handlers wire))
+                       (lispterm.trace:trace-event :frame-callback :path :dma :callback id)
                        (setf (wayland-state-frame-pending-p state) nil)
                        (incf (wayland-state-frame-generation state))
                        (setf (wayland-state-frame-request-id state)
@@ -473,6 +474,8 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
     (wire-send wire (wayland-state-surface state) 2 0 0 width height)
     (setf (dma-buffer-busy-p buffer) t)
     (wire-send wire (wayland-state-surface state) 6)
+    (lispterm.trace:trace-event :commit :path :dma :buffer (dma-buffer-id buffer)
+      :callback callback :generation (1+ (wayland-state-commit-generation state)))
     (incf (wayland-state-commit-generation state))
     (setf (wayland-state-committed-width state) width
           (wayland-state-committed-height state) height
@@ -501,6 +504,8 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
       (return-from dma-present :unsupported))
     (unless (and (wayland-state-configured-p state)
                  (not (wayland-state-frame-pending-p state)))
+      (lispterm.trace:trace-event :present-deferred :path :dma
+        :reason (if (wayland-state-configured-p state) :frame-pending :unconfigured))
       (return-from dma-present :busy))
     (dma-collect state dma)
     (let* ((context (lispterm.display::display-renderer-context display))
@@ -521,6 +526,7 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
                                   for target = (dma-buffer-target b)
                                   sum (* 4 (lispterm.gpu:dma-target-width target)
                                            (lispterm.gpu:dma-target-height target)))) 268435456))
+          (lispterm.trace:trace-event :present-deferred :path :dma :reason :no-buffer)
           (return-from dma-present :busy))
         (let ((target (lispterm.gpu:dma-create context width height)))
           (unwind-protect
@@ -550,6 +556,7 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
                        :captured (list generation width height)
                        :display (list (lispterm.display:display-width display)
                                       (lispterm.display:display-height display)))
+            (lispterm.trace:trace-event :present-deferred :path :dma :reason :stale-import)
             (return-from dma-present :busy)))
       (when (dma-buffer-busy-p buffer) (wire-error "attempted in-flight dma overwrite" nil))
       (when (plusp (dma-buffer-uses buffer)) (incf (dma-protocol-reuses dma)))
@@ -565,10 +572,14 @@ holds neither BUFFER nor its target. At disconnect the entry is removed."
       ;; Complete GPU writes before compositor import consumption, explicitly.
       (lispterm.gpu:gl-finish)
       (lispterm.gpu::gl-check 'dma-finish)
+      ;; Taken after any import roundtrip: the target holds the renderer as of now.
+      (lispterm.trace:trace-event :copy :path :dma :buffer (dma-buffer-id buffer)
+        :width width :height height :scale 1 :store buffer)
       (incf (dma-protocol-finishes dma))
       (dma-commit state buffer width height)
       (incf (dma-buffer-uses buffer))
       (incf (dma-protocol-presents dma)) :presented))))
+      (lispterm.trace:trace-event :present-result :path :dma :result result)
       (dma-trace (window-protocol display) :present-exit :result result
                  :display (list (lispterm.display:display-width display)
                                 (lispterm.display:display-height display))))))

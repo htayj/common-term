@@ -75,20 +75,33 @@
       (setf (host-effective-backend host) (ltd:display-backend (host-display host))
             (host-state host) :attached))))
 
-(defun display-step (host)
+(defun display-step (host &key (poll-p t) (render-p t))
+  "Poll independently of rendering. Reject saturated native input one whole event at a time."
   (let ((display (host-display host)))
     (when (and display (eq (host-state-value host) :attached))
       (restart-case
           (progn
-            (window-geometry-intent host display)
-            (dolist (event (ltd:poll-events display :timeout 0))
-              (cond ((typep event 'ltd:close-event) (window-close host))
-                    ((typep event 'ltd:resize-event)
-                     (window-geometry-event host display event))
-                    (t (session-event (host-session host) event))))
+            (when poll-p
+              (lispterm.trace:trace-event :display-step)
+              (window-geometry-intent host display)
+              (dolist (event (ltd:poll-events display :timeout 0))
+                (lispterm.trace:trace-event :event-dequeue :kind (type-of event))
+                (cond ((typep event 'ltd:close-event) (window-close host))
+                      ((typep event 'ltd:resize-event)
+                       (window-geometry-event host display event))
+                      (t
+                       (handler-case (session-event (host-session host) event)
+                         (input-backpressure (condition)
+                           ;; Admission is atomic: none of this event was queued.
+                           ;; Keep protocol progress, but never replay rejected input.
+                           (host-record-error host :input-backpressure condition)
+                           (lispterm.trace:trace-event :input-backpressure
+                             :kind (type-of event))))))))
             (when (eq (host-state-value host) :attached)
-              (ltd:geometry-tick display)
-              (render-session (host-session host) display)
+              ;; Geometry retry policy keeps its frame-paced invocation.
+              (when render-p
+                (ltd:geometry-tick display)
+                (render-session (host-session host) display))
               (sb-thread:with-mutex ((session-lock (host-session host)))
                 (setf (session-geometry-status (host-session host))
                       (append (ltd:geometry-status display) (ltd:display-metrics display))))))
@@ -187,8 +200,84 @@ Other commands are rejected; the PTY session and renderer are never touched."
           (reject-host-command host command)))
     (sleep 0.005)))
 
+(defparameter *owner-clock* #'get-internal-real-time)
+(defparameter *owner-wait* (lambda (host seconds) (declare (ignore host)) (sleep seconds)))
+
+(defstruct owner-schedule (next-frame 0) (io-backoff 0))
+
+(defun owner-iteration (host schedule)
+  "Bound input draining and output reading; poll independently of draw pacing."
+  (when (host-stop-p host) (return-from owner-iteration nil))
+  (run-host-commands host)
+  (when (host-stop-p host) (return-from owner-iteration nil))
+  (let ((session (host-session host)) (output-p nil) (input-status :empty))
+    (labels ((display-failure (condition)
+               (host-record-error host :display condition)
+               (set-host-state host :detached)
+               (handler-case (window-close host)
+                 (error (close-error) (host-record-error host :display-close close-error))))
+             (drain-input ()
+               (multiple-value-bind (count status)
+                   (session-flush-input session :max-writes 16 :max-bytes 16384)
+                 (declare (ignore count))
+                 (setf input-status status))
+               (session-queue-responses session))
+             (input-failure (condition)
+               (host-record-error host :pty condition)
+               (setf (owner-schedule-io-backoff schedule)
+                     (+ (funcall *owner-clock*) internal-time-units-per-second))))
+      ;; Clear old bytes and response backlog BEFORE admitting newly polled keys.
+      (handler-case (drain-input) (error (condition) (input-failure condition)))
+      (handler-case
+          (display-step host :render-p nil)
+        (error (condition) (display-failure condition)))
+      (when (host-stop-p host) (return-from owner-iteration nil))
+      ;; Write every available event in a bounded batch, even during read backoff.
+      (handler-case (drain-input) (error (condition) (input-failure condition)))
+      (let ((now (funcall *owner-clock*)))
+        (when (>= now (owner-schedule-io-backoff schedule))
+          (handler-case
+              (let* ((pending (session-input-pending session))
+                     (result (session-read-output session)))
+                ;; The read's final default flush may become writable after the
+                ;; earlier drain blocked. Do not sleep on that positive suffix.
+                (when (< (session-input-pending session) pending)
+                  (setf input-status (if (plusp (session-input-pending session))
+                                         :budget :empty)))
+                (cond ((eq result :eof)
+                       (setf (owner-schedule-io-backoff schedule)
+                             (+ now (* 1/10 internal-time-units-per-second))))
+                      ((and (vectorp result) (plusp (length result)))
+                       (setf output-p t))))
+            (error (condition) (input-failure condition)))))
+      (let ((now (funcall *owner-clock*)))
+        (when (>= now (owner-schedule-next-frame schedule))
+          (let ((frames (session-frames session)))
+            (handler-case (display-step host :poll-p nil)
+              (error (condition) (display-failure condition)))
+            (when (/= frames (session-frames session))
+              (let* ((period (/ internal-time-units-per-second 60))
+                     (deadline (owner-schedule-next-frame schedule)))
+                (setf (owner-schedule-next-frame schedule)
+                      (if (> (- now deadline) period)
+                          (+ now period)
+                          (+ deadline (* period (1+ (floor (- now deadline) period)))))))))))
+    ;; A budget-limited writable FIFO gets another fair turn immediately. A zero
+    ;; write must wait, rather than spin on non-writable PTY input. Pending output
+    ;; still gets its normal bounded read on each turn.
+    (if (or output-p (eq input-status :budget)) 0
+        (let* ((now (funcall *owner-clock*))
+               (deadline (owner-schedule-next-frame schedule))
+               (blink (session-next-blink session))
+               (backoff (owner-schedule-io-backoff schedule))
+               (wait 0.005))
+          (dolist (target (list deadline (and blink (* blink internal-time-units-per-second)) backoff))
+            (when (and target (> target now))
+              (setf wait (min wait (/ (- target now) internal-time-units-per-second)))))
+          wait)))))
+
 (defun window-worker (host &optional startup-command)
-  (let ((next-frame 0) (io-backoff 0))
+  (let ((schedule (make-owner-schedule)))
     (unwind-protect
          (progn
            (when (and startup-command (not (run-host-command host startup-command)))
@@ -201,27 +290,8 @@ Other commands are rejected; the PTY session and renderer are never touched."
              (when (host-display host)
                (supervise-display-cleanup host))
              (return-from window-worker nil))
-           (loop until (host-stop-p host) do
-             (run-host-commands host)
-             (unless (host-stop-p host)
-               (let ((now (get-internal-real-time)))
-                 (when (>= now io-backoff)
-                   (handler-case
-                       (when (eq (session-read-output (host-session host)) :eof)
-                         (setf io-backoff (+ now (* 1/10 internal-time-units-per-second))))
-                     (error (condition)
-                       (host-record-error host :pty condition)
-                       (setf io-backoff (+ now internal-time-units-per-second)))))
-                 (when (>= now next-frame)
-                   (setf next-frame (+ now (ceiling internal-time-units-per-second 60)))
-                   (handler-case (display-step host)
-                     (error (condition)
-                       (host-record-error host :display condition)
-                       (set-host-state host :detached)
-                       (handler-case (window-close host)
-                         (error (close-error) (host-record-error host :display-close close-error)))))))
-               ;; Bound idle CPU use, even when poll returns immediately on EOF.
-               (sleep 0.005))))
+           (loop for wait = (owner-iteration host schedule)
+                 while wait do (funcall *owner-wait* host wait)))
       (handler-case (window-close host)
         (error (condition) (host-record-error host :worker-cleanup condition)))
       (set-host-state host :quiesced))))

@@ -154,12 +154,270 @@
                (assert-parity cpu renderer "OVERLAP-FULL-ROW-REPAINT"))))
       (lispterm.gpu:renderer-close renderer))))
 
+;;;; Incremental packing controls: counters exclude oracle calls and readback.
+(defparameter *packing-keys*
+  '(:full-packs :incremental-packs :records-encoded :atlas-resolutions :records-compared
+    :position-sorts :instance-upload-calls :instance-bytes :draw-calls :glyph-uploads))
+
+(defun packing-counter (r key) (gethash key (lispterm.gpu::renderer-counters r) 0))
+(defun packing-snapshot (r) (mapcar (lambda (key) (packing-counter r key)) *packing-keys*))
+(defun packing-deltas (r before)
+  (loop for key in *packing-keys* for old in before append (list key (- (packing-counter r key) old))))
+
+(defun packing-expect (label actual expected)
+  (if (equalp actual expected)
+      (format t "PASS ~A ~S~%" label actual)
+      (error "~A got ~S expected ~S" label actual expected)))
+
+(defun packing-put (r column row &key (glyph "X") (mask 255) (fg #xffffff) (bg 0) (span 1) (line-size :single))
+  (lispterm.gpu:renderer-write-cell
+   r column row :glyph-key (list glyph nil span)
+   :mask (make-array 1 :element-type '(unsigned-byte 8) :initial-element mask)
+   :foreground fg :background bg :span span :line-size line-size))
+
+(defun packing-signals-error-p (thunk)
+  (handler-case (progn (funcall thunk) nil) (error () t)))
+
+(defun packing-call-with-failing (name thunk)
+  "Run THUNK while the driver function NAME signals instead of reaching GL."
+  (let ((saved (symbol-function name)))
+    (unwind-protect
+         (progn (setf (symbol-function name)
+                      (lambda (&rest arguments) (declare (ignore arguments))
+                        (error "injected ~A failure" name)))
+                (funcall thunk))
+      (setf (symbol-function name) saved))))
+
+(defun packing-run (context rows oraclep)
+  "Return the bytes consed by the one-cell draw."
+  (let* ((columns 200) (one-cell-consed nil)
+         (r (lispterm.gpu:make-renderer :context context :width columns :height rows
+                                        :cell-width 1 :cell-height 1))
+         (twin (lispterm.gpu:make-renderer :context context :width columns :height rows
+                                           :cell-width 1 :cell-height 1)))
+    (unwind-protect
+         (labels ((both (function) (funcall function r) (funcall function twin))
+                  (label (text) (format nil "rows=~D oracle=~A ~A" rows oraclep text))
+                  (paint ()
+                    (both (lambda (target)
+                            (dotimes (y rows) (dotimes (x columns) (packing-put target x y :fg #x808080))))))
+                  (frame (name &rest expected)
+                    (let* ((before (packing-snapshot r))
+                           (start (sb-ext:get-bytes-consed))
+                           (consed (progn (lispterm.gpu:renderer-draw r)
+                                          (- (sb-ext:get-bytes-consed) start)))
+                           (after (packing-deltas r before))
+                           (staged (lispterm.gpu::renderer-pack-staged r)))
+                      (loop for (key value) on expected by #'cddr
+                            do (packing-expect (label (format nil "~A ~S" name key)) (getf after key) value))
+                      (let ((lispterm.gpu::*renderer-force-full-pack* t))
+                        (lispterm.gpu:renderer-draw twin))
+                      (packing-expect (label (format nil "~A pixels equal forced-full twin" name))
+                              (mismatch (lispterm.gpu:renderer-readback r)
+                                        (lispterm.gpu:renderer-readback twin))
+                              nil)
+                      (packing-expect (label (format nil "~A staged equal acknowledged octets" name))
+                              (mismatch staged (lispterm.gpu::renderer-octets r)) nil)
+                      (assert (equalp staged (lispterm.gpu::renderer-pack-staged twin)))
+                      (format t "INFO ~A staged bytes ~:[differ from~;equal~] forced-full twin; consed ~D; ~S~%"
+                              (label name)
+                              (equalp staged (lispterm.gpu::renderer-pack-staged twin)) consed after)
+                      (when oraclep
+                        (packing-expect (label (format nil "~A staged equal fresh full pack" name))
+                                (mismatch staged (values (lispterm.gpu::renderer-pack-instances r))) nil))
+                      consed)))
+           (paint)
+           (frame "cold" :full-packs 1 :incremental-packs 0 :position-sorts 1
+                         :records-encoded (* columns rows) :atlas-resolutions (* 2 columns rows))
+           (both (lambda (target) (packing-put target 5 3 :fg #x123456)))
+           (setf one-cell-consed
+                 (frame "one-cell" :full-packs 0 :incremental-packs 1 :records-encoded 1
+                                   :atlas-resolutions 1 :records-compared 1 :position-sorts 0
+                                   :instance-upload-calls 1 :instance-bytes 32 :draw-calls 1
+                                   :glyph-uploads 0))
+           (both (lambda (target) (setf (lispterm.gpu::renderer-dirty target) t)))
+           (frame "forced-redraw" :full-packs 0 :incremental-packs 1 :records-encoded 0
+                                  :records-compared 0 :instance-upload-calls 0 :position-sorts 0)
+           (both (lambda (target) (lispterm.gpu:renderer-write-remainder target 0 0 3 2 #xabcdef)))
+           (frame "remainder-only" :full-packs 0 :incremental-packs 1 :records-encoded 0
+                                   :instance-upload-calls 0 :position-sorts 0)
+           ;; Repeated and out-of-order writes: two adjacent records and a distant one.
+           (both (lambda (target)
+                   (packing-put target 10 2 :fg #x111111) (packing-put target 9 2 :fg #x222222)
+                   (packing-put target 150 (1- rows) :fg #x333333) (packing-put target 10 2 :fg #x444444)))
+           (frame "three-cells" :full-packs 0 :incremental-packs 1 :records-encoded 3
+                                :records-compared 3 :instance-upload-calls 2 :instance-bytes 96
+                                :position-sorts 0)
+           ;; Atlas capacity is 1 after the cold frame: a new glyph needs growth.
+           (both (lambda (target) (packing-put target 20 4 :glyph "Y" :mask 0 :bg #x00ff00)))
+           (frame "new-glyph-growth-fallback" :full-packs 1 :incremental-packs 0 :position-sorts 1)
+           (both (lambda (target) (packing-put target 21 4 :glyph "Z" :mask 0 :bg #x0000ff)))
+           (frame "second-growth-fallback" :full-packs 1 :incremental-packs 0)
+           (packing-expect (label "atlas capacity after two growths")
+                   (lispterm.gpu:atlas-capacity (lispterm.gpu::renderer-atlas r)) 4)
+           (both (lambda (target) (packing-put target 22 4 :glyph "W" :mask 0 :bg #xff0000)))
+           (frame "free-slot-fill" :full-packs 0 :incremental-packs 1 :records-encoded 1
+                                   :atlas-resolutions 1 :glyph-uploads 1 :instance-upload-calls 1
+                                   :instance-bytes 32)
+           (both (lambda (target) (packing-put target 23 4 :glyph "Y" :mask 0 :bg #xffff00)))
+           (frame "resident-hit" :full-packs 0 :incremental-packs 1 :records-encoded 1 :glyph-uploads 0)
+           ;; Layout changes. A double-width cell swallows two single cells.
+           (both (lambda (target) (packing-put target 2 7 :line-size :double-width :fg #xff00ff)))
+           (frame "double-width-layout-change" :full-packs 1 :incremental-packs 0)
+           (both (lambda (target) (packing-put target 2 7 :line-size :double-width :fg #x00ffff)))
+           (frame "double-width-in-place" :full-packs 0 :incremental-packs 1 :records-encoded 1)
+           ;; A double-width span-2 cell at column 0, split by a single cell at
+           ;; column 1. Its left fragment has the key of a single cell at column 0.
+           (both (lambda (target)
+                   (packing-put target 0 11 :glyph "D" :span 2 :line-size :double-width :fg #xabcdef)))
+           (frame "wide-at-column-0" :full-packs 1 :incremental-packs 0)
+           (both (lambda (target) (packing-put target 1 11 :fg #xfedcba)))
+           (frame "fragmenting-write" :full-packs 1 :incremental-packs 0)
+           (packing-expect (label "clipped runs retained")
+                   (and (lispterm.gpu::renderer-pack-runs r) t) t)
+           (both (lambda (target) (packing-put target 0 11 :fg #x135790)))
+           (frame "column-0-key-collision" :full-packs 1 :incremental-packs 0)
+           (both (lambda (target) (packing-put target 0 11 :fg #x975310)))
+           (let ((draws (packing-counter r :draw-calls)))
+             (frame "in-place-with-clipped-runs" :full-packs 0 :incremental-packs 1 :records-encoded 1)
+             (packing-expect (label "scissor runs drawn from the cache") (> (- (packing-counter r :draw-calls) draws) 1) t))
+           ;; Failed instance upload, then retry.
+           (both (lambda (target) (packing-put target 7 7 :fg #x0a0b0c)))
+           (packing-expect (label "injected instance upload failure signals")
+                   (packing-call-with-failing 'lispterm.gpu::gl-buffer-sub-data
+                                      (lambda () (packing-signals-error-p (lambda () (lispterm.gpu:renderer-draw r)))))
+                   t)
+           (packing-expect (label "pack valid, record still dirty after failed instance upload")
+                   (list (lispterm.gpu::renderer-pack-valid r)
+                         (hash-table-count (lispterm.gpu::renderer-pack-dirty r))
+                         (lispterm.gpu::renderer-dirty r))
+                   '(t 1 t))
+           (frame "retry-after-instance-failure" :full-packs 0 :incremental-packs 1 :records-encoded 0
+                                                 :instance-upload-calls 1 :instance-bytes 32)
+           ;; Failed glyph upload on the incremental path, then retry.
+           (both (lambda (target) (packing-put target 8 7 :glyph "Q" :mask 0 :bg #x112233)))
+           (packing-expect (label "injected glyph upload failure signals")
+                   (packing-call-with-failing 'lispterm.gpu:gl-tex-sub-image-2d
+                                      (lambda () (packing-signals-error-p (lambda () (lispterm.gpu:renderer-draw r)))))
+                   t)
+           (packing-expect (label "pack valid, glyph pending after failed glyph upload")
+                   (list (lispterm.gpu::renderer-pack-valid r)
+                         (length (lispterm.gpu:atlas-pending-uploads (lispterm.gpu::renderer-atlas r))))
+                   '(t 1))
+           (frame "retry-after-glyph-failure" :full-packs 0 :incremental-packs 1 :records-encoded 0
+                                              :glyph-uploads 1 :instance-upload-calls 1)
+           ;; A changed mask for a resident key signals from both packs.
+           (packing-put r 8 8 :mask 0)
+           (packing-expect (label "changed mask signals on the incremental pack")
+                   (packing-signals-error-p (lambda () (lispterm.gpu:renderer-draw r))) t)
+           (packing-expect (label "pack dropped after the error") (lispterm.gpu::renderer-pack-valid r) nil)
+           (packing-expect (label "changed mask signals on the full pack")
+                   (packing-signals-error-p (lambda () (lispterm.gpu:renderer-draw r))) t)
+           (both (lambda (target) (packing-put target 8 8 :fg #x5a5a5a)))
+           (frame "recovery-after-changed-mask" :full-packs 1 :incremental-packs 0)
+           ;; A rejected resize keeps the retained pack; a successful one resets it.
+           (packing-expect (label "rejected resize signals")
+                   (packing-signals-error-p (lambda () (lispterm.gpu:renderer-resize r 0 rows 1 1))) t)
+           (both (lambda (target) (packing-put target 30 5 :fg #x777777)))
+           (frame "after-rejected-resize" :full-packs 0 :incremental-packs 1 :records-encoded 1)
+           (both (lambda (target) (lispterm.gpu:renderer-resize target columns rows 1 1)))
+           (packing-expect (label "successful resize resets the pack")
+                   (list (lispterm.gpu::renderer-pack-valid r) (lispterm.gpu::renderer-pack-staged r)
+                         (hash-table-count (lispterm.gpu::renderer-pack-index r)))
+                   '(nil nil 0))
+           (paint)
+           (frame "after-resize" :full-packs 1 :incremental-packs 0)
+           (both (lambda (target) (packing-put target 5 3 :fg #x123456)))
+           (frame "one-cell-after-resize" :full-packs 0 :incremental-packs 1 :records-encoded 1
+                                          :instance-bytes 32))
+      (lispterm.gpu:renderer-close twin)
+      (lispterm.gpu:renderer-close r))
+    one-cell-consed))
+
+(defun check-packing-work (context &optional (row-counts '(60 120)))
+  "Count existing production operations and actual GL calls, independently of new metrics."
+  (dolist (rows row-counts)
+    (let ((r (lispterm.gpu:make-renderer :context context :width 200 :height rows
+                                       :cell-width 1 :cell-height 1)))
+      (unwind-protect
+           (progn
+             (dotimes (y rows) (dotimes (x 200) (packing-put r x y)))
+             (lispterm.gpu:renderer-draw r)
+             (packing-put r 5 3 :fg #x123456)
+             (let* ((names '(lispterm.gpu::renderer-pack-instances
+                             lispterm.gpu::renderer-positions
+                             lispterm.gpu:atlas-ensure-glyph
+                             lispterm.gpu:instance-buffer-write
+                             lispterm.gpu:gl-buffer-sub-data
+                             lispterm.gpu:gl-draw-arrays-instanced))
+                    (saved (mapcar (lambda (n) (cons n (symbol-function n))) names))
+                    (counts (make-hash-table)) (bytes 0))
+               (unwind-protect
+                    (progn
+                      (dolist (entry saved)
+                        (let ((name (car entry)) (real (cdr entry)))
+                          (setf (symbol-function name)
+                                (lambda (&rest args)
+                                  (incf (gethash name counts 0))
+                                  (when (eq name 'lispterm.gpu:gl-buffer-sub-data)
+                                    (incf bytes (third args)))
+                                  (apply real args)))))
+                      (lispterm.gpu:renderer-draw r))
+                 (dolist (entry saved) (setf (symbol-function (car entry)) (cdr entry))))
+               (format t "PACKING-ACTUAL-WORK rows=~D calls=~S bytes=~D~%"
+                       rows (loop for n in names collect (list n (gethash n counts 0))) bytes)
+               ;; These checks also run against the old production definitions.
+               (dolist (name (subseq names 0 4)) (assert (zerop (gethash name counts 0))))
+               (assert (= 1 (gethash 'lispterm.gpu:gl-buffer-sub-data counts 0)))
+               (assert (= 32 bytes))
+               (assert (= 1 (gethash 'lispterm.gpu:gl-draw-arrays-instanced counts 0)))))
+        (lispterm.gpu:renderer-close r)))))
+(defun check-packing-capacity-recovery (context)
+  (let ((r (lispterm.gpu:make-renderer :context context :width 8 :height 4 :cell-width 1 :cell-height 1))
+        (twin (lispterm.gpu:make-renderer :context context :width 8 :height 4 :cell-width 1 :cell-height 1)))
+    (unwind-protect
+         (labels ((both (f) (funcall f r) (funcall f twin))
+                  (frame ()
+                    (lispterm.gpu:renderer-draw r)
+                    (let ((lispterm.gpu::*renderer-force-full-pack* t)) (lispterm.gpu:renderer-draw twin))
+                    (assert (equalp (lispterm.gpu:renderer-readback r) (lispterm.gpu:renderer-readback twin)))
+                    (assert (equalp (lispterm.gpu::renderer-pack-staged r) (lispterm.gpu::renderer-octets r)))
+                    (assert (equalp (lispterm.gpu::renderer-pack-staged r) (lispterm.gpu::renderer-pack-staged twin)))))
+           (both (lambda (target)
+                   (setf (slot-value (lispterm.gpu::renderer-atlas target) 'lispterm.gpu::maximum) 2)
+                   (dotimes (y 4) (dotimes (x 8) (packing-put target x y :glyph "Y")))
+                   (packing-put target 1 0 :glyph "X")))
+           (frame)
+           (let ((epoch (lispterm.gpu:atlas-epoch (lispterm.gpu::renderer-atlas r)))
+                 (full (packing-counter r :full-packs)))
+             (both (lambda (target) (packing-put target 1 0 :glyph "Z" :fg #x123456)))
+             (frame)
+             (assert (= 1 (- (packing-counter r :full-packs) full)))
+             (assert (< epoch (lispterm.gpu:atlas-epoch (lispterm.gpu::renderer-atlas r)))))
+           (both (lambda (target) (packing-put target 2 0 :glyph "W")))
+           (dolist (target (list r twin))
+             (assert (handler-case (progn (lispterm.gpu:renderer-draw target) nil)
+                       (lispterm.gpu:atlas-capacity-error () t)))
+             (assert (not (lispterm.gpu::renderer-pack-valid target)))
+             (assert (lispterm.gpu::renderer-dirty target)))
+           (both (lambda (target) (packing-put target 2 0 :glyph "Y")))
+           (frame)
+           (format t "PACKING-CAPACITY: eviction fallback, capacity refusal and recovery passed~%"))
+      (lispterm.gpu:renderer-close twin) (lispterm.gpu:renderer-close r))))
 (defun gpu-offscreen-check ()
   (let ((context (lispterm.gpu:open-context)) (renderer nil) (frames 0) (pixels 0))
     (unwind-protect
          (progn
            (lispterm.gpu:require-hardware-context context)
            (check-overlapping-cell-writes context)
+           (check-packing-work context)
+           (check-packing-capacity-recovery context)
+           (dolist (rows '(60 120))
+             (dolist (oraclep '(nil t))
+               (let ((consed (packing-run context rows oraclep)))
+                 ;; A fixed ceiling allows SBCL allocation-region noise, not grid-sized packing.
+                 (assert (< consed 131072))
+                 (format t "PACKING-ALLOCATION rows=~D oracle=~S draw-bytes=~D ceiling=131072~%" rows oraclep consed))))
            (dolist (dimensions '((51 35) (43 33) (8 16) (7 9) (89 48)))
              (destructuring-bind (width height) dimensions
                (let* ((cpu (parity-display width height))
