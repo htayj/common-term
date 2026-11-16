@@ -603,7 +603,7 @@ acknowledge."
       (gl-viewport 0 0 (renderer-width r) (renderer-height r))
       (dolist (cap '(#x0BD0 #x0BE2 #x0C11 #x0B71 #x0B44)) (gl-disable cap))
       ;; RGBA8 is linear, not an sRGB attachment; ES3 has no desktop sRGB enable.
-      (renderer-color #x1d2021) (gl-clear #x4000)
+      (renderer-color #x000000) (gl-clear #x4000)
       (gl-use-program (renderer-program r))
       (flet ((location (name) (let ((v (gl-get-uniform-location (renderer-program r) name)))
                                (when (< v 0) (error "Missing production uniform ~A" name)) v)))

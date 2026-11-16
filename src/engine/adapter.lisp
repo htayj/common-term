@@ -16,8 +16,8 @@
 (defun palette-color (index)
   (check-type index (integer 0 255))
   (cond ((< index 16)
-         (aref #(#x000000 #xcd0000 #x00cd00 #xcdcd00 #x0000ee #xcd00cd #x00cdcd #xe5e5e5
-                 #x7f7f7f #xff0000 #x00ff00 #xffff00 #x5c5cff #xff00ff #x00ffff #xffffff) index))
+         (aref #(#x000000 #xaa0000 #x00aa00 #xaa5500 #x0000aa #xaa00aa #x00aaaa #xaaaaaa
+                 #x555555 #xff5555 #x55ff55 #xffff55 #x5555ff #xff55ff #x55ffff #xffffff) index))
         ((< index 232)
          (let* ((n (- index 16)) (levels #(0 95 135 175 215 255)))
            (logior (ash (aref levels (floor n 36)) 16)

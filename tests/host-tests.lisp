@@ -174,8 +174,8 @@
                (check :neutral-grid (typep (aref grid 0 0) 'ltd:cell))
                (check :bold (ltd:cell-bold (aref grid 0 0)))
                (check :underline (ltd:cell-underline (aref grid 0 0)))
-               (check :foreground (= #xcd0000 (ltd:cell-fg (aref grid 0 0))))
-               (check :background (= #x0000ee (ltd:cell-bg (aref grid 0 0))))
+               (check :foreground (= #xaa0000 (ltd:cell-fg (aref grid 0 0))))
+               (check :background (= #x0000aa (ltd:cell-bg (aref grid 0 0))))
                (check :wide-leading (= 2 (ltd:cell-width (aref grid 0 1))))
                (check :wide-continuation (= 0 (ltd:cell-width (aref grid 0 2))))))
            ;; Inject normal close, then prove the real child and parser keep running.

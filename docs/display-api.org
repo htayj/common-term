@@ -26,6 +26,8 @@ Backends own transport, window handles and input translation.
 make-cell &key char width fg bg bold inverse underline. Width is 2 on a wide
 leading cell, 0 on its continuation, otherwise 1. Colours are NIL (default) or
 24-bit RGB integers. palette-color index returns RGB; char-cell-width character.
+The default foreground is light gray (#xAAAAAA) on black (#x000000), with the
+sixteen CGA colors in ANSI index order at palette indices 0 through 15.
 key-event has key (character or :up/:down/:left/:right/:f1..:f12), text, modifiers
 (list of :shift :control :alt :super). text-event has text; resize-event has
 columns rows width height; close-event; focus-event has focused-p; paste-event

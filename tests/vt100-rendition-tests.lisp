@@ -400,7 +400,7 @@
       (lispterm.engine:resize s 2 2)
       (lispterm::render-session session d :now 1/10)
       (check (= (1+ frames) (lispterm::session-frames session)) :resize-forces-frame)
-      (check (plusp (count #xffebdbb2 (ltd::display-framebuffer d))) :resize-redraws-glyph))))
+      (check (plusp (count #xffaaaaaa (ltd::display-framebuffer d))) :resize-redraws-glyph))))
 
 (defmethod ltd::backend-blit ((backend (eql :rendition-test-failure)) display framebuffer rectangles)
   (declare (ignore display framebuffer rectangles))

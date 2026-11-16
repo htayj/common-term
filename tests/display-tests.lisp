@@ -57,6 +57,14 @@
     (assert (= #xff123456 (aref (display-framebuffer d) (+ x (* y 24)))))))
   (draw-cells d 0 2 (list (make-cell :char #\Space :underline t :fg #xabcdef)))
   (dotimes (x 8) (assert (= #xffabcdef (aref (display-framebuffer d) (+ 16 x (* 14 24))))))
+  (loop for expected across #(#x000000 #xaa0000 #x00aa00 #xaa5500
+                              #x0000aa #xaa00aa #x00aaaa #xaaaaaa
+                              #x555555 #xff5555 #x55ff55 #xffff55
+                              #x5555ff #xff55ff #x55ffff #xffffff)
+        for index from 0 do (assert (= expected (palette-color index))))
+  (multiple-value-bind (fg bg) (cell-colors d 0 0 (make-cell) :cursor-p nil)
+    (assert (= #xaaaaaa fg))
+    (assert (= #x000000 bg)))
   (assert (= #xffffff (palette-color 231)))
   (assert (= #x080808 (palette-color 232)))
   (assert (handler-case

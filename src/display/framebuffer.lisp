@@ -11,7 +11,8 @@
                              (or (eq (display-renderer-request d) :cpu)
                                  (display-renderer-fallback-reason d)))
                     (make-array (* new-width new-height)
-                                :element-type '(unsigned-byte 32) :initial-element #xff1d2021)))
+                                :element-type '(unsigned-byte 32)
+                                :initial-element (logior #xff000000 *default-background*))))
          (grid (make-array (list rows columns) :initial-element nil))
          (damage (list (list 0 0 new-width new-height)))
          (event (make-resize-event :columns columns :rows rows :width width :height height)))
@@ -33,7 +34,8 @@
 
 (defun cell-colors (d row col cell &key (cursor-p t))
   "Resolve inverse, screen reverse and cursor inversion exactly once."
-  (let ((fg (or (cell-fg cell) #xebdbb2)) (bg (or (cell-bg cell) #x1d2021)))
+  (let ((fg (or (cell-fg cell) *default-foreground*))
+        (bg (or (cell-bg cell) *default-background*)))
     (when (oddp (count-if #'identity
                          (list (cell-inverse cell) (display-reverse-screen d)
                                (and cursor-p (display-cursor-visible d)
@@ -79,7 +81,8 @@
          (span (max 1 (cell-width cell)))
          (right (min (display-width d)
                      (* cw sx (max 1 (floor (display-columns d) sx)))))
-         (fg (or (cell-fg cell) #xebdbb2)) (bg (or (cell-bg cell) #x1d2021))
+         (fg (or (cell-fg cell) *default-foreground*))
+         (bg (or (cell-bg cell) *default-background*))
          (cursor (and (display-cursor-visible d) (eql row (display-cursor-row d))
                       (eql col (display-cursor-col d)))))
     ;; Screen reverse, cell inverse and cursor inversion compose by parity.
@@ -153,8 +156,8 @@ Cell inverse and screen reverse apply; blink affects no background pixels."
          (color (logior #xff000000
                         (if (not (eql (not (null (cell-inverse cell)))
                                       (not (null (display-reverse-screen d)))))
-                            (or (cell-fg cell) #xebdbb2)
-                            (or (cell-bg cell) #x1d2021)))))
+                            (or (cell-fg cell) *default-foreground*)
+                            (or (cell-bg cell) *default-background*)))))
     (if (eq (display-renderer-kind d) :gpu)
         (progn
           (gpu-call "RENDERER-WRITE-REMAINDER" (display-renderer-state d)

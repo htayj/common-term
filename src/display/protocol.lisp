@@ -128,7 +128,8 @@
                   (display-renderer-fallback-reason display) (princ-to-string condition)
                   (display-framebuffer-storage display)
                   (make-array (* (display-width display) (display-height display))
-                              :element-type '(unsigned-byte 32) :initial-element #xff1d2021))
+                              :element-type '(unsigned-byte 32)
+                              :initial-element (logior #xff000000 *default-background*)))
             (error condition)))))
   display)
 

@@ -30,8 +30,11 @@
           (t 1))))
 
 (defparameter *ansi-colors*
-  #(1908769 13378589 10000154 14129441 4556168 11625094 6856042 11049348 9601908 16468276
-    12106534 16432431 8627608 13862555 9355388 15457202))
+  #(#x000000 #xaa0000 #x00aa00 #xaa5500 #x0000aa #xaa00aa #x00aaaa #xaaaaaa
+    #x555555 #xff5555 #x55ff55 #xffff55 #x5555ff #xff55ff #x55ffff #xffffff))
+
+(defparameter *default-foreground* #xaaaaaa)
+(defparameter *default-background* #x000000)
 
 (defun palette-color (index)
   (check-type index (integer 0 255))
