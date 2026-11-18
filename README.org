@@ -1,8 +1,14 @@
-#+title: Lispterm
+#+title: common-term
 
 A Linux Common Lisp terminal with native Wayland and X11 windows. The VT engine,
 PTY host and renderer run in one SBCL heap. In Autolith mode, Autolith's main
 controller runs in that heap on the original main thread.
+
+Use =common-term= or its short name =comterm=. The legacy =bin/lispterm= launcher,
+=lispterm= ASDF systems and =LISPTERM= package names are supported for compatibility.
+Load =common-term=, =common-term/launcher=, =common-term/autolith= or
+=common-term/tests= through ASDF. Package nicknames =COMMON-TERM= and =COMTERM=
+refer to the host API; backend packages also have =COMMON-TERM.*= nicknames.
 
 * Build and run
 Requires Linux x86-64 glibc, Bash, Nix with =nix-command= and =flakes= enabled,
@@ -10,10 +16,10 @@ and a Wayland compositor supporting xdg-shell/SHM or an X11 server.
 
 #+begin_src sh
 scripts/bootstrap-deps
-bin/lispterm
-bin/lispterm --backend wayland -- /bin/sh
-bin/lispterm --backend x11 -- /bin/sh
-bin/lispterm --autolith --backend wayland
+bin/common-term
+bin/comterm --backend wayland -- /bin/sh
+bin/common-term --backend x11 -- /bin/sh
+bin/common-term --autolith --backend wayland
 #+end_src
 
 Without program arguments after =--=, open =SHELL= (or =/bin/sh=).
@@ -33,14 +39,14 @@ accessible DRM render node. See [[file:docs/gpu-foundation.org][GPU architecture
 
 * Use inside Autolith
 Load this repository's =scripts/bootstrap.lisp=, then
-=(asdf:load-system "lispterm/autolith")= in the existing image. Invoke
+=(asdf:load-system "common-term/autolith")= in the existing image. Invoke
 =/graphical-shell= to open a new shell, preserving the primary standard
 file descriptors and Lisp streams. The executable's =--autolith= path instead
 attaches its disposable process's descriptors 0/1/2 to a slave PTY, selects
 direct session style and calls actual Autolith =main=.
 
 Extension definitions are source-backed. Save durable changes in this
-repository and reload them. Private self-mutation replay of Lispterm is not
+repository and reload them. Private self-mutation replay of common-term is not
 advertised: the stock clean commit probe does not preload this extension.
 Hosted-main graphical checkpoints are explicitly refused before fork because
 restoring graphical main needs a supported re-entry arrangement. Separate
@@ -70,6 +76,14 @@ new-shell/stdio-preservation test on the requested backend. Run
 See [[file:docs/latency.org][latency measurement and controls]] for plain-terminal input and submission checks.
 
 [[file:docs/architecture.org][Architecture]] · [[file:docs/security.org][Security]] · [[file:THIRD_PARTY.org][Third-party provenance]]
+
+* Repositories
+Canonical source: [[https://forge.nogroup.group/tay/common-term][Forgejo]]. GitHub mirror:
+[[https://github.com/htayj/common-term][htayj/common-term]].
+
+The Forgejo-to-GitHub push mirror uses SSH, with push-on-commit synchronization
+and an eight-hour fallback. Issues, pull requests and repository settings are
+not mirrored.
 
 Project code is MIT licensed. Vendored notices apply to their respective
 files; the runtime font is a separately packaged dependency.

@@ -14,7 +14,7 @@
   (buffers nil) (generation 0) (event-sink (constantly nil))
   (resize-sink (constantly nil)) (redraw-p t) xkb
   (repeat-rate 25) (repeat-delay 600) repeat-key repeat-at
-  (title "Lispterm") (app-id "org.autolith.lispterm"))
+  (title "common-term") (app-id "org.autolith.common-term"))
 (defun protocol-pump (state &optional (timeout 0))
   (let ((wire (wayland-state-wire state)))
     (wire-poll wire timeout) (wire-dispatch wire)))
@@ -79,7 +79,7 @@
                              (max 1 (signed32 (bytes-u32 payload 0)))))
                      (when (= opcode 2) (protocol-scale state))))))
          (setf (gethash id (wayland-state-outputs state)) (list :global name :scale 1)))))))
-(defun protocol-open (&key name (width 800) (height 480) (title "Lispterm")
+(defun protocol-open (&key name (width 800) (height 480) (title "common-term")
                            (event-sink (constantly nil)) (resize-sink (constantly nil)))
   (let* ((wire (wire-connect name))
          (state (make-wayland-state :wire wire :width width :height height

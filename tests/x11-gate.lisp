@@ -19,7 +19,7 @@
       (progn
        (start-server)
        (let ((original (uiop:getenv "DISPLAY")))
-        (setf d (open-display :backend :x11 :display-name name :columns 60 :rows 20 :title "Lispterm X11 display gate"))
+         (setf d (open-display :backend :x11 :display-name name :columns 60 :rows 20))
         (assert (equal original (uiop:getenv "DISPLAY"))))
        (draw-cells d 1 2 (map 'vector (lambda (c) (make-cell :char c :fg #x83a598)) "Lispterm: native Lisp X11 display"))
        (draw-cells d 3 2 (map 'vector (lambda (c) (make-cell :char c :fg #xb8bb26)) "┌────────────────────────────────────┐"))
@@ -28,6 +28,7 @@
        (dotimes (i 16) (draw-cells d 8 (+ 2 (* i 3)) (vector (make-cell :char #\Space :bg (palette-color i) :width 2))))
        (set-cursor d 10 2 :visible t) (present d)
        (let ((id (princ-to-string (getf (display-metrics d) :window-id))))
+         (assert (string= "common-term" (string-trim '(#\Newline) (xd "getwindowname" id))))
         (xd "windowfocus" id)
         (xd "key" "a")
         (let ((ev (until-event (lambda (e) (and (key-event-p e) (eql #\a (key-event-key e)))))))
@@ -56,10 +57,11 @@
                (bytes (xclhb:get-image-reply-data reply))
                (count (/ (lispterm.display.x11::x-state-bpp s) 8))
                (pixel (loop for i below count sum (ash (aref bytes i) (* 8 (if (zerop (lispterm.display.x11::x-state-byte-order s)) i (- count i 1))))))
-               (expected (logior
-                          (lispterm.display.x11::channel-pixel #x1d (lispterm.display.x11::x-state-red-mask s))
-                          (lispterm.display.x11::channel-pixel #x20 (lispterm.display.x11::x-state-green-mask s))
-                          (lispterm.display.x11::channel-pixel #x21 (lispterm.display.x11::x-state-blue-mask s)))))
+                ;; CGA black in the server's native pixel format.
+                (expected (logior
+                           (lispterm.display.x11::channel-pixel 0 (lispterm.display.x11::x-state-red-mask s))
+                           (lispterm.display.x11::channel-pixel 0 (lispterm.display.x11::x-state-green-mask s))
+                           (lispterm.display.x11::channel-pixel 0 (lispterm.display.x11::x-state-blue-mask s)))))
           (assert (= pixel expected)))
          (let ((capture (or (uiop:getenv "LISPTERM_X11_CAPTURE")
                             (error "Set LISPTERM_X11_CAPTURE to the native capture path"))))

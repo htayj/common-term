@@ -10,14 +10,22 @@ Vendored cl-weave, xclhb and struct+ are registered by =scripts/bootstrap.lisp=.
 Builds and caches are local to ignored directories; loading ASDF opens no UI.
 
 =scripts/sbcl= bypasses system/user init and clears inherited ASDF registry
-variables before invoking the packaged wrapper. Its defaults are:
+variables before invoking the packaged wrapper. Preferred overrides are:
 
 | Variable | Default |
 |----------+---------|
-| LISPTERM_RUNTIME | checkout/.build/deps |
-| LISPTERM_SBCL | runtime/bin/sbcl |
-| LISPTERM_FONT | runtime/share/fonts/terminus/ter-u16n.otb |
-| LISPTERM_XKBCOMMON_LIBRARY | runtime/lib/libxkbcommon.so.0 |
+| COMTERM_RUNTIME | checkout/.build/deps |
+| COMTERM_SBCL | runtime/bin/sbcl |
+| COMTERM_FONT | runtime/share/fonts/terminus/ter-u16n.otb |
+| COMTERM_XKBCOMMON_LIBRARY | runtime/lib/libxkbcommon.so.0 |
+
+The launch wrappers prefer =COMTERM_*=, then accept the corresponding
+=LISPTERM_*= override. They export the resolved =LISPTERM_*= values for the
+Lisp implementation. Direct Lisp loads also accept =COMTERM_FONT= and
+=COMTERM_XKBCOMMON_LIBRARY=: a nonempty public value takes precedence over its
+legacy counterpart; an unset or empty public value falls back to it.
+=COMTERM_RUNTIME= and =COMTERM_SBCL= are wrapper preferences. Test and diagnostic
+variables retain their =LISPTERM_*= names; Nix derivation names are also unchanged.
 
 Use these variables for an equivalent externally provisioned runtime. The OTB
 parser reads bitmap Terminus OpenType files directly; it is not a general

@@ -264,7 +264,7 @@
           (test-shell "initial-rect" (format nil "screen_initial_rect_valid ~a" path) 0)
           (test-shell "full-region" (format nil "screen_full_region ~a '0,0 640x384'" path) 0)
           (test-shell "wrong-region" (format nil "screen_full_region ~a '0,0 639x384'" path) 1)))))
-  (let* ((node "{\"pid\":42,\"type\":\"floating_con\",\"app_id\":\"org.autolith.lispterm\",\"name\":\"Lispterm-screen-owned-run\"}")
+  (let* ((node "{\"pid\":42,\"type\":\"floating_con\",\"app_id\":\"org.autolith.common-term\",\"name\":\"Lispterm-screen-owned-run\"}")
          (one (fixture "node-one.json" (format nil "[~a]" node)))
          (two (fixture "node-two.json" (format nil "[~a,~a]" node node)))
          (none (fixture "node-none.json" "[]")))

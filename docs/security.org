@@ -1,6 +1,6 @@
 #+title: Security and process boundaries
 
-A terminal shell runs with the invoking user's authority. Lispterm is a local
+A terminal shell runs with the invoking user's authority. common-term is a local
 UI, not a sandbox or privilege boundary. Treat shell input and evaluated Lisp
 as executable code. In same-image Autolith mode, terminal, extension and agent
 share one heap and can inspect or redefine each other's definitions.

@@ -1,10 +1,12 @@
 #+title: Native Wayland backend
 
 * Architecture
-The =lispterm/display-wayland= ASDF system implements the backend contract in
+The internal =lispterm/display-wayland= ASDF system implements the backend contract in
 =display-api.org=. The terminal engine and CPU framebuffer are independent of
 Wayland. The backend owns its AF_UNIX connection, protocol object table, shared
 memory buffers and keyboard state on the display's caller thread.
+The default window title is =common-term=; the Wayland app-id is
+=org.autolith.common-term=.
 
 The transport is Common Lisp with CFFI bindings to Linux libc. It does not use
 libwayland callbacks, a foreign event-loop thread, Xlib, Xwayland, or =DISPLAY=.
@@ -60,8 +62,10 @@ delay on the caller's polling loop; emit at most one repeat per poll. Stop repea
 on release or keyboard focus loss.
 
 Load =libxkbcommon.so.0= through the platform loader, or set
-=LISPTERM_XKBCOMMON_LIBRARY= to its absolute path. The transport itself needs only
-libc, CFFI and Babel.
+=COMTERM_XKBCOMMON_LIBRARY= to its absolute path, including for direct Lisp loads.
+A nonempty public value takes precedence over =LISPTERM_XKBCOMMON_LIBRARY=;
+an unset or empty public value falls back to the legacy variable. The transport
+itself needs only libc, CFFI and Babel.
 
 * Lifecycle and limits
 Connecting is nonblocking. Opening has a five-second bounded roundtrip/configure handshake. Polling honours

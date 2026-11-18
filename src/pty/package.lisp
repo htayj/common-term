@@ -1,6 +1,7 @@
 ;;;; Linux x86-64 PTY transport. External programs use posix_spawnp, not Lisp fork.
 (require :sb-posix)
 (defpackage #:lispterm.pty
+  (:nicknames #:common-term.pty)
   (:use #:cl)
   (:export #:open-pty #:pty #:pty-master-fd #:pty-slave-name #:pty-process #:pty-open-p
            #:pty-read #:pty-write #:pty-resize #:pty-window-size #:pty-foreground-process-group

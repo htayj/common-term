@@ -1,5 +1,6 @@
 ;;;; Linux/x86-64 Wayland transport. No libwayland thread or callback trampoline.
 (defpackage #:lispterm.display.wayland
+  (:nicknames #:common-term.display.wayland)
   (:use #:cl)
   (:export #:wire-connect #:wire-close #:wire-send #:wire-poll #:wire-dispatch
            #:wayland-state #:wayland-state-configured-p))

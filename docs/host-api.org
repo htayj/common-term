@@ -1,9 +1,10 @@
 #+title: Session and host API
 
 * Entry points
-Package =LISPTERM= shadows CL:OPEN and CL:CLOSE.
+Use =COMMON-TERM= or =COMTERM=, nicknames of the legacy =LISPTERM= package.
+The host package shadows CL:OPEN and CL:CLOSE.
 
-- =open &key argv pty (backend :auto) display-name (title "Lispterm") (rows 24) (columns 80)=
+- =open &key argv pty (backend :auto) display-name (title "common-term") (rows 24) (columns 80)=
   returns a registered host after its display opens. =:backend= accepts =:auto=,
   =:x11=, =:wayland=. An explicit backend never falls back. Without =:pty=,
   spawn =argv= or the user's =$SHELL= on a new PTY. With =:pty=, adopt that
@@ -22,7 +23,7 @@ Package =LISPTERM= shadows CL:OPEN and CL:CLOSE.
 - =reopen host= queues window replacement, waiting at most five seconds for
   acknowledgement. Preserve the PTY and engine. After a window close or
   connection loss, continue reading output into the engine while detached.
-- =invalidate host= requests a fresh frame. Redefine =lispterm::render-session=
+- =invalidate host= requests a fresh frame. Redefine =common-term::render-session=
   in source, then invalidate to exercise the replacement on the next frame.
 - =send-input host input= queues UTF-8 text or octets; each request is at most
   65536 bytes. Resize/key/paste/focus events pass through the same owner.

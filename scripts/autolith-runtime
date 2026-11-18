@@ -7,10 +7,10 @@ runtime=/nix/store/m4594yh4fzx4lhfw0qfmgq7hzsmm8iaq-sbcl-with-packages/bin/sbcl
 [[ -x $runtime && -f $al/autolith.asd ]] || {
  echo 'Installed pinned Autolith 0.67.0 runtime is unavailable.' >&2; exit 1;
 }
-display_runtime=${LISPTERM_RUNTIME:-$root/.build/deps}
+display_runtime=${COMTERM_RUNTIME:-${LISPTERM_RUNTIME:-$root/.build/deps}}
 if [[ -d $display_runtime ]]; then
- export LISPTERM_FONT=${LISPTERM_FONT:-$display_runtime/share/fonts/terminus/ter-u16n.otb}
- export LISPTERM_XKBCOMMON_LIBRARY=${LISPTERM_XKBCOMMON_LIBRARY:-$display_runtime/lib/libxkbcommon.so.0}
+ export LISPTERM_FONT=${COMTERM_FONT:-${LISPTERM_FONT:-$display_runtime/share/fonts/terminus/ter-u16n.otb}}
+ export LISPTERM_XKBCOMMON_LIBRARY=${COMTERM_XKBCOMMON_LIBRARY:-${LISPTERM_XKBCOMMON_LIBRARY:-$display_runtime/lib/libxkbcommon.so.0}}
  export LISPTERM_GPU_RUNTIME="$display_runtime"
  export __EGL_VENDOR_LIBRARY_FILENAMES=$(realpath "$display_runtime/share/glvnd/egl_vendor.d/50_mesa.json")
  export LIBGL_DRIVERS_PATH="$display_runtime/lib/dri"

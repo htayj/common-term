@@ -55,7 +55,7 @@ and no user Quicklisp initialization is needed.
   derivation. The runtime resolves share/fonts/terminus/ter-u16n.otb through
   the pinned closure; distributors copying font data must preserve its notices.
 - libxkbcommon 1.13.2: separately packaged native keyboard dependency, MIT.
-  Upstream: https://xkbcommon.org/ . Lispterm uses its keyboard API through
+  Upstream: https://xkbcommon.org/ . common-term uses its keyboard API through
   CFFI; Wayland transport and protocol dispatch are local Lisp implementations.
 - The optional verification closure adds Xvfb, xdotool, ImageMagick, Sway,
   wtype, grim, Fastfetch and standard shell/process tools. They are separate

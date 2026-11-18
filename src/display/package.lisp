@@ -1,5 +1,5 @@
 (defpackage #:lispterm.display
- (:use #:cl) (:nicknames #:ltd)
+ (:use #:cl) (:nicknames #:ltd #:common-term.display)
  (:export #:open-display #:close-display #:reopen-display #:display-open-p #:poll-events
  #:draw-cells #:draw-frame #:set-cursor #:present #:set-title #:display-metrics
  #:make-cell #:cell #:cell-char #:cell-width #:cell-fg #:cell-bg #:cell-bold #:cell-inverse #:cell-underline
@@ -12,4 +12,4 @@
  #:synchronize-display-renderer #:renderer-unavailable
  #:cell-p #:key-event-p #:text-event-p #:resize-event-p #:close-event-p #:focus-event-p #:paste-event-p #:display-error-detail
  #:font-width #:font-height #:resize-display #:display-error #:display-open-failed #:display-connection-lost))
-(defpackage #:lispterm.display.x11 (:use #:cl #:lispterm.display))
+(defpackage #:lispterm.display.x11 (:use #:cl #:lispterm.display) (:nicknames #:common-term.display.x11))

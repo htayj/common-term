@@ -1,13 +1,13 @@
-#+title: Running Autolith inside lispterm
+#+title: Running Autolith inside common-term
 
 * Startup
 
-Run =bin/lispterm= for a fresh shell. Select =--backend wayland= for native
+Run =bin/common-term= (or =bin/comterm=) for a fresh shell. Select =--backend wayland= for native
 Wayland, =--backend x11= for X11, or =--backend auto= to select from the session
 environment. Pass =--display NAME=, =--title TEXT=, =--rows N=, and =--columns N=
 to configure the window. Pass a program and arguments after =--=.
 
-Run =bin/lispterm --autolith --backend wayland= to start Autolith in the same
+Run =bin/common-term --autolith --backend wayland= to start Autolith in the same
 SBCL image. Pass Autolith arguments after =--=. The standalone executable starts
 a fresh POSIX session, attaches a PTY slave to descriptors 0/1/2, rebuilds SBCL's
 standard and terminal streams, and sets =TERM=xterm-256color= and
@@ -25,17 +25,17 @@ is sufficient for shell mode; the installed Autolith closure is required for
 
 * Entry from a running Autolith
 
-Load =lispterm/autolith= through ASDF, then invoke =/graphical-shell=. This
+Load =common-term/autolith= through ASDF, then invoke =/graphical-shell=. This
 registered application command opens a new shell using the current heap without
 redirecting the primary application's stdio or starting a second Autolith main.
 Its metadata permits execution during a turn and declares shared primary
-terminal ownership. Inspect the host through =lispterm:status=.
+terminal ownership. Inspect the host through =common-term:status=.
 
-For explicit control, call =lispterm:open=, =lispterm:send-input=,
-=lispterm:status=, =lispterm:reopen=, and =lispterm:close=. To add a manually opened
+For explicit control, call =common-term:open=, =common-term:send-input=,
+=common-term:status=, =common-term:reopen=, and =common-term:close=. To add a manually opened
 host to an application's shutdown/checkpoint ownership, first call
-=lispterm.autolith:register-runtime= with that application's actual tool registry,
-then =lispterm.autolith:adopt-host=. Call =forget-host= when closing it permanently.
+=common-term.autolith:register-runtime= with that application's actual tool registry,
+then =common-term.autolith:adopt-host=. Call =forget-host= when closing it permanently.
 The graphical-shell command performs registration automatically.
 
 * Runtime ownership
@@ -85,7 +85,7 @@ bypasses the ownership contract.
 * Source tracking
 
 The default extension mode is source-backed. Edit/reload the repository to retain
-changes. Loading =lispterm= and redefining its functions in the shared heap does
+changes. Loading =common-term= and redefining its functions in the shared heap does
 not create Autolith private mutation journal entries.
 
 Launcher preloading alone does not make private =self.commit= persistence safe.

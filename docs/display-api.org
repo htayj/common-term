@@ -1,8 +1,9 @@
 #+title: Display interface
 
 * Ownership
-Package LISPTERM.DISPLAY (nickname LTD). Backends LISPTERM.DISPLAY.X11 and
-LISPTERM.DISPLAY.WAYLAND. Caller-thread-only operations. No terminal engine types.
+Package COMMON-TERM.DISPLAY (legacy names LISPTERM.DISPLAY and LTD).
+Backends COMMON-TERM.DISPLAY.X11 and COMMON-TERM.DISPLAY.WAYLAND.
+Caller-thread-only operations. No terminal engine types.
 The shared core owns renderer selection, damage tracking and glyph masks.
 GPU mode composes in OpenGL ES 3; CPU mode uses an ARGB32 framebuffer.
 Backends own transport, window handles and input translation.
@@ -67,7 +68,9 @@ its grid after a resize. Preserve no references to the old framebuffer.
 
 Use =font-width= and =font-height= for cell metrics. The shared renderer reads
 real OpenType bitmap glyphs from Terminus EBLC/EBDT tables and caches masks.
-Pass =:font-path= or set =LISPTERM_FONT= to a Terminus OTB file. The Nix default
+Pass =:font-path= or set =COMTERM_FONT= to a Terminus OTB file, including for
+direct Lisp loads. A nonempty =COMTERM_FONT= takes precedence over =LISPTERM_FONT=;
+an unset or empty public value falls back to the legacy variable. The Nix default
 searches the installed Terminus font at the requested pixel size. Box drawing
 uses the font's actual Unicode glyphs. Glyph shaping is outside this interface.
 

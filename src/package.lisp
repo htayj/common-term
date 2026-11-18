@@ -1,4 +1,5 @@
 (defpackage #:lispterm
+  (:nicknames #:common-term #:comterm)
   (:use #:cl)
   (:shadow #:open #:close)
   (:export #:open #:close #:main #:lispterm-error
@@ -7,11 +8,13 @@
            #:input-backpressure #:input-backpressure-pending #:input-backpressure-requested
            #:input-cancelled #:input-cancelled-bytes))
 (defpackage #:lispterm.engine.compat
+  (:nicknames #:common-term.engine.compat)
   (:use #:cl)
   (:export #:char-width #:decode-error #:lock #:make-lock #:with-lock-held
            #:octets-to-string #:string-to-octets #:parse-integer-or-nil
            #:split-string #:version-string))
 (defpackage #:lispterm.engine
+  (:nicknames #:common-term.engine)
   (:use #:cl)
   (:shadow #:make-screen #:resize #:rows #:columns)
   (:export #:make-screen #:feed #:resize #:rows #:columns #:cursor-row
@@ -23,6 +26,7 @@
 ;;; Opt-in stage tracing for latency measurement, shared by the display,
 ;;; session and window layers. Nothing is timed or allocated while the hook is NIL.
 (defpackage #:lispterm.trace
+  (:nicknames #:common-term.trace)
   (:use #:cl)
   (:export #:*trace* #:*trace-failure* #:trace-event #:monotonic-ns))
 (in-package #:lispterm.trace)

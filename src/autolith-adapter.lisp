@@ -1,5 +1,6 @@
 ;;;; Source-backed integration with the installed Autolith TOOL runtime protocol.
 (defpackage #:lispterm.autolith
+  (:nicknames #:common-term.autolith)
   (:use #:cl)
   (:export #:register-runtime #:adopt-host #:forget-host #:runtime-status
            #:checkpoint-unavailable #:*runtime* #:*automatic-runtime*

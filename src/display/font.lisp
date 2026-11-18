@@ -4,11 +4,14 @@
 
 (defun load-font (path size)
   (read-otb
-   (or path (uiop/os:getenv "LISPTERM_FONT")
+   (or path
+       (let ((public (uiop/os:getenv "COMTERM_FONT")))
+         (and public (plusp (length public)) public))
+       (uiop/os:getenv "LISPTERM_FONT")
        (first
         (directory
          (format nil "/nix/store/*-terminus-font-*/share/fonts/terminus/ter-u~dn.otb" size)))
-       (error "Set LISPTERM_FONT to a Terminus OpenType bitmap font"))))
+       (error "Set COMTERM_FONT (or LISPTERM_FONT) to a Terminus OpenType bitmap font"))))
 
 (defvar *loaded-font-sequence* 0
   "Process-local number of the last loaded-font evidence record attempted.")

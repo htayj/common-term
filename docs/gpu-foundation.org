@@ -1,13 +1,13 @@
 #+title: Common Lisp GPU renderer
 
 * Selection and dependencies
-Use =bin/lispterm --renderer auto|gpu|cpu= independently of
+Use =bin/common-term --renderer auto|gpu|cpu= independently of
 =--backend auto|x11|wayland=. The default =auto= requests hardware first.
 It selects CPU only for initialization unavailability after successful cleanup.
 An explicit =gpu= request propagates unavailability; cleanup errors propagate
 in either mode. Renderer choice does not change explicit backend selection.
 
-The =lispterm/gpu= system and =lispterm.gpu= package contain the renderer,
+The internal =lispterm/gpu= system and =common-term.gpu= package contain the renderer,
 CFFI driver bindings, shader generation and pure atlas/instance models.
 The display system depends on GPU, not the reverse. Loading the system creates
 no context. Renderer, bindings, shaders and GPU tests are Common Lisp;
@@ -78,7 +78,7 @@ until compositor release. Unsupported capabilities use GPU-readback SHM.
 =gpu-wayland-dmabuf= verifies public presentation with zero readbacks, exact
 compositor pixels, release/reuse, resize, reopen and checked close/retry.
 
-A headless Sway fixture using pixman can display pixels composed by Lispterm's
+A headless Sway fixture using pixman can display pixels composed by common-term's
 hardware GPU. That compositor choice is not proof of direct GPU buffer import.
 Direct-buffer verification requires a capable GLES compositor fixture.
 

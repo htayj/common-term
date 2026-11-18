@@ -1,6 +1,7 @@
 #+title: PTY interface, frozen Batch A
 
-Package LISPTERM.PTY. Linux SBCL; dependencies SB-POSIX and CFFI where needed.
+Package COMMON-TERM.PTY (legacy name LISPTERM.PTY). Linux SBCL;
+dependencies SB-POSIX and CFFI where needed.
 
 - open-pty &key (rows 24) (columns 80) returns a PTY.
 - pty-master-fd, pty-slave-name, pty-process, pty-open-p are accessors.

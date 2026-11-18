@@ -15,11 +15,15 @@
   X11 keyboard/window events.
 - =lispterm/display-wayland=: native Lisp/CFFI Unix transport and fd passing,
   xdg-shell, SHM buffers, scale handling and xkbcommon keyboard state.
-- =lispterm=: sessions, rendering projection, owner-thread window loop and
+- =common-term=: sessions, rendering projection, owner-thread window loop and
   public host API. The session owns its PTY and grid independently of a view.
-- =lispterm/launcher=: shell executable and same-heap Autolith main entry.
-- =lispterm/autolith=: extension-owned registered TOOL runtime and application
+- =common-term/launcher=: shell executable and same-heap Autolith main entry.
+- =common-term/autolith=: extension-owned registered TOOL runtime and application
   command; stock Autolith telemetry and application methods are not replaced.
+
+The =common-term= entry systems wrap the corresponding =lispterm= systems.
+Internal layer system names above and =lispterm.asd= retain their legacy names;
+=common-term/tests= selects the existing test system.
 
 * Ownership and recovery
 One window-owner thread serializes backend access, framebuffer presentation,

@@ -88,7 +88,7 @@ double_size_output_valid() {
     "$jq" -e --argjson s "$run_scale" 'length==1 and .[0].name=="HEADLESS-1" and .[0].scale==$s and .[0].active==true and .[0].rect=={"x":0,"y":0,"width":1280,"height":800}' "$1" >/dev/null
 }
 double_size_owned_node() {
-    "$jq" -ce --argjson pid "$2" '[.. | objects | select(.pid?==$pid and .type?=="floating_con")] | if length==1 and .[0].app_id=="org.autolith.lispterm" and .[0].name=="Lispterm-double-size-owned-run" then .[0] else error("ambiguous/missing/foreign owned surface") end' "$1"
+    "$jq" -ce --argjson pid "$2" '[.. | objects | select(.pid?==$pid and .type?=="floating_con")] | if length==1 and .[0].app_id=="org.autolith.common-term" and .[0].name=="Lispterm-double-size-owned-run" then .[0] else error("ambiguous/missing/foreign owned surface") end' "$1"
 }
 double_size_rect_valid() {
     "$jq" -e --argjson width "$2" --argjson height "$3" '

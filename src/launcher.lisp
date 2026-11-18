@@ -37,7 +37,7 @@
            (setf (getf options :columns) (positive argument)))
           ((string= argument "--") (setf argv arguments arguments nil))
           ((member argument '("-h" "--help") :test #'string=)
-           (format t "Usage: lispterm [--autolith] [--backend auto|x11|wayland]~%                [--renderer auto|gpu|cpu]~%                [--display NAME] [--title TITLE] [--rows N] [--columns N]~%                [-- PROGRAM ARG...]~%")
+           (format t "Usage: common-term [--autolith] [--backend auto|x11|wayland]~%                [--renderer auto|gpu|cpu]~%                [--display NAME] [--title TITLE] [--rows N] [--columns N]~%                [-- PROGRAM ARG...]~%")
            (return-from launcher-options (values nil nil :help)))
           (t (error "Unknown option ~S; use -- before program arguments" argument)))))
     (values options autolith-p argv)))
@@ -111,7 +111,7 @@ user closed and a child that exited record neither."
                           errors)))
 
 (defun failure-line (entry)
-  (format nil "lispterm: ~(~A~) error: ~A" (getf entry :operation) (getf entry :message)))
+  (format nil "common-term: ~(~A~) error: ~A" (getf entry :operation) (getf entry :message)))
 
 (defun run-shell (options argv)
   "Run ARGV in a window until it exits or the window goes away, then close the
@@ -134,7 +134,7 @@ close errors on *ERROR-OUTPUT*, otherwise 0."
              (dolist (entry failures)
                (format *error-output* "~A~%" (failure-line entry)))
              (when close-error
-               (format *error-output* "lispterm: close error: ~A~%" close-error))
+               (format *error-output* "common-term: close error: ~A~%" close-error))
              (finish-output *error-output*)
              (if (or failures close-error) 1 0)))
       ;; A host whose display cannot close keeps its PTY and child. They are

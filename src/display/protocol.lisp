@@ -158,7 +158,7 @@
     (assert-owner display))
   (setf (display-framebuffer-storage display) pixels))
 
-(defun open-display (&key (backend :auto) display-name (title "Lispterm")
+(defun open-display (&key (backend :auto) display-name (title "common-term")
                           (columns 80) (rows 24) font-path (font-size 16)
                           (renderer :auto))
   (unless (member renderer '(:cpu :gpu :auto))

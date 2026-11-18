@@ -3,7 +3,9 @@
 (defvar *xkb-library* nil)
 (defun ensure-xkb-library ()
   (or *xkb-library*
-      (let ((path (uiop:getenv "LISPTERM_XKBCOMMON_LIBRARY")))
+      (let ((path (or (let ((public (uiop:getenv "COMTERM_XKBCOMMON_LIBRARY")))
+                        (and public (plusp (length public)) public))
+                      (uiop:getenv "LISPTERM_XKBCOMMON_LIBRARY"))))
         (setf *xkb-library*
               (if (and path (plusp (length path)))
                   (cffi:load-foreign-library path)

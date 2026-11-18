@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+autolith=0
+for argument in "$@"; do
+ [[ $argument != -- ]] || break
+ [[ $argument != --autolith ]] || autolith=1
+done
+if ((autolith)); then
+ # A fresh session is required before TIOCSCTTY. --fork also handles invocation
+ # from shells/UIOP that made us a process-group leader. Wait preserves status.
+ exec setsid --fork --wait "$root/scripts/autolith-runtime" \
+  --non-interactive --load "$root/scripts/bootstrap.lisp" \
+  --eval '(asdf:load-system "common-term/launcher")' \
+  --eval '(common-term:main (uiop:command-line-arguments))' \
+  --end-toplevel-options "$@"
+else
+ export LISPTERM_SBCL=${COMTERM_SBCL:-${LISPTERM_SBCL:-${COMTERM_RUNTIME:-${LISPTERM_RUNTIME:-$root/.build/deps}}/bin/sbcl}}
+ exec "$root/scripts/sbcl" --non-interactive \
+  --load "$root/scripts/bootstrap.lisp" \
+  --eval '(asdf:load-system "common-term/launcher")' \
+  --eval '(common-term:main (uiop:command-line-arguments))' \
+  --end-toplevel-options "$@"
+fi

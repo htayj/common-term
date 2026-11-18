@@ -6,4 +6,5 @@
   (dolist (name '("cl-weave" "xclhb" "struct-plus"))
     (let ((directory (merge-pathnames (format nil "vendor/~A/" name) root)))
       (when (probe-file directory) (pushnew directory asdf:*central-registry* :test #'equal))))
-  (asdf:load-asd (merge-pathnames "lispterm.asd" root)))
+  (asdf:load-asd (merge-pathnames "lispterm.asd" root))
+(asdf:load-asd (merge-pathnames "common-term.asd" root)))

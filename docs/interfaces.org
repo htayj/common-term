@@ -2,12 +2,12 @@
 
 ASDF load order: lispterm/engine (compat, vendored engine, adapter), lispterm/pty,
 lispterm/display (shared renderer/protocol), lispterm/display-x11 and
-lispterm/display-wayland (independent backend extensions), then lispterm
-(session and public entry points). lispterm/tests loads the upstream terminal
-suite and local engine adapter tests. Later layer files are declared only when
-they exist; their owners must extend lispterm.asd with the same system names.
+lispterm/display-wayland (independent backend extensions), then common-term
+(session and public entry points, via lispterm). common-term/tests loads the
+upstream terminal suite and local engine adapter tests. Internal layer systems
+are defined in lispterm.asd; common-term.asd provides the canonical entry aliases.
 
-Engine package LISPTERM.ENGINE, independent of display and PTY:
+Engine package COMMON-TERM.ENGINE (legacy name LISPTERM.ENGINE), independent of display and PTY:
 make-screen &key columns rows; feed screen octets; resize screen rows columns;
 rows, columns, cursor-row, cursor-column; cell-at screen row column;
 cell-character, cell-width, cell-foreground, cell-background, cell-bold-p,
@@ -16,7 +16,7 @@ dirty-p screen and clear-damage screen. Adapter exposes engine cells read-only;
 renderers copy the values into display cells. No backend objects enter engine.
 
 * Reproducible foundation tests
-Run scripts/bootstrap-deps, then set LISPTERM_SBCL=$PWD/.build/deps/bin/sbcl.
+Run scripts/bootstrap-deps, then set COMTERM_SBCL=$PWD/.build/deps/bin/sbcl.
 Run tests/verify.sh deps, tests/verify.sh unit, tests/verify.sh pty-spike.
 All launcher calls pass --no-userinit --no-sysinit. bootstrap.lisp registers
 only this repository and its named vendor directories; Nix supplies compiled

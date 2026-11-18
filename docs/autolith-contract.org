@@ -12,7 +12,7 @@ probed ASDF discovery, without loading/building Autolith or changing its live UI
 * Standalone graphical entry
 
 1. Start one SBCL process with the packaged dependency environment. Load
-   Autolith definitions and lispterm before calling =autolith::main=.
+   Autolith definitions and common-term before calling =autolith::main=.
 2. On that process's main thread, create a PTY master/slave pair. Set its
    dimensions before terminal construction. Arrange a controlling terminal and
    foreground process group in this dedicated process, with checked errors;
@@ -90,7 +90,7 @@ Use an extension-owned subclass of =autolith::tool= as the runtime owner,
 registered in the active application's tool registry. Specialize only on
 that subclass, never on Autolith's general application/tool classes:
 
-- =tool-runtime-identity=: return the shared lispterm runtime identity.
+- =tool-runtime-identity=: return the shared common-term runtime identity.
 - =tool-runtime-close=: cooperatively stop and join every extension thread,
   close display connections, and retain a parent-only resume description.
   Retain the live parent's PTY master/session while stopping its reader;
@@ -136,10 +136,12 @@ ordinary evaluation/redefinition in package LISPTERM do not create Autolith
 self-mutation journal entries. An explicit self.redefine with package LISPTERM
 can inspect/change an already loaded package, but that does not establish safe
 persistence. Use repository edits/reloads for durable extension development.
+The =COMMON-TERM= and =COMTERM= package nicknames address the same definitions;
+the internal Autolith tool namespace retains its legacy name.
 
 Private replay precedes user init
 (AL/src/application/runtime.lisp:943-975; AL/src/startup/user-init.lisp:65-75).
-Therefore loading lispterm only from init cannot replay LISPTERM mutations.
+Therefore loading common-term only from init cannot replay LISPTERM mutations.
 The graphical launcher must load extension definitions before main to make
 startup replay possible. It must not open windows while merely loading ASDF.
 
@@ -176,7 +178,7 @@ loads :autolith, then invokes main. In this Nix installation .qlot/setup.lisp
 is a small ASDF adapter, not a network Quicklisp installer; it adjusts the AL
 output translation using AUTOLITH_NIX_SOURCE_ROOT and AUTOLITH_ASDF_CACHE.
 A custom graphical source bootstrap can reproduce those loading steps and
-insert lispterm before main; do not load bin/autolith-active wholesale because
+insert common-term before main; do not load bin/autolith-active wholesale because
 it immediately calls main. The stock core's toplevel also immediately calls
 main (AL/src/startup/active-image.lisp:121-140).
 

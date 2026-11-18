@@ -1,4 +1,5 @@
 (defpackage #:lispterm.gpu
+  (:nicknames #:common-term.gpu)
   (:use #:cl)
   (:export #:gpu-unavailable #:gpu-operation #:gpu-detail #:unavailable
            #:open-context #:close-context #:context-info #:assert-context-owner

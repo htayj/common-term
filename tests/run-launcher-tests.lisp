@@ -63,7 +63,7 @@
            (null (lispterm::display-failures (cddr ring))))
     (check :no-errors-no-failures (null (lispterm::display-failures nil)))
     (check :failure-line
-           (equal "lispterm: display error: connection lost"
+           (equal "common-term: display error: connection lost"
                   (lispterm::failure-line (first failures))))))
 
 ;;; Transport: the real host, PTY and child on a fake display transport.
@@ -126,18 +126,18 @@ Return the exit code, the launcher's stderr text, and whether the child is gone.
            (multiple-value-bind (code errors gone-p) (run-fake-shell directory :display-error :poll #'lost)
              (check :display-error-exits-nonzero (eql 1 code))
              (check :display-error-is-printed
-                    (search "lispterm: display error: Display: Injected transport loss" errors) errors)
+                    (search "common-term: display error: Display: Injected transport loss" errors) errors)
              (check :display-error-reaps-child gone-p))
            ;; The display cannot close either, and the child ignores the hangup.
            (multiple-value-bind (code errors gone-p)
                (run-fake-shell directory :close-failure :poll #'lost :fail-close t :stubborn t)
              (check :close-failure-exits-nonzero (eql 1 code))
              (check :close-failure-prints-display-error
-                    (search "lispterm: display error: Display: Injected transport loss" errors) errors)
+                    (search "common-term: display error: Display: Injected transport loss" errors) errors)
              (check :close-failure-prints-display-close-error
-                    (search "lispterm: display-close error: Display: Injected native close failure" errors)
+                    (search "common-term: display-close error: Display: Injected native close failure" errors)
                     errors)
-             (check :close-failure-prints-close-error (search "lispterm: close error: " errors) errors)
+             (check :close-failure-prints-close-error (search "common-term: close error: " errors) errors)
              (check :close-failure-reaps-stubborn-child gone-p))
            (check :no-host-left (null (lispterm:status))))
       (uiop:delete-directory-tree directory :validate t))))
@@ -151,7 +151,7 @@ Return the exit code, the launcher's stderr text, and whether the child is gone.
            (list* (format nil "SWAYSOCK=~A" (uiop:getenv "SWAYSOCK")) "swaymsg" arguments)
            :ignore-error-status t))
 
-(defun run-lispterm (directory name event &key stubborn)
+(defun run-lispterm (directory name event &key stubborn (launcher "bin/lispterm"))
   "Start bin/lispterm, wait for its window and child, call EVENT with the window
 title, and wait for the exit. Return exit code, stderr text, and child liveness."
   (let* ((title (format nil "launcher-~(~A~)-~D" name (sb-posix:getpid)))
@@ -159,7 +159,7 @@ title, and wait for the exit. Return exit code, stderr text, and child liveness.
          (stdout (merge-pathnames (format nil "~(~A~).stdout" name) directory))
          (stderr (merge-pathnames (format nil "~(~A~).stderr" name) directory))
          (process (uiop:launch-program
-                   (append (list (namestring (merge-pathnames "bin/lispterm" *root*))
+                    (append (list (namestring (merge-pathnames launcher *root*))
                                  "--backend" "wayland" "--title" title "--rows" "10" "--columns" "40" "--")
                            (child-argv pidfile :stubborn stubborn))
                    :input nil :output stdout :error-output stderr))
@@ -198,16 +198,20 @@ title, and wait for the exit. Return exit code, stderr text, and child liveness.
            (lambda (directory)
              (multiple-value-bind (code errors live-p)
                  (run-lispterm directory :window-close
-                               (lambda (title) (swaymsg (format nil "[title=\"~A\"] kill" title))))
-               (check :window-close-exits-zero (eql 0 code))
-               (check :window-close-prints-no-error (not (search "lispterm:" errors)) errors)
+                                (lambda (title)
+                                  (check :common-term-app-id
+                                         (search "org.autolith.common-term" (swaymsg "-t" "get_tree" "-r")))
+                                  (swaymsg (format nil "[title=\"~A\"] kill" title)))
+                                :launcher "bin/common-term")
+                (check :window-close-exits-zero (eql 0 code))
+                (check :window-close-prints-no-error (not (search "common-term:" errors)) errors)
                (check :window-close-child-gone (not live-p)))
              (multiple-value-bind (code errors live-p)
                  (run-lispterm directory :disconnect
                                (lambda (title) (declare (ignore title)) (swaymsg "exit"))
                                :stubborn t)
                (check :disconnect-exits-nonzero (and (integerp code) (plusp code)) code)
-               (check :disconnect-prints-display-error (search "lispterm: display error: " errors) errors)
+               (check :disconnect-prints-display-error (search "common-term: display error: " errors) errors)
                (check :disconnect-child-gone (not live-p))))))
 
 (handler-case
