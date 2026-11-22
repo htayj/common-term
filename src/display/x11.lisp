@@ -2,6 +2,11 @@
 
 (in-package #:lispterm.display.x11)
 
+(defconstant +primary-paste-limit+ (* 1024 1024))
+
+(defstruct primary-paste
+  time target deadline reading-p)
+
 (defstruct x-state
   client
   window
@@ -15,7 +20,8 @@
   blue-mask
   events
   refreshing
-  pending-keys geometry-next geometry-query-p configure-sequence)
+  pending-keys geometry-next geometry-query-p configure-sequence
+  paste-property utf8-string primary-paste)
 
 (defun queue-event (d event) (push event (x-state-events (display-backend-state d))))
 
@@ -43,6 +49,71 @@
   (translate-keysyms (cdr (assoc keycode (xclhb:client-keycode-keysym-table client)))
                     modifiers))
 
+(defun finish-primary-paste (state)
+  (setf (x-state-primary-paste state) nil)
+  (let ((client (x-state-client state)))
+    (xclhb:delete-property client (x-state-window state) (x-state-paste-property state))
+    (xclhb:flush client)))
+
+(defun convert-primary (state paste target)
+  (setf (primary-paste-target paste) target)
+  (let ((client (x-state-client state)))
+    (xclhb:convert-selection client (x-state-window state) xclhb:+atom--primary+
+                             target (x-state-paste-property state) (primary-paste-time paste))
+    (xclhb:flush client)))
+
+(defun request-primary-paste (state time)
+  ;; Coalesce repeated Shift+Insert while one conversion is outstanding.
+  (unless (x-state-primary-paste state)
+    (let ((paste (make-primary-paste :time time
+                                     :deadline (+ (get-internal-real-time)
+                                                  (* 5 internal-time-units-per-second)))))
+      (xclhb:delete-property (x-state-client state) (x-state-window state)
+                             (x-state-paste-property state))
+      (setf (x-state-primary-paste state) paste)
+      (convert-primary state paste (x-state-utf8-string state)))))
+
+(defun primary-paste-text (reply target)
+  ;; A different type (including INCR), a partial read, or invalid text
+  ;; is not a paste. X11 STRING is ISO-8859-1, not UTF-8.
+  (when (and (= target (xclhb:get-property-reply-type reply))
+             (= 8 (xclhb:get-property-reply-format reply))
+             (zerop (xclhb:get-property-reply-bytes-after reply)))
+    (let ((bytes (xclhb:get-property-reply-value reply)))
+      (when (<= 1 (length bytes) +primary-paste-limit+)
+        (handler-case
+            (babel:octets-to-string bytes :encoding
+                                   (if (= target xclhb:+atom--string+) :latin-1 :utf-8))
+          (babel:character-decoding-error () nil))))))
+
+(defun read-primary-paste (display state paste)
+  (let ((client (x-state-client state))
+        (target (primary-paste-target paste)))
+    (setf (primary-paste-reading-p paste) t)
+    (xclhb:get-property client
+      (lambda (reply)
+        (let ((text (primary-paste-text reply target)))
+          (finish-primary-paste state)
+          (when text (queue-event display (make-paste-event :text text)))))
+      0 (x-state-window state) (x-state-paste-property state) target
+      0 (/ +primary-paste-limit+ 4))
+    (xclhb:flush client)))
+
+(defun selection-notify (display event)
+  (let* ((state (display-backend-state display))
+         (paste (x-state-primary-paste state))
+         (property (xclhb:selection-notify-event-property event)))
+    (when (and paste (not (primary-paste-reading-p paste))
+               (= (x-state-window state) (xclhb:selection-notify-event-requestor event))
+               (= xclhb:+atom--primary+ (xclhb:selection-notify-event-selection event))
+               (= (primary-paste-time paste) (xclhb:selection-notify-event-time event))
+               (= (primary-paste-target paste) (xclhb:selection-notify-event-target event)))
+      (cond ((= property (x-state-paste-property state)) (read-primary-paste display state paste))
+            ((zerop property)
+             (if (= (primary-paste-target paste) (x-state-utf8-string state))
+                 (convert-primary state paste xclhb:+atom--string+)
+                 (finish-primary-paste state)))))))
+
 (defun dispatch-key (display event)
   (let* ((state (display-backend-state display)) (client (x-state-client state)))
     (if (x-state-refreshing state)
@@ -50,13 +121,16 @@
         (let* ((modifiers (xclhb:key-press-event-state event))
                (key (translate-key client (xclhb:key-press-event-detail event) modifiers)))
           (when key
-            (queue-event display
-             (make-key-event :key key
-              :text (or (lispterm.display::keypad-text key) (when (characterp key) (string key)))
-              :modifiers
-              (loop for (bit name) in '((0 :shift) (2 :control) (3 :alt) (6 :super))
-                    when (logbitp bit modifiers)
-                    collect name))))))))
+            (let ((semantic-modifiers
+                    (loop for (bit name) in '((0 :shift) (2 :control) (3 :alt) (6 :super))
+                          when (logbitp bit modifiers)
+                          collect name)))
+              (if (and (eq key :insert) (equal semantic-modifiers '(:shift)))
+                  (request-primary-paste state (xclhb:key-press-event-time event))
+                  (queue-event display
+                   (make-key-event :key key
+                    :text (or (lispterm.display::keypad-text key) (when (characterp key) (string key)))
+                    :modifiers semantic-modifiers)))))))))
 
 (defun refresh-keymap (display)
   (let ((state (display-backend-state display)))
@@ -68,6 +142,23 @@
         (setf (x-state-pending-keys state) nil)
         (dolist (event pending) (dispatch-key display event))))))
 
+(defun set-window-identity (display client window)
+  (let* ((name (display-window-class display))
+         (class (babel:string-to-octets name :encoding :latin-1))
+         (width (1+ (length class)))
+         (value (make-array (* 2 width) :element-type '(unsigned-byte 8) :initial-element 0))
+         (hostname (babel:string-to-octets (machine-instance) :encoding :latin-1)))
+    (when (find 0 class)
+      (error 'display-error :detail "Window class must not contain NUL"))
+    (replace value class)
+    (replace value class :start1 width)
+    (xclhb:change-property client xclhb:+prop-mode--replace+ window xclhb:+atom--wm-class+
+                           xclhb:+atom--string+ 8 (length value) value)
+    (xclhb:change-property client xclhb:+prop-mode--replace+ window (atom-id client "_NET_WM_PID")
+                           xclhb:+atom--cardinal+ 32 1
+                           (xclhb:card32->card8-vector (sb-unix:unix-getpid)))
+    (xclhb:change-property client xclhb:+prop-mode--replace+ window xclhb:+atom--wm-client-machine+
+                           xclhb:+atom--string+ 8 (length hostname) hostname)))
 (defmethod backend-open ((backend (eql :x11)) d)
   (let* ((c (or (xclhb:x-connect nil (display-name d)) (error "X connection rejected")))
          (state (setf (display-backend-state d) (make-x-state :client c)))
@@ -102,6 +193,9 @@
                    (make-list 3 :initial-element 0)))
     (apply #'xclhb:create-gc c gc win 0 (make-list 23 :initial-element 0))
     (xclhb:set-keycode-keysym-table c)
+    (setf (x-state-paste-property state) (atom-id c "_COMMON_TERM_PRIMARY")
+          (x-state-utf8-string state) (atom-id c "UTF8_STRING"))
+    (xclhb:set-event-handler c 31 (lambda (e) (selection-notify d e)))
     (xclhb:set-event-handler c 2 (lambda (e) (dispatch-key d e)))
     (xclhb:set-event-handler c 12
                              (lambda (e)
@@ -148,6 +242,7 @@
                                  (when (= delete (aref (xclhb:client-message-event-data e) 0))
                                    (queue-event d (make-close-event))))))
     (backend-set-title backend d (display-title d))
+    (set-window-identity d c win)
     (xclhb:map-window c win)
     (xclhb:flush c)))
 
@@ -176,6 +271,11 @@
           (c (x-state-client s))
           (stream (xclhb:client-stream c))
           (deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+       ;; An unresponsive owner must not permanently disable PRIMARY paste.
+       (let ((paste (x-state-primary-paste s)))
+         (when (and paste (not (primary-paste-reading-p paste))
+                    (>= (get-internal-real-time) (primary-paste-deadline paste)))
+           (finish-primary-paste s)))
      (loop do (loop while (or (listen stream)
                               (sb-sys:wait-until-fd-usable (sb-sys:fd-stream-fd stream) :input
                                                            0))

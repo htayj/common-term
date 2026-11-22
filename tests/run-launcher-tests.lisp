@@ -52,6 +52,19 @@
 ;;; Pure: which recorded errors mean that the window broke.
 
 (defun pure-tests ()
+  (check :default-window-class
+         (equal "common-term" (getf (lispterm::launcher-options nil) :window-class)))
+  (multiple-value-bind (options autolith argv)
+      (lispterm::launcher-options
+       (list "--backend" "wayland" "--class" "ct-custom" "--" "cmd" "--class" "child"))
+    (declare (ignore autolith))
+    (check :wayland-accepts-window-class
+           (and (eq (getf options :backend) :wayland)
+                (equal (getf options :window-class) "ct-custom")))
+    (check :child-class-argument-passthrough (equal argv '("cmd" "--class" "child"))))
+  (check :missing-window-class-value
+         (handler-case (progn (lispterm::launcher-options (list "--class")) nil)
+           (error () t)))
   (let* ((ring (list (list :time 4 :operation :display-close :message "close failed")
                      (list :time 3 :operation :display :message "connection lost")
                      (list :time 2 :operation :pty :message "read failed")

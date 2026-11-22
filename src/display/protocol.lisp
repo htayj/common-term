@@ -22,6 +22,7 @@
 (defstruct display
   (epoch (next-display-epoch))
   backend backend-state name title configuration font framebuffer-storage damage
+  (window-class "common-term")
   (renderer-request :cpu) (renderer-kind :cpu) renderer-context renderer-state
   renderer-fallback-reason (renderer-pending-p nil) (readback-pending-p nil)
   (process-id (sb-unix:unix-getpid))
@@ -159,6 +160,7 @@
   (setf (display-framebuffer-storage display) pixels))
 
 (defun open-display (&key (backend :auto) display-name (title "common-term")
+                          (window-class "common-term")
                           (columns 80) (rows 24) font-path (font-size 16)
                           (renderer :auto))
   (unless (member renderer '(:cpu :gpu :auto))
@@ -171,9 +173,11 @@
          (display
            (make-display
             :backend backend :name display-name :title title :renderer-request renderer
+            :window-class window-class
             :columns columns :rows rows :owner sb-thread:*current-thread*
             :configuration (list :backend backend :display-name display-name
                                  :title title :columns columns :rows rows
+                                 :window-class window-class
                                  :font-path font-path :font-size font-size :renderer renderer))))
     (handler-case
         (progn

@@ -53,7 +53,8 @@ when the owner is supervising a display retained by failed startup."
       (error 'host-error :operation :join :host host :detail "Native display cleanup is pending"))
     (sb-thread:with-mutex ((host-lock host)) (setf (host-thread host) nil))))
 
-(defun open (&key argv pty (backend :auto) (renderer :auto) display-name (title "common-term") (rows 24) (columns 80))
+(defun open (&key argv pty (backend :auto) (renderer :auto) display-name (title "common-term")
+                  (window-class "common-term") (rows 24) (columns 80))
   "Open a graphical PTY host. Supplying PTY adopts it without spawning a child."
   (unless (member backend '(:auto :x11 :wayland))
     (error 'host-error :operation :open :detail "Backend must be :auto, :x11, or :wayland"))
@@ -71,7 +72,9 @@ when the owner is supervising a display retained by failed startup."
          (pty (or pty (lispterm.pty:open-pty :rows rows :columns columns)))
          (host (%make-host :id (sb-thread:with-mutex (*hosts-lock*) (incf *next-host-id*))
                           :session (make-session pty rows columns)
-                          :configuration (list :backend backend :renderer renderer :display-name display-name :title title)))
+                          :configuration (list :backend backend :renderer renderer
+                                               :display-name display-name :title title
+                                               :window-class window-class)))
          (startup (make-host-command
                    :operation :startup
                    :argument (when created-p
