@@ -114,10 +114,10 @@
 (defun send-mode (command)
   (check (string= "sent" (child-command command)) "unexpected child mode acknowledgement"))
 
-(defun hold-request (command before target)
+(defun hold-request (command before target &key probe)
   (let ((old (pixels before)) (wanted (pixels target)))
     (arm)
-    (send-mode command)
+    (send-mode (or probe command))
     (let ((request (await "redirected ConfigureRequest"
                           (lambda () (xclhb:process-input *client*) (first *requests*)))))
       (check (= +width-height-mask+
@@ -137,8 +137,17 @@
           (check (null *notifies*) "saw ConfigureNotify while the request was held: ~S" *notifies*)
           (check (equal before observed)
                  "HELD-ORDER ~A: X still ~S pixels, expected tty ~S, got ~S" command actual before observed)
+          ;; The child polls the raw PTY without consuming any bytes. Even a
+          ;; partial reply is a failure while we still own the trapped request.
+          (when probe
+            (let ((state (child-command "cpr-ready")))
+              (check (not (string= "readable" state))
+                     "HELD-CPR ~A: reply became readable before ConfigureRequest release (X ~S, tty ~S)"
+                     command actual observed)
+              (check (string= "pending" state) "unexpected CPR readiness result ~S" state)))
           (when (>= (get-internal-real-time) end)
             (note "held ~A; actual pixels ~S, tty ~S" command actual observed)
+            (when probe (note "held ~A: no CPR readable before release" command))
             (return)))
         (sleep 0.005)))))
 
@@ -157,15 +166,30 @@
                     (member wanted *notifies* :test #'equal))))))
   (note "PASS ~A: genuine ConfigureNotify, X ~S pixels and tty ~S" label (pixels target) target))
 
+(defun read-cpr-sample ()
+  (let ((sample (child-command "sample-cpr")))
+    (unless (string= sample "pending") sample)))
+
+(defun check-cpr (label sample cursor grid)
+  (destructuring-bind (row col) grid
+    (check (string= sample (format nil "~A ~D ~D" cursor row col))
+           "~A: expected CPR ~A with fresh tty ~S, got ~S" label cursor grid sample)))
+
+(defun release-and-check-cpr (command before target)
+  (configure (pixels target))
+  ;; Read the queued CPR and its child-side ioctl result before waiting for
+  ;; geometry convergence, otherwise the convergence wait can mask a race.
+  (let ((sample (await "CPR after ConfigureRequest release" #'read-cpr-sample)))
+    (check-cpr command sample "1;1" target)
+    (converge (format nil "held DECCOLM ~A, then release" command) before target)
+    (note "PASS CPR ~A: reply ~A, fresh tty ~S, X ~S pixels" command "1;1" target (actual-pixels))))
 (defun redirected-checks ()
   (let ((normal '(24 80)) (wide '(24 132)) (adjusted '(26 96)))
-    (hold-request "set" normal wide)
+    (hold-request "set" normal wide :probe "set-cpr")
     ;; X11 applies requests from the redirect owner directly.
-    (configure (pixels wide))
-    (converge "held DECCOLM set, then release" normal wide)
-    (hold-request "reset" wide normal)
-    (configure (pixels normal))
-    (converge "held DECCOLM reset, then release" wide normal)
+    (release-and-check-cpr "set" normal wide)
+    (hold-request "reset" wide normal :probe "reset-cpr")
+    (release-and-check-cpr "reset" wide normal)
     (hold-request "set" normal wide)
     (configure (pixels adjusted))
     (converge "redirect owner adjusts rows and columns" normal adjusted)
@@ -176,26 +200,30 @@
 ;; Use a fresh terminal so refusal starts with a fresh DECCOLM transition.
 (defun refusal-checks ()
   (let ((normal '(24 80)) (wide '(24 132)))
-    (hold-request "set" normal wide)
-    ;; Drop the request with no synthetic notify. Exercise a quiet interval
-    ;; longer than the proposed short timeout, without using it as a dispatch
-    ;; timestamp or asserting the terminal's internal timeout implementation.
-    (let ((end (+ (get-internal-real-time) (* 2 internal-time-units-per-second))))
+    (hold-request "set" normal wide :probe "refusal-cpr")
+    ;; Drop the configure without a synthetic event. CUP to 1;100 was in
+    ;; the original write, so a deferred reply from a prematurely wide grid
+    ;; would return column 100 rather than clamping to 80 after rollback.
+    (let ((end (+ (get-internal-real-time) (* 2 internal-time-units-per-second)))
+          (sample nil))
       (loop
-        (let ((observed (tty-size)) (actual (actual-pixels)))
-          (check (and (equal normal observed) (equal (pixels normal) actual)
-                      (null *notifies*))
+        (unless sample
+          (setf sample (read-cpr-sample))
+          (when sample (check-cpr "timeout rollback" sample "1;80" normal)))
+        (let* ((observed (tty-size)) (actual (actual-pixels)))
+          (check (and (equal normal observed) (equal (pixels normal) actual) (null *notifies*))
                  "drop without notify: expected old geometry; X ~S, tty ~S, events ~S"
                  actual observed *notifies*))
         (when (>= (get-internal-real-time) end) (return))
-        (sleep 0.025)))
-    (let ((cursor (child-command "refusal-cursor" 6)))
-      (check (string= "1;80" cursor) "after drop, CUP to column 100 reported ~S, expected 1;80" cursor))
-    (let* ((observed (tty-size)) (actual (actual-pixels)))
-      (check (and (equal normal observed) (equal (pixels normal) actual) (null *notifies*))
-             "geometry changed during the cursor probe")
-      (note "PASS dropped ConfigureRequest: no notify for 2 s, X ~S pixels, tty ~S, CUP to 1;100 reported 1;80"
-            actual observed))
+        (sleep 0.025))
+      (unless sample
+        (setf sample (await "deferred CPR after refused resize" #'read-cpr-sample 3))
+        (check-cpr "timeout rollback" sample "1;80" normal))
+      (let* ((observed (tty-size)) (actual (actual-pixels)))
+        (check (and (equal normal observed) (equal (pixels normal) actual) (null *notifies*))
+               "geometry changed during the timeout cursor probe")
+        (note "PASS CPR timeout: no notify, X ~S pixels, fresh tty ~S, CUP to 1;100 reported 1;80"
+              actual observed)))
     (arm)
     (configure (pixels wide))
     (converge "late real configure after drop" normal wide)))

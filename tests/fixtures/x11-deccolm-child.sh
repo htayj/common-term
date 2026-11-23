@@ -10,6 +10,11 @@ terminal_barrier() {
  [[ $reply == $'\033[0n' ]]
 }
 
+write_probe() {
+  # A full dd record is written to the PTY in one write, even if the pipe splits it.
+  printf '%s' "$1" | dd bs="${#1}" count=1 iflag=fullblock status=none
+}
+
 # Commands and replies use files, not the terminal byte stream. In particular,
 # size queries must not wait for this terminal to service its own input/output.
 terminal_barrier
@@ -21,11 +26,21 @@ for ((id=1;;id++)); do
   set) printf '\033[?3h'; result=sent ;;
   reset) printf '\033[?3l'; result=sent ;;
   size) result=$(stty size) ;;
-   refusal-cursor)
-    # An 80-column engine clamps this position to column 80; a wide engine does not.
-    printf '\033[1;100H\033[6n'
-    IFS= read -r -d R -t 5 cursor
-    result=${cursor#$'\033['}
+   set-cpr) write_probe $'\033[?3h\033[6n'; result=sent ;;
+   reset-cpr) write_probe $'\033[?3l\033[6n'; result=sent ;;
+   refusal-cpr) write_probe $'\033[?3h\033[1;100H\033[6n'; result=sent ;;
+   cpr-ready)
+    # Bash read with timeout zero checks readability without consuming any bytes.
+    if IFS= read -r -t 0; then result=readable; else result=pending; fi
+    ;;
+   sample-cpr)
+    result=pending
+    if IFS= read -r -t 0; then
+     IFS= read -r -d R -t 2 cursor
+     size=$(stty size)
+     [[ $cursor =~ ^$'\033['([0-9]+\;[0-9]+)$ ]]
+     result="${BASH_REMATCH[1]} $size"
+    fi
     ;;
   quit) exit 0 ;;
   *) exit 2 ;;

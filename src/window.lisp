@@ -40,7 +40,9 @@
   (sb-thread:with-mutex ((session-lock session))
     (when (session-x11-grid session)
       (session-restore-x11-grid session)
-      (setf (session-x11-grid session) nil (session-geometry-intent session) nil))))
+      (setf (session-x11-grid session) nil
+            (session-geometry-intent session) nil
+            (session-geometry-paused-p session) nil))))
 
 (defun window-close (host)
   ;; Retain the handle on close failure, so checkpoint quiesce cannot silently
@@ -115,8 +117,7 @@
                       (when poll-p
                         (ltd:geometry-tick display)
                         (window-geometry-commit host display))
-                      ;; Same-read bytes use the parser's new stride, but only
-                      ;; show the screen when its grid fits the actual window.
+                      ;; Draw only when the session fits the actual X11 window.
                       (let ((grid (session-x11-grid session)))
                         (when (and render-p (session-screen-size-p session (car grid) (cdr grid)))
                           (render-session session display))))
@@ -150,9 +151,9 @@
     (:geometry-retry
      (let* ((session (host-session host)) (display (host-display host)))
        (sb-thread:with-mutex ((session-lock session))
-         (ltd:request-grid-size display (lispterm.engine:columns (session-screen session))
-                                (lispterm.engine:rows (session-screen session))
-                                (session-geometry-generation session))
+         (destructuring-bind (generation rows columns) (session-display-intent session)
+           (ltd:request-grid-size display columns rows generation)
+           (setf (host-geometry-sent-generation host) generation))
          (setf (session-force-frame session) t))))
     (:geometry-cancel
      (let ((display (host-display host)))
@@ -161,7 +162,8 @@
          (if (session-x11-grid session)
              (sb-thread:with-mutex ((session-lock session))
                (session-restore-x11-grid session)
-               (setf (host-geometry-sent-generation host) (session-geometry-generation session)))
+               (setf (session-geometry-paused-p session) nil
+                     (host-geometry-sent-generation host) (session-geometry-generation session)))
              (session-resize session (ltd:display-rows display) (ltd:display-columns display))))))
     (:invalidate
      (sb-thread:with-mutex ((session-lock (host-session host)))
@@ -350,13 +352,17 @@ Other commands are rejected; the PTY session and renderer are never touched."
       (setf (host-commands host) (nconc (host-commands host) (list command))))
     (wait-host-command host command timeout)))
 
+(defun session-display-intent (session)
+  "Return generation, rows and columns under SESSION-LOCK."
+  (or (and (session-x11-grid session) (session-geometry-intent session))
+      (list (session-geometry-generation session)
+            (lispterm.engine:rows (session-screen session))
+            (lispterm.engine:columns (session-screen session)))))
+
 (defun window-geometry-intent (host display)
   (let* ((session (host-session host))
          (intent (sb-thread:with-mutex ((session-lock session))
-                    (or (and (session-x11-grid session) (session-geometry-intent session))
-                        (list (session-geometry-generation session)
-                              (lispterm.engine:rows (session-screen session))
-                              (lispterm.engine:columns (session-screen session)))))))
+                   (session-display-intent session))))
     (unless (eql (first intent) (host-geometry-sent-generation host))
       (destructuring-bind (generation rows columns) intent
         ;; A fresh native open already requested the initial dimensions.
@@ -366,13 +372,26 @@ Other commands are rejected; the PTY session and renderer are never touched."
         (setf (host-geometry-sent-generation host) generation)))))
 
 (defun window-geometry-commit (host display)
-  "A failed X11 request may roll back parser geometry, never resize the PTY."
+  "Release parsing only after the matched request resolves and the actual grid is published."
   (let ((session (host-session host)) (request (ltd:display-geometry-request display)))
-    (when (and request
-               (member (ltd:geometry-request-phase request) '(:refused :timed-out)))
+    (when (and (session-geometry-paused-p session) request
+               (member (ltd:geometry-request-phase request)
+                       '(:surface-ready :closing :settled :refused :timed-out)))
       (sb-thread:with-mutex ((session-lock session))
-        (when (eql (ltd:geometry-request-id request) (session-geometry-generation session))
-          (session-restore-x11-grid session))))))
+        (let ((grid (session-x11-grid session)))
+          ;; Poll has already processed the coalesced actual size event, which
+          ;; records GRID only after the PTY resize succeeds. Same-size requests
+          ;; may reach :SURFACE-READY without a size event, via GetGeometry.
+          (when (eql (ltd:geometry-request-id request) (session-geometry-generation session))
+            (unless (and (eql (car grid) (ltd:display-rows display))
+                         (eql (car grid) (session-pty-rows session))
+                         (eql (cdr grid) (ltd:display-columns display))
+                         (eql (cdr grid) (session-pty-columns session))
+                         (session-screen-size-p session (car grid) (cdr grid)))
+              ;; Detach through the owner's display error path rather than
+              ;; stall or resume with different engine and PTY sizes.
+              (error 'host-error :operation :resize :detail "X11 and PTY grids disagree"))
+            (setf (session-geometry-paused-p session) nil)))))))
 
 (defun window-geometry-event (host display event)
   (let ((session (host-session host)))

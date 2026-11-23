@@ -18,6 +18,8 @@
   (geometry-generation 0) geometry-intent geometry-status pty-rows pty-columns
   ;; (rows . columns) from actual window geometry, or NIL outside X11.
   x11-grid
+  ;; Pause is independent of whether the triggering read had a suffix.
+  geometry-paused-p output-bytes (output-offset 0)
   (lock (sb-thread:make-mutex :name "lispterm screen"))
   (transport-state :open) process-state
   (bytes-received 0) (frames 0) (force-frame t) last-cursor last-title
@@ -132,19 +134,21 @@ A zero write ends this attempt immediately; a positive partial write may retry."
     (and (= rows (lispterm.engine:rows screen)) (= columns (lispterm.engine:columns screen)))))
 
 (defun session-restore-x11-grid (session)
-  "Discard a speculative size, retaining content where it fits. Call under SESSION-LOCK."
+  "Adopt the last grid published by a successful configure. Call under SESSION-LOCK."
   (let ((grid (session-x11-grid session)))
     (when (and grid (not (session-screen-size-p session (car grid) (cdr grid))))
       (lispterm.engine:resize (session-screen session) (car grid) (cdr grid))
       (setf (session-force-frame session) t))))
 (defun session-observe-geometry (session)
-  ;; Called with SESSION-LOCK after a complete engine feed. No second resize:
-  ;; characters following DECCOLM have already used the new stride.
+  ;; Called under SESSION-LOCK after a feed boundary. Outside attached X11
+  ;; the engine has already resized its grid.
   (let* ((screen (session-screen session))
          (generation (nerimux/terminal/types:screen-geometry-generation screen)))
     (unless (= generation (session-geometry-generation session))
       (let ((rows (lispterm.engine:rows screen))
-            (columns (lispterm.engine:columns screen)))
+            (columns (if (session-geometry-paused-p session)
+                         (nerimux/terminal/types:screen-geometry-columns screen)
+                         (lispterm.engine:columns screen))))
         (unless (session-x11-grid session)
           (lispterm.pty:pty-resize (session-pty session) rows columns)
           (setf (session-pty-rows session) rows (session-pty-columns session) columns))
@@ -153,14 +157,17 @@ A zero write ends this attempt immediately; a positive partial write may retry."
               (session-force-frame session) t)))))
 
 (defun session-read-output (session)
-  "Drain one input chunk and read one output chunk per scheduler iteration."
+  "Drain input and feed at most one PTY read or its saved suffix."
   (session-flush-input session)
   (unless (session-queue-responses session) (return-from session-read-output nil))
   (let* ((pty (session-pty session))
-         (bytes (let ((bytes (lispterm.pty:pty-read pty :timeout 0)))
-                  (when (vectorp bytes)
-                    (lispterm.trace:trace-event :pty-read :bytes (length bytes)))
-                  bytes))
+         (saved (session-output-bytes session))
+         (bytes (unless (session-geometry-paused-p session)
+                  (or saved
+                      (let ((bytes (lispterm.pty:pty-read pty :timeout 0)))
+                        (when (vectorp bytes)
+                          (lispterm.trace:trace-event :pty-read :bytes (length bytes)))
+                        bytes))))
          (process (lispterm.pty:pty-process pty))
          (process-state (and process (lispterm.pty:process-poll process))))
     (sb-thread:with-mutex ((session-lock session))
@@ -170,16 +177,23 @@ A zero write ends this attempt immediately; a positive partial write may retry."
                    (if process :hangup :waiting-for-slave)))
             (bytes
              (setf (session-transport-state session) :open)
-             (incf (session-bytes-received session) (length bytes))
-               (lispterm.engine:feed (session-screen session) bytes)
-             (lispterm.trace:trace-event :feed-done :bytes (length bytes)
-               :screen (session-screen session))
+             (unless saved (incf (session-bytes-received session) (length bytes)))
+             (let ((start (session-output-offset session)))
+               (multiple-value-bind (next paused-p)
+                   (lispterm.engine:feed (session-screen session) bytes :start start
+                                        :defer-geometry (not (null (session-x11-grid session))))
+                 (setf (session-geometry-paused-p session) paused-p
+                       (session-output-bytes session) (and (< next (length bytes)) bytes)
+                       (session-output-offset session) (if (session-output-bytes session) next 0))
+                 (lispterm.trace:trace-event :feed-done :bytes (- next start)
+                   :screen (session-screen session))))
              (session-observe-geometry session)
              (setf (nerimux/terminal:screen-passthrough-queue (session-screen session)) nil
                    (nerimux/terminal:screen-clipboard-queue (session-screen session)) nil
                    (nerimux/terminal:screen-notification-queue (session-screen session)) nil))))
     (session-queue-responses session)
     bytes))
+
 
 (defun session-resize (session rows columns &key x11-configure-p)
   ;; Bound allocations from compositor or client supplied geometry.

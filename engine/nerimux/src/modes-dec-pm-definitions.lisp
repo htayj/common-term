@@ -24,11 +24,15 @@
                 `(,(car s) ,@(caddr s)))
               specs))))))
 
+(defvar *defer-column-resize* nil
+  "When bound during a host-managed feed, leave physical resizing to the host.")
+
 (defun set-column-mode (screen wide-p)
-  "DECCOLM executes synchronously, even when the requested width is unchanged."
   (let ((columns (if wide-p 132 80)))
-    (screen-resize screen columns (screen-height screen))
-    (setf (screen-cells screen) (%make-blank-cells (* columns (screen-height screen)))
+    (unless *defer-column-resize*
+      (screen-resize screen columns (screen-height screen)))
+    ;; Apply the reset in CSI parameter order without changing the stride.
+    (setf (screen-cells screen) (%make-blank-cells (* (screen-width screen) (screen-height screen)))
           (screen-column-mode screen) wide-p
           (screen-geometry-columns screen) columns
           (screen-scroll-top screen) 0
