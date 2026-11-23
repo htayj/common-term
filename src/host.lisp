@@ -139,8 +139,8 @@ when the owner is supervising a display retained by failed startup."
                  :worker-alive-p (and (host-thread host) (sb-thread:thread-alive-p (host-thread host)))
                  :error-count (length (host-error-ring host))))
          (sb-thread:with-mutex ((session-lock session))
-           (list* :rows (lispterm.engine:rows (session-screen session))
-                 :columns (lispterm.engine:columns (session-screen session))
+             (multiple-value-bind (rows columns) (session-reported-grid session)
+               (list* :rows rows :columns columns
                  :engine-geometry-generation
                  (nerimux/terminal/types:screen-geometry-generation (session-screen session))
                  :pty-rows (session-pty-rows session) :pty-columns (session-pty-columns session)
@@ -151,7 +151,7 @@ when the owner is supervising a display retained by failed startup."
                  :process-state (session-process-state session)
                  :child-pid (let ((process (lispterm.pty:pty-process (session-pty session))))
                                (and process (lispterm.pty:process-pid process)))
-                 (session-blink-receipt session)))
+                      (session-blink-receipt session))))
            (sb-thread:with-mutex ((session-input-lock session))
              (list :input-pending (session-input-pending session)
                    :input-limit *input-queue-limit*))))))

@@ -16,6 +16,8 @@
 (defstruct (session (:constructor %make-session))
   pty screen
   (geometry-generation 0) geometry-intent geometry-status pty-rows pty-columns
+  ;; (rows . columns) from actual window geometry, or NIL outside X11.
+  x11-grid
   (lock (sb-thread:make-mutex :name "lispterm screen"))
   (transport-state :open) process-state
   (bytes-received 0) (frames 0) (force-frame t) last-cursor last-title
@@ -119,6 +121,22 @@ A zero write ends this attempt immediately; a positive partial write may retry."
         (setf (nerimux/terminal:screen-response-queue screen) nil)))
     t))
 
+(defun session-reported-grid (session)
+  "Return actual rows and columns. Call with SESSION-LOCK held."
+  (let ((grid (session-x11-grid session)) (screen (session-screen session)))
+    (if grid (values (car grid) (cdr grid))
+        (values (lispterm.engine:rows screen) (lispterm.engine:columns screen)))))
+
+(defun session-screen-size-p (session rows columns)
+  (let ((screen (session-screen session)))
+    (and (= rows (lispterm.engine:rows screen)) (= columns (lispterm.engine:columns screen)))))
+
+(defun session-restore-x11-grid (session)
+  "Discard a speculative size, retaining content where it fits. Call under SESSION-LOCK."
+  (let ((grid (session-x11-grid session)))
+    (when (and grid (not (session-screen-size-p session (car grid) (cdr grid))))
+      (lispterm.engine:resize (session-screen session) (car grid) (cdr grid))
+      (setf (session-force-frame session) t))))
 (defun session-observe-geometry (session)
   ;; Called with SESSION-LOCK after a complete engine feed. No second resize:
   ;; characters following DECCOLM have already used the new stride.
@@ -127,9 +145,10 @@ A zero write ends this attempt immediately; a positive partial write may retry."
     (unless (= generation (session-geometry-generation session))
       (let ((rows (lispterm.engine:rows screen))
             (columns (lispterm.engine:columns screen)))
-        (lispterm.pty:pty-resize (session-pty session) rows columns)
-        (setf (session-pty-rows session) rows (session-pty-columns session) columns
-              (session-geometry-generation session) generation
+        (unless (session-x11-grid session)
+          (lispterm.pty:pty-resize (session-pty session) rows columns)
+          (setf (session-pty-rows session) rows (session-pty-columns session) columns))
+        (setf (session-geometry-generation session) generation
               (session-geometry-intent session) (list generation rows columns)
               (session-force-frame session) t)))))
 
@@ -152,7 +171,7 @@ A zero write ends this attempt immediately; a positive partial write may retry."
             (bytes
              (setf (session-transport-state session) :open)
              (incf (session-bytes-received session) (length bytes))
-             (lispterm.engine:feed (session-screen session) bytes)
+               (lispterm.engine:feed (session-screen session) bytes)
              (lispterm.trace:trace-event :feed-done :bytes (length bytes)
                :screen (session-screen session))
              (session-observe-geometry session)
@@ -162,14 +181,23 @@ A zero write ends this attempt immediately; a positive partial write may retry."
     (session-queue-responses session)
     bytes))
 
-(defun session-resize (session rows columns)
+(defun session-resize (session rows columns &key x11-configure-p)
   ;; Bound allocations from compositor or client supplied geometry.
   (unless (and (typep rows '(integer 1 300)) (typep columns '(integer 1 500)))
     (error 'host-error :operation :resize :detail "Grid exceeds 500 columns or 300 rows"))
   (sb-thread:with-mutex ((session-lock session))
-    (lispterm.pty:pty-resize (session-pty session) rows columns)
-    (lispterm.engine:resize (session-screen session) rows columns)
-    (setf (session-pty-rows session) rows (session-pty-columns session) columns)
+    (cond (x11-configure-p
+           (unless (and (eql rows (session-pty-rows session))
+                        (eql columns (session-pty-columns session)))
+             (when (session-pty session)
+               (lispterm.pty:pty-resize (session-pty session) rows columns))
+             (setf (session-pty-rows session) rows (session-pty-columns session) columns))
+           (setf (session-x11-grid session) (cons rows columns))
+           (session-restore-x11-grid session))
+          ((not (session-x11-grid session))
+           (lispterm.pty:pty-resize (session-pty session) rows columns)
+           (lispterm.engine:resize (session-screen session) rows columns)
+           (setf (session-pty-rows session) rows (session-pty-columns session) columns)))
     (setf (session-force-frame session) t)))
 
 (defun session-event (session event)

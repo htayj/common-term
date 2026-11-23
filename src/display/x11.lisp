@@ -20,7 +20,7 @@
   blue-mask
   events
   refreshing
-  pending-keys geometry-next geometry-query-p configure-sequence
+  pending-keys geometry-next geometry-query-p geometry-sent-size configure-sequence
   paste-property utf8-string primary-paste)
 
 (defun queue-event (d event) (push event (x-state-events (display-backend-state d))))
@@ -204,23 +204,13 @@
                                        (list
                                         (list 0 0 (display-width d) (display-height d))))))
     (xclhb:set-event-handler c 22
-                             (lambda (e)
-                               (let ((w (xclhb:configure-notify-event-width e))
-                                     (h (xclhb:configure-notify-event-height e)))
-                                 ;; The generated event struct drops the sequence field (pad at
-                                 ;; bytes 2-3). XCLHB:PROCESS-INPUT-ONE reads each 32-byte event
-                                 ;; into the client input buffer at offset 0 and calls this
-                                 ;; handler before reading again, so bytes 2-3 hold this event's
-                                 ;; sequence. Diagnostic only; never used for causality.
-                                 (setf (x-state-configure-sequence (display-backend-state d))
-                                       (xclhb::read-card16 (xclhb:client-input-buffer c) 2))
-                                 (unless (and (= w (display-width d)) (= h (display-height d)))
-                                   (resize-display d w h)
-                                   (queue-event d (make-resize-event
-                                                   :width w :height h
-                                                   :columns (display-columns d) :rows (display-rows d)
-                                                   :serial (x-state-configure-sequence (display-backend-state d)))))
-                                  (x11-geometry-configured d w h))))
+      (lambda (e)
+        ;; The generated event drops the SendEvent bit and the sequence. The
+        ;; input buffer still contains the current event; sequence is diagnostic.
+        (let ((bytes (xclhb:client-input-buffer c)))
+          (x11-handle-configure d (xclhb:configure-notify-event-window e)
+            (xclhb:configure-notify-event-width e) (xclhb:configure-notify-event-height e)
+            (xclhb::read-card16 bytes 2) (logbitp 7 (aref bytes 0))))))
     (xclhb:set-event-handler c 9
                              (lambda (e)
                                (declare (ignore e))
@@ -361,40 +351,63 @@
   (and request (= width (lispterm.display:geometry-request-width request))
        (= height (lispterm.display:geometry-request-height request))))
 (defun x11-geometry-configured (display width height)
-  (let ((r (lispterm.display:display-geometry-request display)))
-    (when (and (lispterm.display:geometry-active-p display)
-               (x11-target-matches-p r width height))
-      (lispterm.display:geometry-result display r
-                                       :surface-ready)
+  (let ((request (ltd:display-geometry-request display)))
+    (when (and request (eq (ltd:geometry-request-phase request) :pending)
+               (x11-target-matches-p request width height))
+      (ltd:geometry-result display request :surface-ready)
       (setf (display-damage display) (list (list 0 0 width height))))))
-(defun x11-start-size-request (display)
+
+(defun x11-handle-configure (display window width height sequence synthetic-p)
   (let ((s (display-backend-state display)))
-    (when (and (x-state-geometry-next s) (not (x-state-geometry-query-p s)))
-      (let ((request (x-state-geometry-next s)) (c (x-state-client s)))
-        (setf (x-state-geometry-next s) nil (x-state-geometry-query-p s) t)
-        ;; Constants denote bit positions; bitcase takes every positional field.
-        (unless (x11-target-matches-p request (display-width display) (display-height display))
-          (xclhb:configure-window c (x-state-window s)
-                                 (logior (ash 1 xclhb:+config-window--width+)
-                                         (ash 1 xclhb:+config-window--height+))
-                                 0 0 (lispterm.display:geometry-request-width request)
-                                 (lispterm.display:geometry-request-height request) 0 0 0))
-        ;; At most one outstanding query and one coalesced target, even if a
-        ;; peer stops replying while the child repeatedly issues DECCOLM.
-        (xclhb:get-geometry c
-          (lambda (reply)
-            (setf (x-state-geometry-query-p s) nil)
-            (when (and (lispterm.display:geometry-active-p display)
-                       (lispterm.display:geometry-current-p display request))
-              (let ((w (xclhb:get-geometry-reply-width reply))
-                    (h (xclhb:get-geometry-reply-height reply)))
-                (when (x11-target-matches-p request w h)
-                  (unless (and (= w (display-width display)) (= h (display-height display)))
-                    (queue-event display (resize-display display w h)))
-                  (x11-geometry-configured display w h))))
-            (x11-start-size-request display))
-          (x-state-window s))
-        (xclhb:flush c)))))
+    (when (and (not synthetic-p) (eql window (x-state-window s))
+               (not (and (= width (display-width display)) (= height (display-height display)))))
+      (resize-display display width height)
+      (let ((request (ltd:display-geometry-request display)))
+        (setf (x-state-configure-sequence s) sequence)
+        (when (equal (x-state-geometry-sent-size s) (cons width height))
+          (setf (x-state-geometry-sent-size s) nil))
+        (queue-event display (make-resize-event :width width :height height
+                               :rows (display-rows display) :columns (display-columns display)
+                               :serial sequence))
+        ;; A size change is actual even if it does not match the current
+        ;; request. X event order does not tell us whether a WM is done.
+        (if (x11-target-matches-p request width height)
+            (x11-geometry-configured display width height)
+            (when (and request (member (ltd:geometry-request-phase request) '(:surface-ready :closing)))
+              (ltd:geometry-result display request :pending)))))))
+
+(defun x11-start-size-request (display)
+  (let* ((s (display-backend-state display)) (request (x-state-geometry-next s)))
+    (when request
+      (let* ((c (x-state-client s))
+             (width (ltd:geometry-request-width request))
+             (height (ltd:geometry-request-height request))
+             (sent (x-state-geometry-sent-size s)))
+        (cond ((or (not (x11-target-matches-p request (display-width display) (display-height display)))
+                   (and sent (not (equal sent (cons width height)))))
+               ;; A still-outstanding different target can make the cached
+               ;; local size stale. Send a reverse even if the cache matches it.
+               (setf (x-state-geometry-next s) nil (x-state-geometry-sent-size s) (cons width height))
+               (xclhb:configure-window c (x-state-window s)
+                                      (logior (ash 1 xclhb:+config-window--width+)
+                                              (ash 1 xclhb:+config-window--height+))
+                                      0 0 width height 0 0 0)
+               (xclhb:flush c))
+              ((not (x-state-geometry-query-p s))
+               (setf (x-state-geometry-next s) nil (x-state-geometry-query-p s) t)
+               ;; Query only a possible no-op. Never use a reply to publish a
+               ;; changed size: a genuine size ConfigureNotify must do that.
+               (xclhb:get-geometry c
+                 (lambda (reply)
+                   (setf (x-state-geometry-query-p s) nil)
+                   (when (and (ltd:geometry-current-p display request)
+                              (x11-target-matches-p request (display-width display) (display-height display))
+                              (x11-target-matches-p request (xclhb:get-geometry-reply-width reply)
+                                                              (xclhb:get-geometry-reply-height reply)))
+                     (x11-geometry-configured display width height))
+                   (x11-start-size-request display))
+                 (x-state-window s))
+               (xclhb:flush c)))))))
 (defmethod lispterm.display:backend-request-size ((backend (eql :x11)) display request)
   (declare (ignore backend))
   (setf (x-state-geometry-next (display-backend-state display)) request)
@@ -415,8 +428,8 @@
       (xclhb:get-geometry (x-state-client s)
         (lambda (reply)
           (setf (x-state-geometry-query-p s) nil)
-          (when (and (lispterm.display:geometry-active-p display)
-                     (lispterm.display:geometry-current-p display r)
+          (when (and (ltd:geometry-current-p display r)
+                     (eq (ltd:geometry-request-phase (ltd:display-geometry-request display)) :closing)
                      (x11-target-matches-p r (xclhb:get-geometry-reply-width reply)
                                            (xclhb:get-geometry-reply-height reply))
                      (x11-target-matches-p r (display-width display) (display-height display)))

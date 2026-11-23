@@ -42,6 +42,10 @@
     (when *fail-poll*
       (setf *fail-poll* nil)
       (error 'ltd:display-connection-lost :detail "Injected transport loss"))
+    ;; X11 applies the observed pixel size before publishing the resize event.
+    (dolist (event *events*)
+      (when (typep event 'ltd:resize-event)
+        (ltd:resize-display display (ltd:resize-event-width event) (ltd:resize-event-height event))))
     (prog1 *events* (setf *events* nil))))
 (defmethod ltd:backend-blit ((backend (eql :x11)) display framebuffer rectangles)
   (declare (ignore backend framebuffer rectangles)) (record-native display))

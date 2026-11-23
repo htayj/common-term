@@ -50,6 +50,7 @@ case $gate in
   grep -q ':OWN-FDS :OK T' "$log" ;;
  x11) exec tests/x11-gate.sh "$@" ;;
  x11-admission) exec tests/x11-admission-gate.sh "$@" ;;
+ x11-deccolm) exec tests/x11-deccolm-gate.sh "$@" ;;
  wayland) exec tests/wayland-gate.sh "$@" ;;
  same-heap|active-image) exec tests/autolith-gate.sh "${1:-wayland}" ;;
  recovery)

@@ -36,10 +36,17 @@
 (defun set-host-state (host state)
   (sb-thread:with-mutex ((host-lock host)) (setf (host-state host) state)))
 
+(defun window-release-x11-grid (session)
+  (sb-thread:with-mutex ((session-lock session))
+    (when (session-x11-grid session)
+      (session-restore-x11-grid session)
+      (setf (session-x11-grid session) nil (session-geometry-intent session) nil))))
+
 (defun window-close (host)
   ;; Retain the handle on close failure, so checkpoint quiesce cannot silently
   ;; claim that an unclosed native resource is safe to inherit across fork.
   (when (host-display host)
+    (window-release-x11-grid (host-session host))
     (handler-case (ltd:close-display (host-display host))
       (error (condition)
         (set-host-state host :detached)
@@ -66,6 +73,10 @@
         (set-host-state host :detached)
         (error condition)))
     (sb-thread:with-mutex ((session-lock session))
+      (when (ltd:configure-authoritative-p (host-display host))
+        (setf (session-x11-grid session)
+              (cons (ltd:display-rows (host-display host))
+                    (ltd:display-columns (host-display host)))))
       (let ((title (nerimux/terminal:screen-title screen)))
         (when (and title (plusp (length title)))
           (ltd:set-title (host-display host) (subseq title 0 (min 1024 (length title)))))
@@ -98,10 +109,20 @@
                            (lispterm.trace:trace-event :input-backpressure
                              :kind (type-of event))))))))
             (when (eq (host-state-value host) :attached)
-              ;; Geometry retry policy keeps its frame-paced invocation.
-              (when render-p
-                (ltd:geometry-tick display)
-                (render-session (host-session host) display))
+              (let ((session (host-session host)))
+                (if (session-x11-grid session)
+                    (progn
+                      (when poll-p
+                        (ltd:geometry-tick display)
+                        (window-geometry-commit host display))
+                      ;; Same-read bytes use the parser's new stride, but only
+                      ;; show the screen when its grid fits the actual window.
+                      (let ((grid (session-x11-grid session)))
+                        (when (and render-p (session-screen-size-p session (car grid) (cdr grid)))
+                          (render-session session display))))
+                    (when render-p
+                      (ltd:geometry-tick display)
+                      (render-session session display))))
               (sb-thread:with-mutex ((session-lock (host-session host)))
                 (setf (session-geometry-status (host-session host))
                       (append (ltd:geometry-status display) (ltd:display-metrics display))))))
@@ -136,7 +157,12 @@
     (:geometry-cancel
      (let ((display (host-display host)))
        (ltd:cancel-size-request display)
-       (session-resize (host-session host) (ltd:display-rows display) (ltd:display-columns display))))
+       (let ((session (host-session host)))
+         (if (session-x11-grid session)
+             (sb-thread:with-mutex ((session-lock session))
+               (session-restore-x11-grid session)
+               (setf (host-geometry-sent-generation host) (session-geometry-generation session)))
+             (session-resize session (ltd:display-rows display) (ltd:display-columns display))))))
     (:invalidate
      (sb-thread:with-mutex ((session-lock (host-session host)))
        (setf (session-force-frame (host-session host)) t)))
@@ -327,9 +353,10 @@ Other commands are rejected; the PTY session and renderer are never touched."
 (defun window-geometry-intent (host display)
   (let* ((session (host-session host))
          (intent (sb-thread:with-mutex ((session-lock session))
-                   (list (session-geometry-generation session)
-                         (lispterm.engine:rows (session-screen session))
-                         (lispterm.engine:columns (session-screen session))))))
+                    (or (and (session-x11-grid session) (session-geometry-intent session))
+                        (list (session-geometry-generation session)
+                              (lispterm.engine:rows (session-screen session))
+                              (lispterm.engine:columns (session-screen session)))))))
     (unless (eql (first intent) (host-geometry-sent-generation host))
       (destructuring-bind (generation rows columns) intent
         ;; A fresh native open already requested the initial dimensions.
@@ -338,9 +365,27 @@ Other commands are rejected; the PTY session and renderer are never touched."
           (ltd:request-grid-size display columns rows generation))
         (setf (host-geometry-sent-generation host) generation)))))
 
+(defun window-geometry-commit (host display)
+  "A failed X11 request may roll back parser geometry, never resize the PTY."
+  (let ((session (host-session host)) (request (ltd:display-geometry-request display)))
+    (when (and request
+               (member (ltd:geometry-request-phase request) '(:refused :timed-out)))
+      (sb-thread:with-mutex ((session-lock session))
+        (when (eql (ltd:geometry-request-id request) (session-geometry-generation session))
+          (session-restore-x11-grid session))))))
+
 (defun window-geometry-event (host display event)
-  (sb-thread:with-mutex ((session-lock (host-session host)))
-    (setf (session-force-frame (host-session host)) t))
+  (let ((session (host-session host)))
+    (when (session-x11-grid session)
+      ;; X11 poll already applied every actual size to the display. When it
+      ;; drained several configures, publish only the newest actual size.
+      (return-from window-geometry-event
+        (when (and (eql (ltd:resize-event-width event) (ltd:display-width display))
+                   (eql (ltd:resize-event-height event) (ltd:display-height display)))
+          (session-resize session (ltd:display-rows display) (ltd:display-columns display)
+                          :x11-configure-p t))))
+    (sb-thread:with-mutex ((session-lock session))
+      (setf (session-force-frame session) t)))
   (cond ((ltd:resize-event-interactive-p event)
          (ltd:cancel-size-request display)
          (session-event (host-session host) event))

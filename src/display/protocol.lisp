@@ -283,6 +283,14 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
 (defparameter *geometry-timeout* 2)
 (defparameter *geometry-clock* #'get-internal-real-time)
 (defun geometry-now () (funcall *geometry-clock*))
+
+(defgeneric configure-authoritative-p (display)
+  (:documentation "Whether the native configure, not the requested grid, controls PTY size."))
+(defmethod configure-authoritative-p (display)
+  (declare (ignore display)) nil)
+(defmethod configure-authoritative-p ((display display))
+  (eq (display-backend display) :x11))
+
 (define-condition geometry-incomplete (display-error)
   ((request :initarg :request :reader geometry-incomplete-request)))
 (defgeneric backend-request-size (backend display request))
@@ -338,8 +346,10 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
              :id request-id :epoch (display-geometry-epoch display) :display-epoch (display-epoch display)
              :columns columns :rows rows :width (* columns cw) :height (* rows ch)
              :cell-width cw :cell-height ch
-             :deadline (+ (geometry-now)
-                          (ceiling (* *geometry-timeout* internal-time-units-per-second))))))
+              :deadline (+ (geometry-now)
+                          (ceiling (* (if (configure-authoritative-p display)
+                                          (min 1 *geometry-timeout*) *geometry-timeout*)
+                                      internal-time-units-per-second))))))
     (setf (display-geometry-request display) r)
     (backend-request-size (display-backend display) display r)
     r))
@@ -378,7 +388,7 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
           :target-presentation (and r (geometry-request-presentation r)))))
 (export '(request-grid-size cancel-size-request geometry-tick geometry-status
           geometry-active-p geometry-current-p geometry-request geometry-request-id geometry-request-width
-          geometry-request-height geometry-result backend-request-size backend-cancel-size
+          geometry-request-height geometry-request-phase geometry-result backend-request-size backend-cancel-size
           display-geometry-request display-presentation-generation resize-event-serial
           resize-event-states resize-event-scale resize-event-interactive-p))
 
