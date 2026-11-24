@@ -20,14 +20,16 @@
 (defun %ensure-open (pty)
   (when (%close-requested-p pty) (%fail 'pty-closed-error :closed nil))
   (unless (pty-open-p pty) (%fail 'pty-closed-error :closed nil)))
-(defun %resize (fd rows columns)
+(defun %resize (fd rows columns x-pixels y-pixels)
+  (check-type x-pixels (unsigned-byte 16))
+  (check-type y-pixels (unsigned-byte 16))
   (cffi:with-foreign-object (ws '(:struct winsize))
     (setf (cffi:foreign-slot-value ws '(:struct winsize) 'rows) rows
           (cffi:foreign-slot-value ws '(:struct winsize) 'columns) columns
-          (cffi:foreign-slot-value ws '(:struct winsize) 'x) 0
-          (cffi:foreign-slot-value ws '(:struct winsize) 'y) 0)
+          (cffi:foreign-slot-value ws '(:struct winsize) 'x) x-pixels
+          (cffi:foreign-slot-value ws '(:struct winsize) 'y) y-pixels)
     (%check (%ioctl fd #x5414 ws) 'pty-io-error :resize)))
-(defun open-pty (&key (rows 24) (columns 80))
+(defun open-pty (&key (rows 24) (columns 80) (x-pixels 0) (y-pixels 0))
   (%dimension rows) (%dimension columns)
   (let ((fd (%check (%openpt (logior sb-posix:o-rdwr sb-posix:o-noctty
                                     sb-posix:o-nonblock #o2000000)) 'pty-open-error :open)))
@@ -43,7 +45,7 @@
           (cffi:with-foreign-object (name :char 256)
             (let ((rc (%ptsname fd name 256)))
               (unless (zerop rc) (%fail 'pty-open-error :slave-name rc)))
-            (%resize fd rows columns)
+            (%resize fd rows columns x-pixels y-pixels)
             (%make-pty :master-fd fd :slave-name (cffi:foreign-string-to-lisp name))))
       (error (e) (%close fd) (error e)))))
 (defun %ready (fd events deadline)
@@ -99,18 +101,26 @@
                               (%fail 'pty-io-error :write)))))))
             when (zerop (%remaining deadline)) do (return)))
     offset))
-(defun pty-resize (pty rows columns)
+(defun pty-resize (pty rows columns &key (x-pixels 0) (y-pixels 0))
+  "Set all four winsize fields together. Zero pixels means unknown."
   (%dimension rows) (%dimension columns)
   (sb-thread:with-mutex ((pty-lock pty))
-    (%ensure-open pty) (%resize (pty-master-fd pty) rows columns))
+    (%ensure-open pty)
+    (%resize (pty-master-fd pty) rows columns x-pixels y-pixels))
   (values rows columns))
-(defun pty-window-size (pty)
+(defun pty-window-size (pty &key pixels)
+  "Return rows and columns. With PIXELS, also return text width and height."
   (sb-thread:with-mutex ((pty-lock pty))
     (%ensure-open pty)
     (cffi:with-foreign-object (ws '(:struct winsize))
       (%check (%ioctl (pty-master-fd pty) #x5413 ws) 'pty-io-error :window-size)
-      (values (cffi:foreign-slot-value ws '(:struct winsize) 'rows)
-              (cffi:foreign-slot-value ws '(:struct winsize) 'columns)))))
+      (let ((rows (cffi:foreign-slot-value ws '(:struct winsize) 'rows))
+            (columns (cffi:foreign-slot-value ws '(:struct winsize) 'columns)))
+        (if pixels
+            (values rows columns
+                    (cffi:foreign-slot-value ws '(:struct winsize) 'x)
+                    (cffi:foreign-slot-value ws '(:struct winsize) 'y))
+            (values rows columns))))))
 (defun pty-foreground-process-group (pty)
   (sb-thread:with-mutex ((pty-lock pty))
     (%ensure-open pty) (%check (%tcgetpgrp (pty-master-fd pty)) 'pty-io-error :foreground-group)))

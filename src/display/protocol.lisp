@@ -229,11 +229,9 @@ Backend cleanup must be retryable and retain unfinished resource ownership."
   (assert-owner display)
   (check-type timeout (real 0))
   (when (display-open-p display)
-    (handler-case
-        (sb-ext:with-timeout (+ timeout 0.25)
-          (backend-poll (display-backend display) display timeout))
-      (sb-ext:timeout ()
-        (error 'display-connection-lost :detail "Display transport poll stalled")))))
+    ;; The backend owns its readiness timeout and reports transport failures.
+    ;; Do not interrupt a healthy read because the owner was descheduled.
+    (backend-poll (display-backend display) display timeout)))
 
 (defun present (display)
   (assert-owner display)

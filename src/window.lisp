@@ -44,11 +44,25 @@
             (session-geometry-intent session) nil
             (session-geometry-paused-p session) nil))))
 
+(defun window-set-cell-metrics (session display)
+  ;; Caller holds SESSION-LOCK. X11 cells are already in pixels. On Wayland
+  ;; the font describes logical cells and the whole frame is scaled to the buffer.
+  (let* ((font (ltd:display-font display))
+         (backend (ltd:display-backend display))
+         (scale (or (when (and font (eq backend :wayland))
+                      (getf (ltd:backend-metrics backend display) :buffer-scale))
+                    1)))
+    (setf (session-cell-width session) (and font (* (ltd:font-width font) scale))
+          (session-cell-height session) (and font (* (ltd:font-height font) scale)))))
+
 (defun window-close (host)
   ;; Retain the handle on close failure, so checkpoint quiesce cannot silently
   ;; claim that an unclosed native resource is safe to inherit across fork.
   (when (host-display host)
     (window-release-x11-grid (host-session host))
+    (let ((session (host-session host)))
+      (sb-thread:with-mutex ((session-lock session))
+        (setf (session-cell-width session) nil (session-cell-height session) nil)))
     (handler-case (ltd:close-display (host-display host))
       (error (condition)
         (set-host-state host :detached)
@@ -74,11 +88,14 @@
             (setf (host-display host) display)))
         (set-host-state host :detached)
         (error condition)))
+    (let* ((display (host-display host))
+           (x11-p (ltd:configure-authoritative-p display)))
+      (sb-thread:with-mutex ((session-lock session))
+        (window-set-cell-metrics session display))
+      ;; Install the text-area size before STARTUP can exec the child.
+      (session-resize session (ltd:display-rows display) (ltd:display-columns display)
+                      :x11-configure-p x11-p))
     (sb-thread:with-mutex ((session-lock session))
-      (when (ltd:configure-authoritative-p (host-display host))
-        (setf (session-x11-grid session)
-              (cons (ltd:display-rows (host-display host))
-                    (ltd:display-columns (host-display host)))))
       (let ((title (nerimux/terminal:screen-title screen)))
         (when (and title (plusp (length title)))
           (ltd:set-title (host-display host) (subseq title 0 (min 1024 (length title)))))
@@ -93,39 +110,46 @@
   (let ((display (host-display host)))
     (when (and display (eq (host-state-value host) :attached))
       (restart-case
-          (progn
+          (let ((session (host-session host)))
             (when poll-p
               (lispterm.trace:trace-event :display-step)
               (window-geometry-intent host display)
-              (dolist (event (ltd:poll-events display :timeout 0))
-                (lispterm.trace:trace-event :event-dequeue :kind (type-of event))
-                (cond ((typep event 'ltd:close-event) (window-close host))
-                      ((typep event 'ltd:resize-event)
-                       (window-geometry-event host display event))
-                      (t
-                       (handler-case (session-event (host-session host) event)
-                         (input-backpressure (condition)
-                           ;; Admission is atomic: none of this event was queued.
-                           ;; Keep protocol progress, but never replay rejected input.
-                           (host-record-error host :input-backpressure condition)
-                           (lispterm.trace:trace-event :input-backpressure
-                             :kind (type-of event))))))))
+              (let ((events (ltd:poll-events display :timeout 0)))
+                ;; Poll already applied native geometry. Read metrics before
+                ;; publishing a grid so all four fields change together.
+                (sb-thread:with-mutex ((session-lock session))
+                  (window-set-cell-metrics session display))
+                (dolist (event events)
+                  (lispterm.trace:trace-event :event-dequeue :kind (type-of event))
+                  (cond ((typep event 'ltd:close-event) (window-close host))
+                        ((typep event 'ltd:resize-event)
+                         (window-geometry-event host display event))
+                        (t
+                         (handler-case (session-event session event)
+                           (input-backpressure (condition)
+                             ;; Never replay rejected input.
+                             (host-record-error host :input-backpressure condition)
+                             (lispterm.trace:trace-event :input-backpressure
+                               :kind (type-of event)))))))))
             (when (eq (host-state-value host) :attached)
-              (let ((session (host-session host)))
-                (if (session-x11-grid session)
-                    (progn
-                      (when poll-p
-                        (ltd:geometry-tick display)
-                        (window-geometry-commit host display))
-                      ;; Draw only when the session fits the actual X11 window.
-                      (let ((grid (session-x11-grid session)))
-                        (when (and render-p (session-screen-size-p session (car grid) (cdr grid)))
-                          (render-session session display))))
-                    (when render-p
+              (when poll-p
+                ;; Font or output scale can change without a resize event.
+                (sb-thread:with-mutex ((session-lock session))
+                  (session-update-current-winsize session)))
+              (if (session-x11-grid session)
+                  (progn
+                    (when poll-p
                       (ltd:geometry-tick display)
-                      (render-session session display))))
-              (sb-thread:with-mutex ((session-lock (host-session host)))
-                (setf (session-geometry-status (host-session host))
+                      (window-geometry-commit host display))
+                    ;; Draw only when the session fits the actual X11 window.
+                    (let ((grid (session-x11-grid session)))
+                      (when (and render-p (session-screen-size-p session (car grid) (cdr grid)))
+                        (render-session session display))))
+                  (when render-p
+                    (ltd:geometry-tick display)
+                    (render-session session display)))
+              (sb-thread:with-mutex ((session-lock session))
+                (setf (session-geometry-status session)
                       (append (ltd:geometry-status display) (ltd:display-metrics display))))))
         (reopen () :report "Replace the display and keep the PTY session." (window-open host))
         (detach () :report "Close the window, retaining the terminal session." (window-close host))
@@ -383,14 +407,17 @@ Other commands are rejected; the PTY session and renderer are never touched."
           ;; records GRID only after the PTY resize succeeds. Same-size requests
           ;; may reach :SURFACE-READY without a size event, via GetGeometry.
           (when (eql (ltd:geometry-request-id request) (session-geometry-generation session))
-            (unless (and (eql (car grid) (ltd:display-rows display))
-                         (eql (car grid) (session-pty-rows session))
-                         (eql (cdr grid) (ltd:display-columns display))
-                         (eql (cdr grid) (session-pty-columns session))
-                         (session-screen-size-p session (car grid) (cdr grid)))
-              ;; Detach through the owner's display error path rather than
-              ;; stall or resume with different engine and PTY sizes.
-              (error 'host-error :operation :resize :detail "X11 and PTY grids disagree"))
+            (multiple-value-bind (x y) (session-winsize-pixels session (car grid) (cdr grid))
+              (unless (and (eql (car grid) (ltd:display-rows display))
+                           (eql (car grid) (session-pty-rows session))
+                           (eql (cdr grid) (ltd:display-columns display))
+                           (eql (cdr grid) (session-pty-columns session))
+                           (eql x (session-pty-x-pixels session))
+                           (eql y (session-pty-y-pixels session))
+                           (session-screen-size-p session (car grid) (cdr grid)))
+                ;; Detach through the owner's display error path rather than
+                ;; stall or resume with different engine and PTY sizes.
+                (error 'host-error :operation :resize :detail "X11 and PTY winsizes disagree")))
             (setf (session-geometry-paused-p session) nil)))))))
 
 (defun window-geometry-event (host display event)

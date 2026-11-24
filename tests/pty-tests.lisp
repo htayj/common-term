@@ -142,8 +142,16 @@
     (dolist (bad '(0 -1 65536 1.5 nil "24"))
       (check (list :invalid-rows bad) (raises 'type-error (lambda () (open-pty :rows bad))))
       (check (list :invalid-columns bad) (raises 'type-error (lambda () (open-pty :columns bad)))))
+    (with-pty (pty :rows 24 :columns 80 :x-pixels 640 :y-pixels 384)
+      (check :initial-winsize
+             (equal '(24 80 640 384) (multiple-value-list (pty-window-size pty :pixels t))))
+      (check :invalid-x-pixels (raises 'type-error (lambda () (pty-resize pty 30 100 :x-pixels 65536))))
+      (check :invalid-y-pixels (raises 'type-error (lambda () (pty-resize pty 30 100 :y-pixels -1))))
+      (check :winsize-after-invalid-resize
+             (equal '(24 80 640 384) (multiple-value-list (pty-window-size pty :pixels t)))))
     (with-pty (pty :rows 31 :columns 97)
       (check :dimensions (equal '(31 97) (multiple-value-list (pty-window-size pty))))
+      (check :unknown-pixels (equal '(31 97 0 0) (multiple-value-list (pty-window-size pty :pixels t))))
       (check :timeout (null (pty-read pty :timeout 0.01)))
       (check :refuse-rebind (raises 'stdio-rebind-refused (lambda () (attach-slave-to-stdio pty))))
       (dolist (argv (list nil (list "") (list shell (string #\Null)) '(3)))
@@ -162,10 +170,12 @@
         (check :foreground-group (= (process-pid process) (pty-foreground-process-group pty)))
         (check :write (= 6 (pty-write pty (bytes (format nil "hello~%")))))
         (check :input-bytes (search "INPUT=hello" (collect-until pty "INPUT=hello")))
-        (pty-resize pty 43 109)
+        (pty-resize pty 43 109 :x-pixels 872 :y-pixels 688)
         ;; Bash may defer a trapped signal while its read builtin waits.
         (pty-write pty (bytes (format nil "wake~%")))
         (check :resized-size (equal '(43 109) (multiple-value-list (pty-window-size pty))))
+        (check :resized-winsize
+               (equal '(43 109 872 688) (multiple-value-list (pty-window-size pty :pixels t))))
         (let ((output (collect-until pty "43 109")))
           (format t "(:winch-output ~S)~%" output)
           (check :sigwinch (and (search "WINCH:" output) (search "43 109" output))))

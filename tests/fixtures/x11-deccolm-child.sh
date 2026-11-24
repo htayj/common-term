@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+root=$PWD
+winsize() {
+ local output
+ output=$("$root/scripts/sbcl" --script "$root/tests/fixtures/tty-winsize.lisp") || return
+ # Some SBCL wrappers print a startup banner even in script mode.
+ printf '%s\n' "${output##*$'\n'}"
+}
 cd "$1"
+# Sample before changing tty modes or issuing the first terminal query.
+winsize > initial-winsize.tmp
+mv -- initial-winsize.tmp initial-winsize
 stty raw -echo
 
 terminal_barrier() {
@@ -25,7 +35,7 @@ for ((id=1;;id++)); do
  case $command in
   set) printf '\033[?3h'; result=sent ;;
   reset) printf '\033[?3l'; result=sent ;;
-  size) result=$(stty size) ;;
+  size) result=$(winsize) ;;
    set-cpr) write_probe $'\033[?3h\033[6n'; result=sent ;;
    reset-cpr) write_probe $'\033[?3l\033[6n'; result=sent ;;
    refusal-cpr) write_probe $'\033[?3h\033[1;100H\033[6n'; result=sent ;;
@@ -37,7 +47,7 @@ for ((id=1;;id++)); do
     result=pending
     if IFS= read -r -t 0; then
      IFS= read -r -d R -t 2 cursor
-     size=$(stty size)
+     size=$(winsize)
      [[ $cursor =~ ^$'\033['([0-9]+\;[0-9]+)$ ]]
      result="${BASH_REMATCH[1]} $size"
     fi

@@ -88,7 +88,7 @@
 
 ;; A failed close must retain ownership without advertising a usable transport.
 (defstruct close-test-backend
-  (opens 0) (closes 0) close-actions open-error)
+  (opens 0) (closes 0) close-actions open-error poll-action)
 
 (defmethod backend-open ((backend close-test-backend) display)
   (incf (close-test-backend-opens backend))
@@ -104,8 +104,9 @@
   (setf (display-backend-state display) nil))
 
 (defmethod backend-poll ((backend close-test-backend) display timeout)
-  (declare (ignore display timeout))
-  (error "Unexpected poll during cleanup: ~s" backend))
+  (let ((action (close-test-backend-poll-action backend)))
+    (unless action (error "Unexpected poll during cleanup: ~s" backend))
+    (funcall action display timeout)))
 (defmethod backend-blit ((backend close-test-backend) display framebuffer rectangles)
   (declare (ignore display framebuffer rectangles))
   (error "Unexpected blit during cleanup: ~s" backend))
@@ -116,6 +117,21 @@
   (declare (ignore display))
   (error "Unexpected metrics query during cleanup: ~s" backend))
 
+;; A poll can finish late without losing a healthy connection.
+(let* ((events (list :healthy-event))
+       (backend (make-close-test-backend
+                 :poll-action (lambda (display timeout)
+                                (assert (display-open-p display))
+                                (assert (= timeout 0.01))
+                                (sleep 0.5)
+                                events)))
+       (display (open-display :backend backend :columns 2 :rows 1)))
+  (unwind-protect
+      (progn
+        (assert (eq events (poll-events display :timeout 0.01)))
+        (assert (display-open-p display)))
+    (close-display display)))
+(format t "DISPLAY SLOW HEALTHY POLL PASS~%")
 (let* ((failure (make-condition 'display-error :detail "Close interrupted"))
        (backend (make-close-test-backend :close-actions (list failure failure)))
        (display (open-display :backend backend :columns 2 :rows 1)))

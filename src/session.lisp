@@ -16,6 +16,7 @@
 (defstruct (session (:constructor %make-session))
   pty screen
   (geometry-generation 0) geometry-intent geometry-status pty-rows pty-columns
+  pty-x-pixels pty-y-pixels cell-width cell-height
   ;; (rows . columns) from actual window geometry, or NIL outside X11.
   x11-grid
   ;; Pause is independent of whether the triggering read had a suffix.
@@ -34,10 +35,11 @@
   input-head input-tail (input-offset 0) (input-pending 0))
 
 (defun make-session (pty rows columns)
-  (multiple-value-bind (pty-rows pty-columns)
-      (when pty (lispterm.pty:pty-window-size pty))
+  (multiple-value-bind (pty-rows pty-columns pty-x-pixels pty-y-pixels)
+      (when pty (lispterm.pty:pty-window-size pty :pixels t))
     (%make-session :pty pty :screen (lispterm.engine:make-screen :rows rows :columns columns)
-                   :pty-rows pty-rows :pty-columns pty-columns)))
+                   :pty-rows pty-rows :pty-columns pty-columns
+                   :pty-x-pixels pty-x-pixels :pty-y-pixels pty-y-pixels)))
 
 (defun session-blink-receipt (session)
   "Blink state of the latest completed frame; call with SESSION-LOCK held."
@@ -139,6 +141,34 @@ A zero write ends this attempt immediately; a positive partial write may retry."
     (when (and grid (not (session-screen-size-p session (car grid) (cdr grid))))
       (lispterm.engine:resize (session-screen session) (car grid) (cdr grid))
       (setf (session-force-frame session) t))))
+(defun winsize-pixels (cells cell-pixels)
+  ;; Zero means unknown, including an axis not representable by struct winsize.
+  (let ((pixels (* cells (or cell-pixels 0))))
+    (if (typep pixels '(unsigned-byte 16)) pixels 0)))
+
+(defun session-winsize-pixels (session rows columns)
+  (values (winsize-pixels columns (session-cell-width session))
+          (winsize-pixels rows (session-cell-height session))))
+
+(defun session-update-winsize (session rows columns)
+  ;; Caller holds SESSION-LOCK. Publish only after the single ioctl succeeds.
+  (multiple-value-bind (x y) (session-winsize-pixels session rows columns)
+    (unless (and (eql rows (session-pty-rows session))
+                 (eql columns (session-pty-columns session))
+                 (eql x (session-pty-x-pixels session))
+                 (eql y (session-pty-y-pixels session)))
+      (when (session-pty session)
+        (lispterm.pty:pty-resize (session-pty session) rows columns :x-pixels x :y-pixels y))
+      (setf (session-pty-rows session) rows (session-pty-columns session) columns
+            (session-pty-x-pixels session) x (session-pty-y-pixels session) y))))
+
+(defun session-update-current-winsize (session)
+  ;; Never use a requested X11 grid, even when only the cell metrics changed.
+  (let ((grid (session-x11-grid session)) (screen (session-screen session)))
+    (session-update-winsize session
+                            (if grid (car grid) (lispterm.engine:rows screen))
+                            (if grid (cdr grid) (lispterm.engine:columns screen)))))
+
 (defun session-observe-geometry (session)
   ;; Called under SESSION-LOCK after a feed boundary. Outside attached X11
   ;; the engine has already resized its grid.
@@ -150,8 +180,7 @@ A zero write ends this attempt immediately; a positive partial write may retry."
                          (nerimux/terminal/types:screen-geometry-columns screen)
                          (lispterm.engine:columns screen))))
         (unless (session-x11-grid session)
-          (lispterm.pty:pty-resize (session-pty session) rows columns)
-          (setf (session-pty-rows session) rows (session-pty-columns session) columns))
+          (session-update-winsize session rows columns))
         (setf (session-geometry-generation session) generation
               (session-geometry-intent session) (list generation rows columns)
               (session-force-frame session) t)))))
@@ -201,17 +230,12 @@ A zero write ends this attempt immediately; a positive partial write may retry."
     (error 'host-error :operation :resize :detail "Grid exceeds 500 columns or 300 rows"))
   (sb-thread:with-mutex ((session-lock session))
     (cond (x11-configure-p
-           (unless (and (eql rows (session-pty-rows session))
-                        (eql columns (session-pty-columns session)))
-             (when (session-pty session)
-               (lispterm.pty:pty-resize (session-pty session) rows columns))
-             (setf (session-pty-rows session) rows (session-pty-columns session) columns))
+           (session-update-winsize session rows columns)
            (setf (session-x11-grid session) (cons rows columns))
            (session-restore-x11-grid session))
           ((not (session-x11-grid session))
-           (lispterm.pty:pty-resize (session-pty session) rows columns)
-           (lispterm.engine:resize (session-screen session) rows columns)
-           (setf (session-pty-rows session) rows (session-pty-columns session) columns)))
+           (session-update-winsize session rows columns)
+           (lispterm.engine:resize (session-screen session) rows columns)))
     (setf (session-force-frame session) t)))
 
 (defun session-event (session event)

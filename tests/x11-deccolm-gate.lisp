@@ -15,7 +15,6 @@
 (defvar *requests*)
 (defvar *notifies*)
 (defvar *command-id*)
-(defvar *cell*)
 
 (defun check (ok control &rest args)
   (unless ok
@@ -61,11 +60,13 @@
                  (with-open-file (s reply) (read-line s))))
              seconds))))
 
-(defun tty-size ()
-  (let* ((reply (child-command "size"))
-         (parts (uiop:split-string reply :separator '(#\Space))))
-    (check (= 2 (length parts)) "invalid stty size reply ~S" reply)
+(defun parse-winsize (reply)
+  (let ((parts (uiop:split-string reply :separator '(#\Space))))
+    (check (= 4 (length parts)) "invalid TIOCGWINSZ reply ~S" reply)
     (mapcar #'parse-integer parts)))
+
+(defun tty-size ()
+  (parse-winsize (child-command "size")))
 
 (defun actual-pixels ()
   (let ((reply (xclhb:get-geometry-sync *client* *window*)))
@@ -73,7 +74,11 @@
           (xclhb:get-geometry-reply-height reply))))
 
 (defun pixels (grid)
-  (list (* (first *cell*) (second grid)) (* (second *cell*) (first grid))))
+  ;; Expected default 8x16 bitmap cells, not metrics inferred from the window.
+  (list (* 8 (second grid)) (* 16 (first grid))))
+
+(defun winsize (grid)
+  (append grid (pixels grid)))
 
 (defun set-event-mask (window mask)
   (apply #'xclhb:change-window-attributes *client* window (ash 1 11)
@@ -135,8 +140,9 @@
         (let* ((observed (tty-size)) (actual (actual-pixels)))
           (check (equal old actual) "X resized despite the held request: expected ~S, got ~S" old actual)
           (check (null *notifies*) "saw ConfigureNotify while the request was held: ~S" *notifies*)
-          (check (equal before observed)
-                 "HELD-ORDER ~A: X still ~S pixels, expected tty ~S, got ~S" command actual before observed)
+          (check (equal (winsize before) observed)
+                 "HELD-ORDER ~A: X still ~S pixels, expected tty ~S, got ~S"
+                 command actual (winsize before) observed)
           ;; The child polls the raw PTY without consuming any bytes. Even a
           ;; partial reply is a failure while we still own the trapped request.
           (when probe
@@ -152,28 +158,28 @@
         (sleep 0.005)))))
 
 (defun converge (label before target &key (check-no-wm-order nil))
-  (let ((wanted (pixels target)))
+  (let ((wanted (pixels target)) (old-size (winsize before)) (new-size (winsize target)))
     (await label
            (lambda ()
              (let* ((observed (tty-size))
                     (actual (actual-pixels)))
-               (check (member observed (list before target) :test #'equal)
-                      "~A: tty reached unexpected ~S, expected ~S or ~S" label observed before target)
-               (when (and check-no-wm-order (equal observed target))
+               (check (member observed (list old-size new-size) :test #'equal)
+                      "~A: tty reached unexpected ~S, expected ~S or ~S" label observed old-size new-size)
+               (when (and check-no-wm-order (equal observed new-size))
                  (check (equal actual wanted)
                         "~A: new tty ~S followed by old/wrong X geometry ~S" label observed actual))
-               (and (equal observed target) (equal actual wanted)
-                    (member wanted *notifies* :test #'equal))))))
-  (note "PASS ~A: genuine ConfigureNotify, X ~S pixels and tty ~S" label (pixels target) target))
+               (and (equal observed new-size) (equal actual wanted)
+                    (member wanted *notifies* :test #'equal)))))
+    (note "PASS ~A: genuine ConfigureNotify, X ~S pixels and tty ~S" label wanted new-size)))
 
 (defun read-cpr-sample ()
   (let ((sample (child-command "sample-cpr")))
     (unless (string= sample "pending") sample)))
 
 (defun check-cpr (label sample cursor grid)
-  (destructuring-bind (row col) grid
-    (check (string= sample (format nil "~A ~D ~D" cursor row col))
-           "~A: expected CPR ~A with fresh tty ~S, got ~S" label cursor grid sample)))
+  (let ((expected (winsize grid)))
+    (check (string= sample (format nil "~A~{ ~D~}" cursor expected))
+           "~A: expected CPR ~A with fresh tty ~S, got ~S" label cursor expected sample)))
 
 (defun release-and-check-cpr (command before target)
   (configure (pixels target))
@@ -182,7 +188,7 @@
   (let ((sample (await "CPR after ConfigureRequest release" #'read-cpr-sample)))
     (check-cpr command sample "1;1" target)
     (converge (format nil "held DECCOLM ~A, then release" command) before target)
-    (note "PASS CPR ~A: reply ~A, fresh tty ~S, X ~S pixels" command "1;1" target (actual-pixels))))
+    (note "PASS CPR ~A: reply ~A, fresh tty ~S, X ~S pixels" command "1;1" (winsize target) (actual-pixels))))
 (defun redirected-checks ()
   (let ((normal '(24 80)) (wide '(24 132)) (adjusted '(26 96)))
     (hold-request "set" normal wide :probe "set-cpr")
@@ -211,7 +217,7 @@
           (setf sample (read-cpr-sample))
           (when sample (check-cpr "timeout rollback" sample "1;80" normal)))
         (let* ((observed (tty-size)) (actual (actual-pixels)))
-          (check (and (equal normal observed) (equal (pixels normal) actual) (null *notifies*))
+          (check (and (equal (winsize normal) observed) (equal (pixels normal) actual) (null *notifies*))
                  "drop without notify: expected old geometry; X ~S, tty ~S, events ~S"
                  actual observed *notifies*))
         (when (>= (get-internal-real-time) end) (return))
@@ -220,7 +226,7 @@
         (setf sample (await "deferred CPR after refused resize" #'read-cpr-sample 3))
         (check-cpr "timeout rollback" sample "1;80" normal))
       (let* ((observed (tty-size)) (actual (actual-pixels)))
-        (check (and (equal normal observed) (equal (pixels normal) actual) (null *notifies*))
+        (check (and (equal (winsize normal) observed) (equal (pixels normal) actual) (null *notifies*))
                "geometry changed during the timeout cursor probe")
         (note "PASS CPR timeout: no notify, X ~S pixels, fresh tty ~S, CUP to 1;100 reported 1;80"
               actual observed)))
@@ -229,7 +235,7 @@
     (converge "late real configure after drop" normal wide)))
 
 (defun no-wm-checks ()
-  (let ((normal '(24 80)) (wide '(24 132)) (external '(27 93)))
+  (let ((normal '(24 80)) (wide '(24 132)) (external '(30 100)))
     (arm)
     (send-mode "set")
     (converge "no WM DECCOLM set" normal wide :check-no-wm-order t)
@@ -252,7 +258,6 @@
          (*requests* nil)
          (*notifies* nil)
          (*command-id* 0)
-         (*cell* nil)
          (*client* (xclhb:x-connect nil *display*)))
     (check *client* "failed connecting to private Xvfb")
     (ensure-directories-exist *phase*)
@@ -292,12 +297,15 @@
                   (lambda ()
                     (check (uiop:process-alive-p *terminal*) "terminal exited; see terminal.stderr")
                     (probe-file (merge-pathnames "ready" *phase*))) 10)
-           (check (equal '(24 80) (tty-size)) "initial PTY grid is not 24x80")
-           (destructuring-bind (width height) (actual-pixels)
-             (check (and (plusp width) (plusp height) (zerop (mod width 80)) (zerop (mod height 24)))
-                    "initial X geometry ~Dx~D is not cell-aligned for 24x80" width height)
-             (setf *cell* (list (/ width 80) (/ height 24))))
-           (note "window #x~X ready: initial tty 24x80 and X ~S pixels" *window* (actual-pixels))
+           (let ((initial (with-open-file (s (merge-pathnames "initial-winsize" *phase*))
+                            (parse-winsize (read-line s))))
+                 (expected (winsize '(24 80))))
+             (check (equal expected initial) "STARTUP-WINSIZE: expected ~S, got ~S" expected initial)
+             (check (equal expected (tty-size)) "ready tty winsize differs from startup ~S" initial)
+             (let ((actual (actual-pixels)))
+               (check (equal '(640 384) actual) "initial X geometry: expected (640 384), got ~S" actual)
+               (note "PASS startup winsize: tty ~S before DSR and at ready; X ~S pixels, window #x~X"
+                     initial actual *window*)))
            (funcall checks)
            (child-command "quit")
            (check (zerop (bounded 5 "clean launcher exit" (lambda () (uiop:wait-process *terminal*))))
